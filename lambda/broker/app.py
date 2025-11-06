@@ -29,8 +29,9 @@ mem_table = dynamodb.Table(TABLE) if dynamodb else None
 def _ok(body: Dict[str, Any]) -> Dict[str, Any]:
     return {"statusCode": 200, "headers": {"content-type": "application/json"}, "body": json.dumps(body)}
 
-def _tts(text: str) -> Dict[str, Any]:
-    r = polly.synthesize_speech(Text=text, VoiceId=POLLY_VOICE, OutputFormat="mp3")
+def _tts(text: str, voice_id: Optional[str] = None) -> Dict[str, Any]:
+    voice = voice_id or POLLY_VOICE
+    r = polly.synthesize_speech(Text=text, VoiceId=voice, OutputFormat="mp3")
     audio = r["AudioStream"].read()
     return {"text": text, "audio": {"audio_base64": base64.b64encode(audio).decode()}}
 
@@ -178,10 +179,15 @@ def handler(event, _ctx):
     context    = body.get("context") or {}
     speaker    = context.get("speaker_id")
     acoustic   = context.get("acoustic_event")
+    voice_id   = body.get("voice_id")
+    if isinstance(voice_id, str):
+        voice_id = voice_id.strip() or None
+    else:
+        voice_id = None
 
     # Identity fast-path
     if speaker and re.search(r"\b(who am i|what'?s my name|who'?s speaking)\b", text.lower()):
-        return _ok(_tts(f"You are {speaker}."))
+        return _ok(_tts(f"You are {speaker}.", voice_id))
 
     # Short memory (optional)
     history: List[Dict[str, str]] = _get_memory(session_id) if USE_MEMORY else []
@@ -198,4 +204,4 @@ def handler(event, _ctx):
         history.append({"user": text, "assistant": reply})
         _put_memory(session_id, history)
 
-    return _ok(_tts(reply))
+    return _ok(_tts(reply, voice_id))
