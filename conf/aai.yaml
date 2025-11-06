@@ -19,3 +19,14 @@ dependencies:
   - pip
   - pip:
     - assemblyai
+    - opencv-python
+    - pyaudio
+    - requests
+    - clarifai-grpc
+    - replicate
+    - groq
+    - boto
+    - amazon-transcribe-streaming-sdk 
+    - sounddevice 
+    - opencv-python 
+    - numpy
