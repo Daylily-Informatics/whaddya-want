@@ -5,7 +5,7 @@ trap 'err "Failed at line $LINENO: $BASH_COMMAND"' ERR
 
 usage() {
   cat <<'USAGE'
-Bootstrap the whaddya-want development environment.
+Bootstrap the whaddya-want development environment (Python 3.11 enforced).
 
 Usage: bootstrap.sh [options]
 
@@ -16,6 +16,10 @@ Options:
   --force               Recreate the requested environment from scratch.
   --skip-system-check   Skip verification of system dependencies.
   -h, --help            Show this help and exit.
+
+Notes:
+  • venv path uses a real Python 3.11 interpreter (not 3.12/3.13).
+  • conda path creates env with python=3.11, then pip-installs requirements.
 USAGE
 }
 
@@ -32,6 +36,52 @@ print(os.path.relpath(sys.argv[1], sys.argv[2]))
 PY
 }
 
+# --- find/enforce Python 3.11 ---
+PY311_BIN=""
+
+is_py311() {
+  "$1" - <<'PY' 2>/dev/null || exit 1
+import sys
+print(int(sys.version_info[:2] == (3,11)))
+PY
+}
+
+find_python311() {
+  # 1) Respect $PYTHON if provided and is 3.11
+  if [[ -n "${PYTHON:-}" ]] && command -v "$PYTHON" >/dev/null 2>&1; then
+    if [[ "$(is_py311 "$PYTHON")" == "1" ]]; then PY311_BIN="$(command -v "$PYTHON")"; return 0; fi
+    warn "\$PYTHON points to $( "$PYTHON" -V 2>&1 ); need Python 3.11"
+  fi
+
+  # 2) Direct python3.11 on PATH
+  if command -v python3.11 >/dev/null 2>&1 && [[ "$(is_py311 "$(command -v python3.11)")" == "1" ]]; then
+    PY311_BIN="$(command -v python3.11)"; return 0
+  fi
+
+  # 3) If python3 is 3.11, use it
+  if command -v python3 >/dev/null 2>&1 && [[ "$(is_py311 "$(command -v python3)")" == "1" ]]; then
+    PY311_BIN="$(command -v python3)"; return 0
+  fi
+
+  # 4) Try pyenv auto-install/use
+  if command -v pyenv >/dev/null 2>&1; then
+    local ver="3.11.9"
+    if ! pyenv versions --bare | grep -qx "$ver"; then
+      log "Installing Python $ver via pyenv (first time only)..."
+      pyenv install -s "$ver"
+    fi
+    local root; root="$(pyenv root)"
+    local cand="$root/versions/$ver/bin/python3.11"
+    if [[ -x "$cand" ]] && [[ "$(is_py311 "$cand")" == "1" ]]; then
+      PY311_BIN="$cand"; return 0
+    fi
+  fi
+
+  # 5) Friendly failure with remedies
+  err $'Could not find a Python 3.11 interpreter.\n\
+Hints:\n  • macOS (Homebrew):   brew install python@3.11\n  • pyenv:               brew install pyenv && pyenv install 3.11.9\n  • Ubuntu/Debian:       apt-get install python3.11 python3.11-venv'
+}
+
 SCRIPT_DIR=$PWD
 REPO_ROOT=$PWD
 MODE="venv"
@@ -43,24 +93,15 @@ SKIP_SYSTEM_CHECK=0
 # --- args ---
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --mode)
-      MODE=$(lower "${2:-}")
-      shift
-      ;;
-    --mode=*)
-      MODE=$(lower "${1#*=}")
-      ;;
-    --venv-path)
-      VENV_PATH="${2:-}"; shift ;;
-    --venv-path=*)
-      VENV_PATH="${1#*=}" ;;
-    --conda-env)
-      CONDA_ENV_NAME="${2:-}"; shift ;;
-    --conda-env=*)
-      CONDA_ENV_NAME="${1#*=}" ;;
-    --force) FORCE=1 ;;
+    --mode)        MODE=$(lower "${2:-}"); shift ;;
+    --mode=*)      MODE=$(lower "${1#*=}") ;;
+    --venv-path)   VENV_PATH="${2:-}"; shift ;;
+    --venv-path=*) VENV_PATH="${1#*=}" ;;
+    --conda-env)   CONDA_ENV_NAME="${2:-}"; shift ;;
+    --conda-env=*) CONDA_ENV_NAME="${1#*=}" ;;
+    --force)       FORCE=1 ;;
     --skip-system-check) SKIP_SYSTEM_CHECK=1 ;;
-    -h|--help) usage; exit 0 ;;
+    -h|--help)     usage; exit 0 ;;
     *) err "Unknown option: $1" ;;
   esac
   shift || true
@@ -69,15 +110,14 @@ done
 [[ "$MODE" = "venv" || "$MODE" = "conda" ]] || err "Unsupported mode '$MODE'. Use 'venv' or 'conda'."
 
 ensure_cmd() { command -v "$1" >/dev/null 2>&1 || err "Required command '$1' not found in PATH."; }
-
 need_file() { [[ -f "$1" ]] || err "Missing required file: $1"; }
 
 check_system_dependencies() {
   local miss=()
-  for c in python3 aws; do command -v "$c" >/dev/null 2>&1 || miss+=("$c"); done
+  for c in aws; do command -v "$c" >/dev/null 2>&1 || miss+=("$c"); done
   if [[ ${#miss[@]} -gt 0 ]]; then
     warn "Missing required commands: ${miss[*]}"
-    warn "Install them (e.g., Homebrew: brew install awscli python) then re-run."
+    warn "Install them (e.g., Homebrew: brew install awscli) then re-run."
     exit 1
   fi
 
@@ -94,13 +134,10 @@ check_system_dependencies() {
 
 ensure_conda_environment() {
   ensure_cmd conda
-  # Files must exist
-  need_file "${REPO_ROOT}/conf/aai.yaml"
   need_file "${REPO_ROOT}/client/requirements.txt"
   need_file "${REPO_ROOT}/lambda/broker/requirements.txt"
 
   local env_exists=0
-  # robust parse: read first column that isn't '#'
   if conda info --envs | awk 'NF{print $1}' | sed 's/*//' | grep -Fxq "$CONDA_ENV_NAME"; then
     env_exists=1
   fi
@@ -111,26 +148,24 @@ ensure_conda_environment() {
     env_exists=0
   fi
 
-  # If YAML has a name, prefer it; otherwise use --name
   if [[ $env_exists -eq 0 ]]; then
-    if grep -qiE '^name:\s*' "${REPO_ROOT}/conf/aai.yaml"; then
-      log "Creating Conda env from YAML name (conf/aai.yaml)."
-      conda env create --file "${REPO_ROOT}/conf/aai.yaml"
-    else
-      log "Creating Conda env '$CONDA_ENV_NAME' from conf/aai.yaml."
-      conda env create --name "$CONDA_ENV_NAME" --file "${REPO_ROOT}/conf/aai.yaml"
-    fi
+    log "Creating Conda env '$CONDA_ENV_NAME' with python=3.11."
+    conda create -y -n "$CONDA_ENV_NAME" python=3.11
   else
-    log "Updating Conda env '$CONDA_ENV_NAME'."
-    #conda env update --name "$CONDA_ENV_NAME" --file "${REPO_ROOT}/conf/aai.yaml" --prune
+    # Verify Python version
+    local v
+    v="$(conda run --no-capture-output --name "$CONDA_ENV_NAME" python - <<'PY'
+import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")
+PY
+)"
+    if [[ "$v" != "3.11" ]]; then
+      err "Conda env '$CONDA_ENV_NAME' is Python $v; use --force to recreate with Python 3.11."
+    fi
+    log "Using existing Conda env '$CONDA_ENV_NAME' (Python $v)."
   fi
 
-  # Use the resolved env name (handles YAML-driven name)
-  local use_env="$CONDA_ENV_NAME"
-  if conda info --envs | awk 'NF{print $1}' | sed 's/*//' | grep -Fq "$(basename "$REPO_ROOT")"; then :; fi
-
-  local pip_cmd=(conda run --no-capture-output --name "$use_env" python -m pip)
-  "${pip_cmd[@]}" install --upgrade pip wheel
+  local pip_cmd=(conda run --no-capture-output --name "$CONDA_ENV_NAME" python -m pip)
+  "${pip_cmd[@]}" install --upgrade pip wheel setuptools
   for req in "${REPO_ROOT}/client/requirements.txt" "${REPO_ROOT}/lambda/broker/requirements.txt"; do
     local rel; rel=$(relative_path "$req" "${REPO_ROOT}")
     need_file "$req"
@@ -139,13 +174,15 @@ ensure_conda_environment() {
   done
 
   log "Conda environment ready. Activate with:"
-  echo "  conda activate $use_env"
+  echo "  conda activate $CONDA_ENV_NAME"
 }
 
 ensure_venv_environment() {
-  ensure_cmd python3
   need_file "${REPO_ROOT}/client/requirements.txt"
   need_file "${REPO_ROOT}/lambda/broker/requirements.txt"
+
+  find_python311
+  log "Using Python 3.11 at: $PY311_BIN"
 
   if [[ $FORCE -eq 1 && -d "$VENV_PATH" ]]; then
     log "Removing existing venv at '$VENV_PATH'."
@@ -153,8 +190,8 @@ ensure_venv_environment() {
   fi
 
   if [[ ! -d "$VENV_PATH" ]]; then
-    log "Creating venv at '$VENV_PATH'."
-    python3 -m venv "$VENV_PATH"
+    log "Creating venv at '$VENV_PATH' with Python 3.11."
+    "$PY311_BIN" -m venv "$VENV_PATH"
   else
     log "Reusing venv at '$VENV_PATH'."
   fi
@@ -162,8 +199,16 @@ ensure_venv_environment() {
   local py="${VENV_PATH}/bin/python"
   [[ -x "$py" ]] || err "Virtual env at '$VENV_PATH' is missing Python."
 
-  log "Upgrading pip & wheel."
-  "$py" -m pip install --upgrade pip wheel
+  # Verify it's 3.11
+  local v
+  v="$("$py" - <<'PY'
+import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")
+PY
+)"
+  [[ "$v" == "3.11" ]] || err "Venv Python is $v; remove venv or pass --force to recreate with Python 3.11."
+
+  log "Upgrading pip, wheel, setuptools."
+  "$py" -m pip install --upgrade pip wheel setuptools
 
   for req in "${REPO_ROOT}/client/requirements.txt" "${REPO_ROOT}/lambda/broker/requirements.txt"; do
     local rel; rel=$(relative_path "$req" "${REPO_ROOT}")
@@ -175,7 +220,6 @@ ensure_venv_environment() {
   local act; act=$(relative_path "${VENV_PATH}/bin/activate" "${REPO_ROOT}")
   log "venv ready. Activate with:"
   echo "  source ${act}"
-  echo "Tip: add a src/pyproject and install it in editable mode to avoid PYTHONPATH exports."
 }
 
 if [[ $SKIP_SYSTEM_CHECK -eq 0 ]]; then

@@ -18,8 +18,22 @@ function and optional CLI client:
 ```bash
 export AWS_PROFILE=your-aws-profile   # optional
 bin/bootstrap.sh            # creates .venv/ by default
-# or
-bin/bootstrap.sh --mode conda
+
+## or
+##bin/bootstrap.sh --mode conda
+
+
+source .venv/bin/activate
+pip install -r client/requirements.txt
+pip install amazon-transcribe sounddevice numpy requests
+pip install --upgrade awscrt
+pip install --upgrade pip
+pip install amazon-transcribe sounddevice numpy requests awscrt
+
+pip install sounddevice numpy requests
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+pip install speechbrain                 
+pip install tensorflow==2.20.0 tensorflow_hub tensorflow-io
 ```
 
 After the script completes activate the environment that was created and export
@@ -217,18 +231,7 @@ After deployment copy the output `BrokerEndpoint` URL and point the CLI client
 at it:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r client/requirements.txt
-pip install amazon-transcribe sounddevice numpy requests
-pip install --upgrade awscrt
-pip install --upgrade pip
-pip install amazon-transcribe sounddevice numpy requests awscrt
 
-pip install sounddevice numpy requests
-pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
-pip install speechbrain                 
-pip install tensorflow==2.20.0 tensorflow_hub tensorflow_io==0.36.0
 export AWS_REGION=us-west-2
 export AWS_DEFAULT_REGION=us-west-2
 
