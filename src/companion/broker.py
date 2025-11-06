@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+from .audio import SoundClassifier
 from .config import RuntimeConfig
 from .llm import LLMClient
 from .memory import ConversationStore, ConversationTurn
@@ -28,15 +29,29 @@ class ConversationBroker:
             voice_id=config.voice_id,
             region_name=config.region_name,
         )
+        self._classifier = SoundClassifier()
 
-    def handle(self, session_id: str, user_text: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
+    def handle(
+        self,
+        session_id: str,
+        user_text: str,
+        context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        context = context or {}
+        classification = self._classifier.classify(
+            transcript=user_text,
+            speaker_label=context.get("speaker") or context.get("speaker_label"),
+            sound_type=context.get("sound_type"),
+        )
         history = self._memory.fetch_history(session_id=session_id, limit=self._config.history_limit)
         messages = [
             {"role": "system", "content": "You are a helpful, proactive AI companion."},
             *({"role": turn.role, "content": turn.content} for turn in history),
             {"role": "user", "content": user_text},
         ]
-        if context:
+        if classification.context_message:
+            messages.append({"role": "system", "content": classification.context_message})
+        elif context:
             messages.append({"role": "system", "content": f"Context: {context}"})
         llm_response = self._llm.chat(messages=messages)
 
@@ -57,6 +72,7 @@ class ConversationBroker:
             "text": llm_response.message,
             "audio": audio_payload,
             "tool_calls": llm_response.tool_calls,
+            "classification": classification.to_payload(),
         }
 
 
