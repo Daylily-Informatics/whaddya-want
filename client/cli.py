@@ -48,7 +48,7 @@ import uuid
 import warnings
 from collections import deque
 from pathlib import Path
-from typing import AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, Optional
 
 import numpy as np
 import requests
@@ -83,7 +83,7 @@ _SPK_DIR = Path(os.path.expanduser("~/.whaddya/speakers"))
 _SPK_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# ---- AI audio playback (mp3 → speaker) ----
+# ---- Marvin audio playback (mp3 → speaker) ----
 _MP3_READY = False
 try:
     from pydub import AudioSegment  # type: ignore
@@ -97,10 +97,17 @@ except Exception as e:
 class AudioPlayer:
     """Decode mp3 bytes and play them through the default sounddevice output."""
 
-    def __init__(self, mute_guard: threading.Event | None = None) -> None:
+    def __init__(
+        self,
+        mute_guard: threading.Event | None = None,
+        stop_guard: threading.Event | None = None,
+    ) -> None:
         self.enabled = _MP3_READY
         self._warned_decode_error = False
         self._mute_guard = mute_guard
+        self._stop_guard = stop_guard
+        self._is_playing = False
+        self.last_interrupted = False
 
     def _decode(self, data: bytes) -> tuple[np.ndarray, int] | tuple[None, None]:
         if not self.enabled:
@@ -130,18 +137,46 @@ class AudioPlayer:
             return False
         if self._mute_guard is not None:
             self._mute_guard.set()
+        if self._stop_guard is not None:
+            self._stop_guard.clear()
+        self._is_playing = True
+        self.last_interrupted = False
         try:
             loop = asyncio.get_running_loop()
             audio, rate = await loop.run_in_executor(None, self._decode, data)
             if audio is None or rate is None:
                 return False
             sd.play(audio, rate)
-            await loop.run_in_executor(None, sd.wait)
+            wait_future = loop.run_in_executor(None, sd.wait)
+            while True:
+                try:
+                    await asyncio.wait_for(wait_future, timeout=0.1)
+                    break
+                except asyncio.TimeoutError:
+                    if self._stop_guard is not None and self._stop_guard.is_set():
+                        self.last_interrupted = True
+                        sd.stop()
+                        self._stop_guard.clear()
+            if not wait_future.done():
+                await wait_future
             if self._mute_guard is not None:
                 await asyncio.sleep(0.15)
+        except asyncio.CancelledError:
+            if self._stop_guard is not None:
+                self._stop_guard.set()
+            sd.stop()
+            self.last_interrupted = True
+            raise
         finally:
             if self._mute_guard is not None:
                 self._mute_guard.clear()
+            self._is_playing = False
+        return True
+
+    def request_stop(self) -> bool:
+        if self._stop_guard is None or not self._is_playing:
+            return False
+        self._stop_guard.set()
         return True
 
 
@@ -279,6 +314,7 @@ async def stream_microphone(
     input_device: int | None = None,
     analysis_buf: deque | None = None,
     mute_event: threading.Event | None = None,
+    interrupt_event: threading.Event | None = None,
     verbose: bool = False,
 ) -> AsyncGenerator[str, None]:
     """Yield FINAL transcripts; optionally fill analysis_buf with float32 @16k mono."""
@@ -296,13 +332,21 @@ async def stream_microphone(
     def audio_cb(indata, frames, time_info, status):
         if status and verbose:
             print(status, file=sys.stderr)
-        if mute_event is not None and mute_event.is_set():
-            return
         try:
             raw = bytes(indata)
-            if analysis_buf is not None:
+            need_fmono = analysis_buf is not None
+            if mute_event is not None and mute_event.is_set() and interrupt_event is not None:
+                need_fmono = True
+            fmono = None
+            if need_fmono:
                 fmono = _bytes_to_float_mono_int16(raw, channels)
+            if analysis_buf is not None and fmono is not None:
                 analysis_buf.extend(fmono.tolist())
+            if mute_event is not None and mute_event.is_set():
+                if interrupt_event is not None and fmono is not None:
+                    if float(np.max(np.abs(fmono))) >= 0.12:
+                        interrupt_event.set()
+                return
             raw_q.put_nowait(raw)
         except queue.Full:
             pass
@@ -361,7 +405,24 @@ _ENROLL_RE = re.compile(
     """,
 )
 
-_EXIT_RE = re.compile(r"\b(exit|quit|stop listening|goodbye|stop now)\b", re.I)
+_WAKE_RE = re.compile(r"\bhey\s+marvin\b", re.I)
+_EXIT_COMMAND_RE = re.compile(r"\b(exit|quit|stop listening|goodbye|stop now)\b", re.I)
+_INTERRUPT_COMMAND_RE = re.compile(
+    r"\b(stop|cancel|hold on|pause|quiet|that's enough|enough)\b",
+    re.I,
+)
+
+
+def _has_wake_phrase(text: str) -> bool:
+    return bool(_WAKE_RE.search(text))
+
+
+def is_exit_command(text: str) -> bool:
+    return _has_wake_phrase(text) and bool(_EXIT_COMMAND_RE.search(text))
+
+
+def is_interrupt_command(text: str) -> bool:
+    return _has_wake_phrase(text) and bool(_INTERRUPT_COMMAND_RE.search(text))
 
 
 def parse_enrollment(text: str) -> Optional[str]:
@@ -450,7 +511,8 @@ async def run():
     spkid = SpeakerID()
     bark = BarkDetector()
     playback_mute = threading.Event()
-    player = AudioPlayer(mute_guard=playback_mute)
+    playback_interrupt = threading.Event()
+    player = AudioPlayer(mute_guard=playback_mute, stop_guard=playback_interrupt)
     vprint(
         "[diag] speaker-id enabled={}  bark-detector enabled={}  playback enabled={}".format(
             spkid.enabled, bark.enabled, player.enabled
@@ -458,12 +520,21 @@ async def run():
     )
     print(
         "[hint] Press ENTER to enroll last ~3s as 'Major' (or type a name then ENTER). "
-        "Type 'q' + ENTER to quit, 'r' + ENTER to reset the listener."
+        "Type 'q' + ENTER to quit, 'r' + ENTER to reset the listener, 's' + ENTER to stop Marvin."
     )
+    print("[hint] Say 'hey Marvin stop' to interrupt or 'hey Marvin exit' to leave the session.")
 
     # Manual enroll / quit via stdin
     loop = asyncio.get_running_loop()
     manual_q: asyncio.Queue[str] = asyncio.Queue()
+
+    async def _call_broker(payload: dict[str, Any]) -> dict[str, Any]:
+        def _post() -> dict[str, Any]:
+            r = requests.post(args.broker_url, json=payload, timeout=60)
+            r.raise_for_status()
+            return r.json()
+
+        return await asyncio.to_thread(_post)
 
     def _stdin_watcher():
         try:
@@ -473,10 +544,13 @@ async def run():
                     break
                 s = line.strip()
                 try:
-                    if s.lower() in ("q", "quit", "exit"):
+                    lowered = s.lower()
+                    if lowered in ("q", "quit", "exit"):
                         loop.call_soon_threadsafe(manual_q.put_nowait, "__QUIT__")
-                    elif s.lower() in ("r", "reset", "restart"):
+                    elif lowered in ("r", "reset", "restart"):
                         loop.call_soon_threadsafe(manual_q.put_nowait, "__RESET__")
+                    elif lowered in ("s", "stop"):
+                        loop.call_soon_threadsafe(manual_q.put_nowait, "__STOP__")
                     else:
                         loop.call_soon_threadsafe(manual_q.put_nowait, s)
                 except RuntimeError:
@@ -497,6 +571,7 @@ async def run():
             input_device=args.input_device,
             analysis_buf=analysis_buf,
             mute_event=playback_mute,
+            interrupt_event=playback_interrupt,
             verbose=verbose,
         )
 
@@ -523,6 +598,11 @@ async def run():
                         analysis_buf.clear()
                         reset_requested = True
                         break
+
+                    if typed == "__STOP__":
+                        if player.request_stop():
+                            print("[keyboard] requested Marvin to stop speaking.")
+                        continue
 
                     target = typed if typed else "Major"
                     wav_m = take_latest_seconds(analysis_buf, max(args.id_window, 3.0), args.rate)
@@ -553,10 +633,15 @@ async def run():
                 print(f"YOU: {transcript}")
 
                 # Local voice exit
-                if _EXIT_RE.search(transcript):
-                    print("[voice] exit requested — shutting down.")
+                if is_exit_command(transcript):
+                    print("[voice] Marvin exit requested — shutting down.")
                     stop.set()
                     break
+
+                if is_interrupt_command(transcript):
+                    if player.request_stop():
+                        print("[voice] interrupt requested — stopping Marvin's reply.")
+                        continue
 
                 need = int(args.id_window * args.rate)
                 vprint(f"[diag] buf_samples={len(analysis_buf)} need~{need}")
@@ -611,9 +696,7 @@ async def run():
                 payload["voice_mode"] = args.voice_mode
 
                 try:
-                    r = requests.post(args.broker_url, json=payload, timeout=60)
-                    r.raise_for_status()
-                    body = r.json()
+                    body = await _call_broker(payload)
                 except Exception as e:
                     print(f"[broker error] {e}", file=sys.stderr)
                     continue
@@ -638,7 +721,7 @@ async def run():
                 if client_event:
                     print(f"[event] enrolled_speaker={client_event['enrolled_speaker']}")
 
-                print(f"AI:  {ai_text}")
+                print(f"Marvin: {ai_text}")
 
                 audio_b64 = (body.get("audio") or {}).get("audio_base64")
                 if audio_b64:
@@ -650,6 +733,8 @@ async def run():
                         out.write_bytes(audio_bytes)
                         print(f"[saved] {out}")
                     played = await player.play(audio_bytes)
+                    if player.last_interrupted:
+                        print("[notice] Marvin playback interrupted early.")
                     if not played and not playback_warned:
                         print(
                             "[hint] Install 'pydub' and ffmpeg (or libav) to enable speaker playback.",
