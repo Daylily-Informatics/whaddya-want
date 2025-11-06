@@ -1,2 +1,0 @@
-# whaddya-want
-Ai companion
