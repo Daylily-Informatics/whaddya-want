@@ -278,6 +278,7 @@ async def stream_microphone(
     input_device: int | None = None,
     analysis_buf: deque | None = None,
     mute_event: threading.Event | None = None,
+    verbose: bool = False,
 ) -> AsyncGenerator[str, None]:
     """Yield FINAL transcripts; optionally fill analysis_buf with float32 @16k mono."""
     client = TranscribeStreamingClient(region=region)
@@ -292,7 +293,7 @@ async def stream_microphone(
     async_q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=100)
 
     def audio_cb(indata, frames, time_info, status):
-        if status:
+        if status and verbose:
             print(status, file=sys.stderr)
         if mute_event is not None and mute_event.is_set():
             return
@@ -399,15 +400,33 @@ async def run():
         default=os.getenv("POLLY_VOICE"),
         help="Optional Amazon Polly voice ID override (default: server configuration)",
     )
+    ap.add_argument(
+        "--voice-mode",
+        choices=["standard", "neural", "generative"],
+        default="standard",
+        help="Preferred voice synthesis mode (default: standard)",
+    )
+    ap.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose diagnostics and debugging output",
+    )
     args = ap.parse_args()
 
     voice_id = (args.voice or "").strip() or None
+    verbose = bool(args.verbose)
+
+    def vprint(*vargs, **vkwargs):
+        if verbose:
+            print(*vargs, **vkwargs)
 
     if voice_id:
-        print(f"[diag] overriding Polly voice to '{voice_id}'")
+        vprint(f"[diag] overriding Polly voice to '{voice_id}'")
+
+    vprint(f"[diag] voice mode set to {args.voice_mode}")
 
     print(f"Starting session {args.session} (region={args.region}, lang={args.language})")
-    print("Tip: list devices with:\n  python - <<'PY'\nimport sounddevice as sd; print(sd.query_devices())\nPY\n")
+    vprint("Tip: list devices with:\n  python - <<'PY'\nimport sounddevice as sd; print(sd.query_devices())\nPY\n")
 
     # graceful Ctrl-C
     stop = asyncio.Event()
@@ -425,7 +444,7 @@ async def run():
     bark = BarkDetector()
     playback_mute = threading.Event()
     player = AudioPlayer(mute_guard=playback_mute)
-    print(
+    vprint(
         "[diag] speaker-id enabled={}  bark-detector enabled={}  playback enabled={}".format(
             spkid.enabled, bark.enabled, player.enabled
         )
@@ -462,6 +481,7 @@ async def run():
         input_device=args.input_device,
         analysis_buf=analysis_buf,
         mute_event=playback_mute,
+        verbose=verbose,
     ):
         if stop.is_set():
             break
@@ -474,7 +494,7 @@ async def run():
             break
 
         need = int(args.id_window * args.rate)
-        print(f"[diag] buf_samples={len(analysis_buf)} need~{need}")
+        vprint(f"[diag] buf_samples={len(analysis_buf)} need~{need}")
 
         # One-shot forced enrollment
         if args.force_enroll and not forced_done:
@@ -521,7 +541,8 @@ async def run():
                 if bark.detect(wav_id):
                     context["acoustic_event"] = "dog_bark"
             except Exception as e:
-                print("[diag] bark detect error:", e, file=sys.stderr)
+                if verbose:
+                    print("[diag] bark detect error:", e, file=sys.stderr)
 
         client_event = {}
         if enrolled_name:
@@ -535,6 +556,7 @@ async def run():
             payload["client_event"] = client_event
         if voice_id:
             payload["voice_id"] = voice_id
+        payload["voice_mode"] = args.voice_mode
 
         try:
             r = requests.post(args.broker_url, json=payload, timeout=60)
@@ -553,13 +575,13 @@ async def run():
         # Expect: {"text": "...", "audio": {"audio_base64": "..."}}
         ai_text = body.get("text", "")
         if context.get("speaker_id"):
-            print(f"[ctx] speaker={context['speaker_id']}", end="")
+            vprint(f"[ctx] speaker={context['speaker_id']}", end="")
             if context.get("acoustic_event"):
-                print(f"  event={context['acoustic_event']}")
+                vprint(f"  event={context['acoustic_event']}")
             else:
-                print()
+                vprint()
         elif context.get("acoustic_event"):
-            print(f"[ctx] event={context['acoustic_event']}")
+            vprint(f"[ctx] event={context['acoustic_event']}")
         if client_event:
             print(f"[event] enrolled_speaker={client_event['enrolled_speaker']}")
 
