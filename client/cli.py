@@ -1,77 +1,26 @@
 #!/usr/bin/env python3
-"""
-Minimal+ voice client for the cloud companion — with local speaker-ID and bark detection.
-
-Features
-- Streams microphone audio to Amazon Transcribe (Streaming) via amazon-transcribe SDK
-- Emits ONLY FINAL transcripts
-- Local speaker recognition (SpeechBrain ECAPA-TDNN)
-- Local dog-bark detection (YAMNet on TF Hub)
-- Voice enrollment phrase(s): "enroll my voice as <Name>", "enroll me as <Name>",
-  tolerant variants like "and roll my voice as <Name>", plus "call me <Name>"
-- Manual enroll: press ENTER to enroll last ~3s as 'Major', or type a name then ENTER
-- Optional --force-enroll <Name> to enroll once automatically
-- Voice exit commands (exit/quit/stop listening/goodbye/stop now)
-- Keyboard quit: type 'q' + ENTER
-- Sends context: {"speaker_id": "...", "acoustic_event": "dog_bark"}
-- Sends client_event on enrollment: {"enrolled_speaker": "<Name>"}
-- Honors broker client_event {"command":"exit"}
-- Optional broker TTS mp3 saving (see --save-audio flag)
-
-Install (CPU-only reference set)
-  pip install amazon-transcribe sounddevice numpy requests awscrt
-  pip install torch==2.4.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cpu
-  pip install speechbrain==0.5.16 "huggingface_hub<0.21"
-  pip install tensorflow==2.16.1 tensorflow_hub tensorflow_io==0.36.0
-
-Env
-  AWS_REGION / AWS_DEFAULT_REGION (or pass --region)
-
-Run
-  python client/cli.py --broker-url https://.../ingest/audio --region us-west-2
-"""
-
 from __future__ import annotations
-
-import argparse
-import asyncio
-import base64
-import contextlib
-import json
-import io
-import os
-import queue
-import re
-import signal
-import sys
-import traceback
-import threading
-import uuid
-import warnings
+import argparse, asyncio, base64, contextlib, io, json, os, queue, re, signal, sys, traceback, threading, uuid, warnings, subprocess
 from collections import deque
 from pathlib import Path
-from typing import AsyncGenerator, Optional
+from typing import AsyncGenerator, Optional, Tuple, Dict, Any
 
 import numpy as np
 import requests
 import sounddevice as sd
 
-# Suppress harmless noise
 warnings.filterwarnings("ignore", message="torchvision is not available")
-warnings.filterwarnings(
-    "ignore",
-    message=r"You are using `torch\.load` with `weights_only=False`",
-    category=FutureWarning,
-    module="speechbrain",
-)
 warnings.filterwarnings("ignore", message="pkg_resources is deprecated")
 
-# ---- Amazon Transcribe (streaming) ----
 from amazon_transcribe.client import TranscribeStreamingClient
 from amazon_transcribe.handlers import TranscriptResultStreamHandler
 from amazon_transcribe.model import TranscriptResultStream
 
-# ---- Speaker-ID (SpeechBrain ECAPA) ----
+# Shared identity + audio
+from client import identity
+from client.shared_audio import AudioPlayer
+
+# ---- Speaker embedding (SpeechBrain) ----
 _SPK_READY = False
 try:
     import torch  # noqa: F401
@@ -84,174 +33,24 @@ except Exception as e:
 _SPK_DIR = Path(os.path.expanduser("~/.whaddya/speakers"))
 _SPK_DIR.mkdir(parents=True, exist_ok=True)
 
-
-# ---- AI audio playback (mp3 → speaker) ----
-_MP3_READY = False
+# ---- Optional face recog for image test ----
+_FACE_OK = False
 try:
-    from pydub import AudioSegment  # type: ignore
+    import face_recognition
+    _FACE_OK = True
+except Exception:
+    _FACE_OK = False
 
-    _MP3_READY = True
-except Exception as e:
-    print("[diag] mp3 playback disabled (pydub import failed):", repr(e), file=sys.stderr)
-    _MP3_READY = False
+# ---- Persisted device choices ----
+_STATE_DIR = Path(os.path.expanduser("~/.whaddya"))
+_DEVICES_JSON = _STATE_DIR / "devices.json"
+_STATE_DIR.mkdir(parents=True, exist_ok=True)
 
-
-class AudioPlayer:
-    """Decode mp3 bytes and play them through the default sounddevice output."""
-
-    def __init__(self, mute_guard: threading.Event | None = None) -> None:
-        self.enabled = _MP3_READY
-        self._warned_decode_error = False
-        self._mute_guard = mute_guard
-
-    def _decode(self, data: bytes) -> tuple[np.ndarray, int] | tuple[None, None]:
-        if not self.enabled:
-            return (None, None)
-        try:
-            segment = AudioSegment.from_file(io.BytesIO(data), format="mp3")
-        except Exception as exc:
-            if not self._warned_decode_error:
-                print(
-                    "[diag] unable to decode mp3 audio — install ffmpeg or libav for pydub:",
-                    exc,
-                    file=sys.stderr,
-                )
-                self._warned_decode_error = True
-            return (None, None)
-        samples = np.array(segment.get_array_of_samples())
-        if segment.channels > 1:
-            samples = samples.reshape((-1, segment.channels))
-        else:
-            samples = samples.reshape((-1, 1))
-        scale = float(1 << (8 * segment.sample_width - 1))
-        audio = samples.astype(np.float32) / scale
-        return audio, int(segment.frame_rate)
-
-    async def play(self, data: bytes) -> bool:
-        if not self.enabled:
-            return False
-        if self._mute_guard is not None:
-            self._mute_guard.set()
-        try:
-            loop = asyncio.get_running_loop()
-            audio, rate = await loop.run_in_executor(None, self._decode, data)
-            if audio is None or rate is None:
-                return False
-            sd.play(audio, rate)
-            await loop.run_in_executor(None, sd.wait)
-            if self._mute_guard is not None:
-                await asyncio.sleep(0.15)
-        finally:
-            if self._mute_guard is not None:
-                self._mute_guard.clear()
-        return True
-
-
-class SpeakerID:
-    """Lightweight wrapper around SpeechBrain ECAPA for enroll/identify."""
-    def __init__(self):
-        self.enabled = _SPK_READY
-        self.model = None
-        self.cache: dict[str, np.ndarray] = {}
-
-    def _ensure_model(self):
-        if not self.enabled:
-            return
-        if self.model is None:
-            self.model = EncoderClassifier.from_hparams(
-                source="speechbrain/spkrec-ecapa-voxceleb",
-                run_opts={"device": "cpu"},
-            )
-            for p in _SPK_DIR.glob("*.npy"):
-                try:
-                    self.cache[p.stem] = np.load(p)
-                except Exception:
-                    pass
-
-    def enroll(self, name: str, wav16: np.ndarray) -> bool:
-        """Store/overwrite embedding for `name`. wav16: float32 mono 16kHz."""
-        if not self.enabled:
-            return False
-        self._ensure_model()
-        if self.model is None:
-            return False
-        with torch.no_grad():
-            emb = self.model.encode_batch(torch.from_numpy(wav16).unsqueeze(0))
-        vec = emb.squeeze(0).squeeze(0).cpu().numpy()
-        np.save(_SPK_DIR / f"{name}.npy", vec)
-        self.cache[name] = vec
-        return True
-
-    def identify(self, wav16: np.ndarray, threshold: float = 0.65) -> Optional[str]:
-        """Return best-match name if above cosine-sim threshold, else None."""
-        if not self.enabled:
-            return None
-        self._ensure_model()
-        if self.model is None or not self.cache:
-            return None
-        with torch.no_grad():
-            probe = self.model.encode_batch(torch.from_numpy(wav16).unsqueeze(0))
-        pv = probe.squeeze(0).squeeze(0).cpu().numpy()
-        best, best_name = -1.0, None
-        for name, ref in self.cache.items():
-            sim = float(np.dot(pv, ref) / (np.linalg.norm(pv) * np.linalg.norm(ref) + 1e-9))
-            if sim > best:
-                best, best_name = sim, name
-        return best_name if best >= threshold else None
-
-
-# ---- Bark detector (TFHub YAMNet) ----
-_YAM_READY = False
-try:
-    import tensorflow as tf  # noqa: F401
-    import tensorflow_hub as hub  # type: ignore
-    import tensorflow_io as tfio  # noqa: F401
-    _YAM_READY = True
-except Exception as e:
-    print("[diag] yamnet import error:", repr(e), file=sys.stderr)
-    _YAM_READY = False
-
-
-class BarkDetector:
-    """Binary bark-present detector using YAMNet class scores."""
-    def __init__(self):
-        self.enabled = _YAM_READY
-        self.model = None
-        self.labels = None
-
-    def _ensure_model(self):
-        if not self.enabled or self.model is not None:
-            return
-        self.model = hub.load("https://tfhub.dev/google/yamnet/1")
-        labels_path = hub.resolve("https://tfhub.dev/google/yamnet/1") + "/assets/yamnet_class_map.csv"
-        raw = tf.io.read_file(labels_path).numpy().decode().splitlines()
-        self.labels = [r.split(",")[-1] for r in raw]
-
-    def detect(self, wav16: np.ndarray, prob_threshold: float = 0.25) -> bool:
-        if not self.enabled:
-            return False
-        self._ensure_model()
-        if self.model is None or self.labels is None:
-            return False
-
-        waveform = tf.convert_to_tensor(wav16, dtype=tf.float32)
-        scores, _, _ = self.model(waveform)              # [frames, 521]
-        mean_scores = tf.reduce_mean(scores, axis=0).numpy()  # [521]
-        idx = {lbl: i for i, lbl in enumerate(self.labels)}
-
-        p_dog  = float(mean_scores[idx["Dog"]])  if "Dog"  in idx else 0.0
-        p_bark = float(mean_scores[idx["Bark"]]) if "Bark" in idx else 0.0
-
-        return max(p_dog, p_bark) >= prob_threshold
-
-
-
-# ---- Transcript handler (finals only) ----
+# ---- Finals-only handler ----
 class FinalsOnlyHandler(TranscriptResultStreamHandler):
     def __init__(self, stream: TranscriptResultStream, out_q: asyncio.Queue[str]):
         super().__init__(stream)
         self.out_q = out_q
-
     async def handle_transcript_event(self, transcript_event):
         for result in transcript_event.transcript.results:
             if result.is_partial:
@@ -260,70 +59,44 @@ class FinalsOnlyHandler(TranscriptResultStreamHandler):
             if text.strip():
                 await self.out_q.put(text.strip())
 
-
-# ---- Mic → Transcribe streaming ----
+# ---- Mic → Transcribe ----
 def _bytes_to_float_mono_int16(data: bytes, channels: int) -> np.ndarray:
-    """Convert interleaved int16 bytes to mono float32 [-1,1]."""
     arr = np.frombuffer(data, dtype=np.int16)
     if channels > 1:
         arr = arr.reshape(-1, channels).mean(axis=1).astype(np.int16)
-    f = arr.astype(np.float32) / 32768.0
-    return f
+    return arr.astype(np.float32) / 32768.0
 
-
-async def stream_microphone(
-    *,
-    region: str,
-    language_code: str = "en-US",
-    sample_rate: int = 16000,
-    channels: int = 1,
-    blocksize: int = 4096,
-    input_device: int | None = None,
-    analysis_buf: deque | None = None,
-    mute_event: threading.Event | None = None,
-    verbose: bool = False,
-) -> AsyncGenerator[str, None]:
-    """Yield FINAL transcripts; optionally fill analysis_buf with float32 @16k mono."""
+async def stream_microphone(*, region: str, language_code="en-US", sample_rate=16000, channels=1,
+                            blocksize=4096, input_device: int|None=None,
+                            analysis_buf: deque|None=None, mute_event: threading.Event|None=None,
+                            verbose=False) -> AsyncGenerator[str, None]:
     client = TranscribeStreamingClient(region=region)
     stream = await client.start_stream_transcription(
-        language_code=language_code,
-        media_sample_rate_hz=sample_rate,
-        media_encoding="pcm",
+        language_code=language_code, media_sample_rate_hz=sample_rate, media_encoding="pcm",
     )
-
     loop = asyncio.get_running_loop()
     raw_q: queue.Queue[bytes] = queue.Queue(maxsize=100)
     async_q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=100)
-
     def audio_cb(indata, frames, time_info, status):
         if status and verbose:
             print(status, file=sys.stderr)
-        if mute_event is not None and mute_event.is_set():
-            return
         try:
             raw = bytes(indata)
             if analysis_buf is not None:
                 fmono = _bytes_to_float_mono_int16(raw, channels)
                 analysis_buf.extend(fmono.tolist())
+            if mute_event is not None and mute_event.is_set():
+                return
             raw_q.put_nowait(raw)
         except queue.Full:
             pass
-
     def mic_thread():
-        with sd.RawInputStream(
-            samplerate=sample_rate,
-            blocksize=blocksize,
-            dtype="int16",
-            channels=channels,
-            device=input_device,
-            callback=audio_cb,
-        ):
+        with sd.RawInputStream(samplerate=sample_rate, blocksize=blocksize, dtype="int16",
+                               channels=channels, device=input_device, callback=audio_cb):
             while True:
                 chunk = raw_q.get()
                 loop.call_soon_threadsafe(async_q.put_nowait, chunk)
-
     threading.Thread(target=mic_thread, daemon=True).start()
-
     async def sender():
         try:
             while True:
@@ -331,13 +104,10 @@ async def stream_microphone(
                 await stream.input_stream.send_audio_event(audio_chunk=chunk)
         finally:
             await stream.input_stream.end_stream()
-
     finals_q: asyncio.Queue[str] = asyncio.Queue()
     handler = FinalsOnlyHandler(stream.output_stream, finals_q)
-
     send_task = asyncio.create_task(sender())
     recv_task = asyncio.create_task(handler.handle_events())
-
     try:
         while True:
             text = await finals_q.get()
@@ -346,25 +116,17 @@ async def stream_microphone(
         send_task.cancel()
         recv_task.cancel()
 
-
-# ---- Helpers ----
-# Accept STT goofs: "and roll", "in roll", "role", etc., plus "call me <Name>"
+# ---- Helpers / commands ----
 _ENROLL_RE = re.compile(
     r"""(?xi)
-    \b(?:enrol+|in\s*rol+|and\s*rol+|role)\s+
-      (?:my\s+voice|me)\s*
-      (?:as\s+)?                               # optional 'as'
-      (?:
-        (?:i'?m|i\s+am|this\s+is|says)\s+      # optional bridge
-      )?
-      ([A-Za-z][\w\s'\-]{0,31})\b
-    |
-    \bcall\s+me\s+([A-Za-z][\w\s'\-]{0,31})\b
-    """,
+    \b(?:enrol+|in\s*rol+|and\s*rol+|role)\s+(?:my\s+voice|me)\s*
+      (?:as\s+)?(?:(?:i'?m|i\s+am|this\s+is|says)\s+)?([A-Za-z][\w\s'\-]{0,31})\b
+    | \bcall\s+me\s+([A-Za-z][\w\s'\-]{0,31})\b
+    """
 )
-
 _EXIT_RE = re.compile(r"\b(exit|quit|stop listening|goodbye|stop now)\b", re.I)
-
+_WAKE_RE = re.compile(r"\b(?:hey|ok|okay)\s+marvin\b", re.I)
+_MONITOR_RE = re.compile(r"^\s*marvin[, ]+monitor\b", re.I)
 
 def parse_enrollment(text: str) -> Optional[str]:
     m = _ENROLL_RE.search(text)
@@ -374,60 +136,153 @@ def parse_enrollment(text: str) -> Optional[str]:
     name = re.sub(r"\s+", " ", name)
     return name or None
 
-
 def take_latest_seconds(buf: deque, seconds: float, rate: int) -> Optional[np.ndarray]:
     need = int(seconds * rate)
     if len(buf) < need:
         return None
     arr = np.array([buf[i] for i in range(len(buf) - need, len(buf))], dtype=np.float32)
     mx = float(np.max(np.abs(arr))) + 1e-9
-    arr = arr / mx
-    return arr
+    return arr / mx
 
+# ---- Device helpers ----
+def _detect_cameras(max_index: int = 10) -> list[dict]:
+    import cv2
+    found=[]
+    for idx in range(max_index):
+        cap = cv2.VideoCapture(idx)
+        ok = cap is not None and cap.isOpened()
+        if ok:
+            ret,_ = cap.read()
+            cap.release()
+            if ret: found.append({"index": str(idx), "label": f"Camera {idx}"})
+        elif cap is not None:
+            cap.release()
+    return found
 
-# ---- CLI / Broker loop ----
+def _describe_audio_devices():
+    try:
+        devs = sd.query_devices()
+    except Exception as exc:
+        raise RuntimeError(f"Unable to query audio devices: {exc}") from exc
+    hostapis = sd.query_hostapis()
+    mics, spk = [], []
+    for idx, d in enumerate(devs):
+        ha = hostapis[d["hostapi"]]["name"] if hostapis and 0 <= d.get("hostapi",-1) < len(hostapis) else ""
+        label = f"{d['name']} ({ha})" if ha else d["name"]
+        ent = {"index": str(idx), "label": label}
+        if d.get("max_input_channels",0)>0: mics.append(ent)
+        if d.get("max_output_channels",0)>0: spk.append(ent)
+    return mics, spk
+
+def _prompt_choice(options, title):
+    print(f"[{title}]")
+    for i,opt in enumerate(options, start=1):
+        print(f"  {i}. {opt['label']} (index {opt['index']})")
+    default_idx=1
+    while True:
+        try: raw=input(f"Select {title.lower()} [default {default_idx}]: ").strip()
+        except EOFError: raw=""
+        choice = default_idx if not raw else (int(raw) if raw.isdigit() else None)
+        if choice and 1<=choice<=len(options):
+            sel = int(options[choice-1]["index"])
+            print(f"[selected] {options[choice-1]['label']}")
+            return sel
+        print("Invalid selection, try again.")
+
+def device_setup_interactive() -> Tuple[int,int,int]:
+    cams = _detect_cameras()
+    if not cams: raise RuntimeError("No usable cameras detected.")
+    cam = _prompt_choice(cams, "Available Cameras")
+    mics, sp = _describe_audio_devices()
+    if not mics: raise RuntimeError("No microphones detected.")
+    mic = _prompt_choice(mics, "Available Microphones")
+    sd.check_input_settings(device=mic, samplerate=16000, channels=1)
+    with sd.InputStream(device=mic, channels=1, samplerate=16000) as s: s.read(1)
+    print("[ok] microphone test passed.")
+    if not sp: raise RuntimeError("No speakers detected.")
+    spk = _prompt_choice(sp, "Available Speakers")
+    sd.check_output_settings(device=spk, samplerate=16000, channels=1)
+    import numpy as np
+    dur=0.2; t=np.linspace(0,dur,int(16000*dur),False); tone=0.2*np.sin(2*np.pi*880*t)
+    sd.play(tone, samplerate=16000, device=spk); sd.wait()
+    print("[ok] speaker test passed.")
+    _DEVICES_JSON.write_text(json.dumps({"camera_index":cam,"mic_index":mic,"speaker_index":spk}, indent=2))
+    print(f"[saved] {_DEVICES_JSON}")
+    return cam, mic, spk
+
+def load_saved_devices() -> Tuple[int|None,int|None,int|None]:
+    if _DEVICES_JSON.exists():
+        try:
+            d=json.loads(_DEVICES_JSON.read_text())
+            return d.get("camera_index"), d.get("mic_index"), d.get("speaker_index")
+        except Exception:
+            return None,None,None
+    return None,None,None
+
+# ---- Voice embedding model (for identity) ----
+class SpeakerEmbed:
+    def __init__(self):
+        self.enabled = _SPK_READY
+        self.model = None
+    def _ensure(self):
+        if not self.enabled: return
+        if self.model is None:
+            self.model = EncoderClassifier.from_hparams(
+                source="speechbrain/spkrec-ecapa-voxceleb",
+                run_opts={"device":"cpu"},
+            )
+    def embed(self, wav16: np.ndarray) -> Optional[np.ndarray]:
+        if not self.enabled: return None
+        self._ensure()
+        if self.model is None: return None
+        with torch.no_grad():
+            emb = self.model.encode_batch(torch.from_numpy(wav16).unsqueeze(0))
+        return emb.squeeze(0).squeeze(0).cpu().numpy().astype(np.float32)
+
+# ---- CLI loop ----
 async def run():
-    ap = argparse.ArgumentParser(description="Cloud AI companion voice client (+speaker-ID, bark detect)")
-    ap.add_argument("--broker-url", required=True, help="API Gateway invoke URL (e.g., https://xxx.execute-api.../ingest/audio)")
-    ap.add_argument("--session", default=str(uuid.uuid4()), help="Session UUID (auto if omitted)")
+    ap = argparse.ArgumentParser(description="Voice client (unified identity + monitor trigger)")
+    ap.add_argument("--broker-url", required=True)
+    ap.add_argument("--session", default=str(uuid.uuid4()))
     ap.add_argument("--region", default=os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "us-west-2")
-    ap.add_argument("--language", default="en-US", help="Transcribe language code (default: en-US)")
-    ap.add_argument("--input-device", type=int, default=None, help="sounddevice input device index (optional)")
-    ap.add_argument("--rate", type=int, default=16000, help="sample rate (default 16000)")
-    ap.add_argument("--channels", type=int, default=1, help="mic channels (default 1)")
-    ap.add_argument("--id-threshold", type=float, default=0.65, help="speaker cosine threshold (default 0.65)")
-    ap.add_argument("--id-window", type=float, default=2.0, help="seconds of audio for ID/enroll (default 2.0)")
-    ap.add_argument("--force-enroll", default=None, help="Enroll given name from the first usable buffer (one-shot)")
-    ap.add_argument(
-        "--voice",
-        default=os.getenv("POLLY_VOICE"),
-        help="Optional Amazon Polly voice ID override (default: server configuration)",
-    )
-    ap.add_argument(
-        "--voice-mode",
-        choices=["standard", "neural", "generative"],
-        default="standard",
-        help="Preferred voice synthesis mode (default: standard)",
-    )
-    ap.add_argument(
-        "--save-audio",
-        action="store_true",
-        help="Save broker audio responses to ./output/ (default: disabled)",
-    )
-    ap.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Enable verbose diagnostics and debugging output",
-    )
+    ap.add_argument("--language", default="en-US")
+    ap.add_argument("--input-device", type=int, default=None)
+    ap.add_argument("--setup-devices", action="store_true")
+    ap.add_argument("--identify-image", type=str, default=None, help="Optional: identify a face from an image and exit")
+    ap.add_argument("--rate", type=int, default=16000)
+    ap.add_argument("--channels", type=int, default=1)
+    ap.add_argument("--id-threshold", type=float, default=0.65)
+    ap.add_argument("--id-window", type=float, default=2.0)
+    ap.add_argument("--force-enroll", default=None)
+    ap.add_argument("--voice", default=os.getenv("POLLY_VOICE"))
+    ap.add_argument("--voice-mode", choices=["standard","neural","generative"], default="standard")
+    ap.add_argument("--save-audio", action="store_true")
+    ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
+
+    # Face ID one-shot (shared memory)
+    if args.identify-image:
+        if not _FACE_OK:
+            print("[face] face_recognition not available.", file=sys.stderr)
+            sys.exit(2)
+        img = face_recognition.load_image_file(args.identify-image)  # noqa: E999 (dash)
+        locs = face_recognition.face_locations(img, model="hog")
+        if not locs:
+            print("No face found.")
+            sys.exit(1)
+        encs = face_recognition.face_encodings(img, locs, num_jitters=1)
+        name = identity.identify_face(encs[0])
+        print(f"Identity: {name or 'Unknown'}")
+        sys.exit(0)
 
     voice_id = (args.voice or "").strip() or None
     verbose = bool(args.verbose)
     save_audio = bool(args.save_audio)
-    # Optional low-level HTTP debug for requests/urllib3
+
+    # HTTP wire logs toggle
     if "--debug-http" in sys.argv:
         try:
-            import http.client as _http_client  # type: ignore
+            import http.client as _http_client
             _http_client.HTTPConnection.debuglevel = 1
             import logging
             logging.basicConfig()
@@ -438,58 +293,50 @@ async def run():
             pass
 
     def vprint(*vargs, **vkwargs):
-        if verbose:
-            print(*vargs, **vkwargs)
+        if verbose: print(*vargs, **vkwargs)
 
-    if voice_id:
-        vprint(f"[diag] overriding Polly voice to '{voice_id}'")
+    if voice_id: vprint(f"[diag] Polly voice → {voice_id}")
+    vprint(f"[diag] voice mode = {args.voice_mode}")
 
-    vprint(f"[diag] voice mode set to {args.voice_mode}")
-
-    print(f"Starting session {args.session} (region={args.region}, lang={args.language})")
-    vprint("Tip: list devices with:\n  python - <<'PY'\nimport sounddevice as sd; print(sd.query_devices())\nPY\n")
-
-    # graceful Ctrl-C
-    stop = asyncio.Event()
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    cam_idx_s, mic_idx_s, spk_idx_s = load_saved_devices()
+    cam_idx = cam_idx_s
+    mic_idx = args.input_device if args.input_device is not None else mic_idx_s
+    spk_idx = spk_idx_s
+    if args.setup_devices or cam_idx is None or mic_idx is None or spk_idx is None:
         try:
-            asyncio.get_running_loop().add_signal_handler(sig, stop.set)
-        except NotImplementedError:
-            pass
+            cam_idx, mic_idx, spk_idx = device_setup_interactive()
+        except Exception as e:
+            print(f"[device setup error] {e}", file=sys.stderr)
+    try:
+        if mic_idx is not None or spk_idx is not None:
+            sd.default.device = (mic_idx, spk_idx)
+    except Exception:
+        pass
+    print(f"Session {args.session}  region={args.region}  devices: camera={cam_idx} mic={mic_idx} spk={spk_idx}")
 
-    # Rolling analysis buffer at 16k mono floats
-    analysis_buf = deque(maxlen=int(args.rate * 6))  # keep last ~6 seconds
-
-    # Models
-    spkid = SpeakerID()
-    bark = BarkDetector()
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
     playback_mute = threading.Event()
     player = AudioPlayer(mute_guard=playback_mute)
-    vprint(
-        "[diag] speaker-id enabled={}  bark-detector enabled={}  playback enabled={}".format(
-            spkid.enabled, bark.enabled, player.enabled
-        )
-    )
-    print(
-        "[hint] Press ENTER to enroll last ~3s as 'Major' (or type a name then ENTER). "
-        "Type 'q' + ENTER to quit, 'r' + ENTER to reset the listener."
-    )
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try: loop.add_signal_handler(sig, lambda s=sig: (player.stop(), stop.set()))
+        except NotImplementedError: pass
 
-    # Manual enroll / quit via stdin
-    loop = asyncio.get_running_loop()
+    analysis_buf = deque(maxlen=int(args.rate * 6))
+    spk_embed = SpeakerEmbed()
+
+    # stdin watcher
     manual_q: asyncio.Queue[str] = asyncio.Queue()
-
     def _stdin_watcher():
         try:
             while True:
                 line = sys.stdin.readline()
-                if not line:
-                    break
+                if not line: break
                 s = line.strip()
                 try:
-                    if s.lower() in ("q", "quit", "exit"):
+                    if s.lower() in ("q","quit","exit"):
                         loop.call_soon_threadsafe(manual_q.put_nowait, "__QUIT__")
-                    elif s.lower() in ("r", "reset", "restart"):
+                    elif s.lower() in ("r","reset","restart"):
                         loop.call_soon_threadsafe(manual_q.put_nowait, "__RESET__")
                     else:
                         loop.call_soon_threadsafe(manual_q.put_nowait, s)
@@ -497,248 +344,158 @@ async def run():
                     break
         except Exception:
             pass
-
     threading.Thread(target=_stdin_watcher, daemon=True).start()
 
-    forced_done = False
+    # Mic stream
+    mic = stream_microphone(region=args.region, language_code=args.language, sample_rate=args.rate,
+                            channels=args.channels, input_device=mic_idx, analysis_buf=analysis_buf,
+                            mute_event=playback_mute, verbose=verbose)
+    mic_task = asyncio.create_task(mic.__anext__())
+    reset_requested = False
+    cmd_window_until = 0.0
     playback_warned = False
-    while not stop.is_set():
-        mic = stream_microphone(
-            region=args.region,
-            language_code=args.language,
-            sample_rate=args.rate,
-            channels=args.channels,
-            input_device=args.input_device,
-            analysis_buf=analysis_buf,
-            mute_event=playback_mute,
-            verbose=verbose,
-        )
+    forced_done = False
 
-        mic_task = asyncio.create_task(mic.__anext__())
-        reset_requested = False
-
-        try:
-            while not stop.is_set():
-                # Handle manual keyboard commands promptly
-                handled_manual = False
-                while True:
-                    try:
-                        typed = manual_q.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
-
-                    handled_manual = True
-                    if typed == "__QUIT__":
-                        print("[keyboard] quit requested — shutting down.")
-                        stop.set()
-                        break
-                    if typed == "__RESET__":
-                        print("[keyboard] reset requested — restarting listener.")
-                        analysis_buf.clear()
-                        reset_requested = True
-                        break
-
-                    target = typed if typed else "Major"
-                    wav_m = take_latest_seconds(analysis_buf, max(args.id_window, 3.0), args.rate)
-                    if wav_m is not None and spkid.enroll(target, wav_m):
-                        print(f"[enrolled voice] {target} (manual)")
+    try:
+        while not stop.is_set():
+            # manual keys
+            handled_manual=False
+            while True:
+                try: typed = manual_q.get_nowait()
+                except asyncio.QueueEmpty: break
+                handled_manual=True
+                if typed=="__QUIT__":
+                    print("[keyboard] quit — shutting down."); stop.set(); break
+                if typed=="__RESET__":
+                    print("[keyboard] reset listener."); analysis_buf.clear(); reset_requested=True; break
+                # manual enroll: last ~3s
+                wav_m = take_latest_seconds(analysis_buf, max(args.id_window, 3.0), args.rate)
+                if wav_m is None:
+                    print("[enroll] not enough audio.")
+                else:
+                    vec = spk_embed.embed(wav_m)
+                    if vec is not None:
+                        identity.enroll_voice(typed or "Major", vec)
+                        print(f"[enrolled voice] {typed or 'Major'}")
                     else:
-                        print(
-                            "[enrollment failed] buffer too short or model unavailable",
-                            file=sys.stderr,
-                        )
+                        print("[enroll] speaker embed unavailable.", file=sys.stderr)
+            if stop.is_set() or reset_requested: break
+            if handled_manual: continue
 
-                if stop.is_set() or reset_requested:
-                    break
+            # next transcript
+            try: transcript = await asyncio.wait_for(asyncio.shield(mic_task), timeout=0.2)
+            except asyncio.TimeoutError: continue
+            except StopAsyncIteration: stop.set(); break
+            mic_task = asyncio.create_task(mic.__anext__())
+            print(f"YOU: {transcript}")
 
-                if handled_manual:
-                    continue
-
+            # monitor trigger
+            if _MONITOR_RE.search(transcript):
+                cmd = [
+                    sys.executable, "-m", "client.monitor",
+                    f"--camera-index={cam_idx if cam_idx is not None else 0}",
+                    f"--mic-index={mic_idx if mic_idx is not None else -1}",
+                    f"--speaker-index={spk_idx if spk_idx is not None else -1}",
+                    "--tts=auto", "--voice", (voice_id or ""),
+                ]
                 try:
-                    transcript = await asyncio.wait_for(asyncio.shield(mic_task), timeout=0.2)
-                except asyncio.TimeoutError:
-                    continue
-                except StopAsyncIteration:
-                    stop.set()
-                    break
+                    subprocess.Popen(cmd, stdout=None, stderr=None, close_fds=True)
+                    print("[monitor] started (press 'q' in its window to quit).")
+                except Exception as e:
+                    print(f"[monitor error] {e}", file=sys.stderr)
+                continue
 
-                mic_task = asyncio.create_task(mic.__anext__())
+            # wake-gated exit
+            now = loop.time()
+            if _WAKE_RE.search(transcript):
+                cmd_window_until = now + 8.0
+                print("[marvin] command mode enabled (8s).")
+                continue
+            if _EXIT_RE.search(transcript):
+                if now <= cmd_window_until:
+                    print("[voice] exit requested — shutting down."); stop.set(); break
+                else:
+                    print("[voice] 'exit' ignored (say 'hey Marvin' first).")
 
-                print(f"YOU: {transcript}")
+            # enrollment via phrase
+            name = parse_enrollment(transcript)
+            if name:
+                wav = take_latest_seconds(analysis_buf, args.id_window, args.rate)
+                if wav is not None:
+                    vec = spk_embed.embed(wav)
+                    if vec is not None:
+                        identity.enroll_voice(name, vec); print(f"[enrolled voice] {name}")
+                # no else: silent
 
-                # Local voice exit
-                if _EXIT_RE.search(transcript):
-                    print("[voice] exit requested — shutting down.")
-                    stop.set()
-                    break
+            # build context with voice ID from shared registry
+            wav_id = take_latest_seconds(analysis_buf, args.id_window, args.rate)
+            context: Dict[str, Any] = {}
+            if wav_id is not None:
+                vec = spk_embed.embed(wav_id)
+                if vec is not None:
+                    who = identity.identify_voice(vec, threshold=args.id_threshold)
+                    if who: context["speaker_id"] = who
 
-                need = int(args.id_window * args.rate)
-                vprint(f"[diag] buf_samples={len(analysis_buf)} need~{need}")
-
-                # One-shot forced enrollment
-                if args.force_enroll and not forced_done:
-                    wav_fe = take_latest_seconds(analysis_buf, args.id_window, args.rate)
-                    if wav_fe is not None and spkid.enroll(args.force_enroll, wav_fe):
-                        forced_done = True
-                        print(f"[enrolled voice] {args.force_enroll} (forced)")
-
-                # Enrollment phrase from transcript
-                enrolled_name = None
-                name = parse_enrollment(transcript)
-                if name:
-                    wav = take_latest_seconds(analysis_buf, args.id_window, args.rate)
-                    if wav is not None and spkid.enroll(name, wav):
-                        enrolled_name = name
-                        print(f"[enrolled voice] {name}")
-                    else:
-                        print(
-                            "[enrollment failed] not enough audio or model unavailable.",
-                            file=sys.stderr,
-                        )
-
-                # Build context for broker
-                context = {}
-                wav_id = take_latest_seconds(analysis_buf, args.id_window, args.rate)
-                if wav_id is not None:
-                    who = spkid.identify(wav_id, threshold=args.id_threshold)
-                    if who:
-                        context["speaker_id"] = who
+            # POST to broker
+            payload = {"session_id": args.session, "text": transcript, "voice_mode": args.voice_mode}
+            if voice_id: payload["voice_id"] = voice_id
+            if context: payload["context"] = context
+            if verbose:
+                print(f"[diag] POST {args.broker_url}")
+                print("[diag] payload=", json.dumps(payload, indent=2))
+            try:
+                r = requests.post(args.broker_url, json=payload, timeout=60, headers={"X-Client-Session": args.session})
+                if not r.ok:
+                    rid = r.headers.get("x-amzn-RequestId") or r.headers.get("x-amz-apigw-id") or "?"
+                    print(f"[broker error] HTTP {r.status_code} {r.reason}  request-id={rid}", file=sys.stderr)
+                    h_subset = {k: r.headers.get(k) for k in ["x-amzn-RequestId","x-amz-apigw-id","content-type","date"] if r.headers.get(k)}
+                    if h_subset: print(f"[broker headers] {h_subset}", file=sys.stderr)
                     try:
-                        if bark.detect(wav_id):
-                            context["acoustic_event"] = "dog_bark"
-                    except Exception as e:
-                        if verbose:
-                            print("[diag] bark detect error:", e, file=sys.stderr)
-
-                client_event = {}
-                if enrolled_name:
-                    client_event["enrolled_speaker"] = enrolled_name
-
-                # POST to broker
-                payload = {"session_id": args.session, "text": transcript}
-                if context:
-                    payload["context"] = context
-                if client_event:
-                    payload["client_event"] = client_event
-                if voice_id:
-                    payload["voice_id"] = voice_id
-                payload["voice_mode"] = args.voice_mode
-
-                vprint(f"[diag] POST {args.broker_url}")
-                vprint("[diag] payload=", json.dumps(payload, indent=2) if verbose else "<hidden>")
-                try:
-                    r = requests.post(
-                        args.broker_url,
-                        json=payload,
-                        timeout=60,
-                        headers={"X-Client-Session": args.session},
-                    )
-                    if not r.ok:
-                        # Rich error: status, request IDs, headers, body
-                        rid = r.headers.get("x-amzn-RequestId") or r.headers.get("x-amz-apigw-id") or "?"
-                        print(
-                            f"[broker error] HTTP {r.status_code} {r.reason}  request-id={rid}",
-                            file=sys.stderr,
-                        )
-                        # Show a compact header subset that’s useful for AWS
-                        h_subset = {k: r.headers.get(k) for k in [
-                            "x-amzn-RequestId", "x-amz-apigw-id", "content-type", "date"
-                        ] if r.headers.get(k)}
-                        if h_subset:
-                            print(f"[broker headers] {h_subset}", file=sys.stderr)
-                        # Try JSON body first; fall back to text
-                        try:
-                            errj = r.json()
-                            print("[broker body.json]", json.dumps(errj, indent=2), file=sys.stderr)
-                        except Exception:
-                            body_text = (r.text or "").strip()
-                            if body_text:
-                                # Keep it on one screen if it's huge
-                                preview = body_text if len(body_text) < 4000 else body_text[:4000] + "\n…(truncated)…"
-                                print("[broker body.text]", preview, file=sys.stderr)
-                        # Local traceback context if something else raised
-                        vprint("[diag] call-site", traceback.format_stack()[-2].strip())
-                        continue
-                    body = r.json()
-                except requests.RequestException as e:
-                    # Network/timeout/connection errors
-                    msg = getattr(e, "args", [repr(e)])[0]
-                    print(f"[broker error] request failed: {msg}", file=sys.stderr)
-                    try:
-                        r = e.response
-                        if r is not None:
-                            rid = r.headers.get("x-amzn-RequestId") or r.headers.get("x-amz-apigw-id") or "?"
-                            print(
-                                f"[broker error] HTTP {r.status_code} {r.reason} request-id={rid}",
-                                file=sys.stderr,
-                            )
-                            print("[broker body]", r.text, file=sys.stderr)
+                        errj=r.json(); print("[broker body.json]", json.dumps(errj, indent=2), file=sys.stderr)
                     except Exception:
-                        pass
-                    vprint("[diag] exception", traceback.format_exc())
+                        bt=(r.text or "").strip()
+                        if bt: print("[broker body.text]", bt[:4000]+("…(truncated)…" if len(bt)>4000 else ""), file=sys.stderr)
                     continue
+                body=r.json()
+            except requests.RequestException as e:
+                print(f"[broker error] request failed: {getattr(e,'args',[repr(e)])[0]}", file=sys.stderr)
+                continue
 
-                # Honor broker-requested exit
-                ce = body.get("client_event") or {}
-                if isinstance(ce, dict) and ce.get("command") == "exit":
-                    print("[broker] requested exit — shutting down.")
-                    stop.set()
-                    break
-
-                # Expect: {"text": "...", "audio": {"audio_base64": "..."}}
-                ai_text = body.get("text", "")
-                if context.get("speaker_id"):
-                    vprint(f"[ctx] speaker={context['speaker_id']}", end="")
-                    if context.get("acoustic_event"):
-                        vprint(f"  event={context['acoustic_event']}")
-                    else:
-                        vprint()
-                elif context.get("acoustic_event"):
-                    vprint(f"[ctx] event={context['acoustic_event']}")
-                if client_event:
-                    print(f"[event] enrolled_speaker={client_event['enrolled_speaker']}")
-
-                print(f"AI:  {ai_text}")
-
-                audio_b64 = (body.get("audio") or {}).get("audio_base64")
-                if audio_b64:
-                    audio_bytes = base64.b64decode(audio_b64)
-                    if save_audio:
-                        outdir = Path("output")
-                        outdir.mkdir(exist_ok=True)
-                        out = outdir / f"response-{uuid.uuid4()}.mp3"
-                        out.write_bytes(audio_bytes)
-                        print(f"[saved] {out}")
+            # TTS playback (abortable / barge-in)
+            ai_text = body.get("text","")
+            print(f"AI:  {ai_text}")
+            audio_b64 = (body.get("audio") or {}).get("audio_base64")
+            if audio_b64:
+                audio_bytes = base64.b64decode(audio_b64)
+                async def _barge_monitor():
+                    need = int(0.3 * args.rate)
+                    while playback_mute.is_set() and not stop.is_set():
+                        if len(analysis_buf) >= need:
+                            arr = np.array([analysis_buf[i] for i in range(len(analysis_buf) - need, len(analysis_buf))], dtype=np.float32)
+                            rms = float(np.sqrt(np.mean(arr * arr)))
+                            if rms >= 0.04:
+                                player.stop(); break
+                        await asyncio.sleep(0.05)
+                bm = asyncio.create_task(_barge_monitor())
+                try:
                     played = await player.play(audio_bytes)
-                    if not played and not playback_warned:
-                        print(
-                            "[hint] Install 'pydub' and ffmpeg (or libav) to enable speaker playback.",
-                            file=sys.stderr,
-                        )
-                        playback_warned = True
+                finally:
+                    bm.cancel()
+                if not played and not playback_warned:
+                    print("[hint] Install pydub + ffmpeg/libav for mp3 playback.", file=sys.stderr)
+                    playback_warned=True
 
-        finally:
-            mic_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
-                await mic_task
-            with contextlib.suppress(Exception):
-                await mic.aclose()
-
-        if stop.is_set():
-            break
-        if reset_requested:
-            continue
-        break
-
+    finally:
+        mic_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
+            await mic_task
+        with contextlib.suppress(Exception):
+            await mic.aclose()
     print("Exiting.")
 
-
 def main():
-    try:
-        asyncio.run(run())
-    except KeyboardInterrupt:
-        pass
+    try: asyncio.run(run())
+    except KeyboardInterrupt: pass
 
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
