@@ -17,7 +17,7 @@ Globals:
         CONVERSATION_TABLE: !Ref ConversationTable
         AUDIO_BUCKET: !Ref AudioBucket
         # --- LLM / TTS ---
-        MODEL_ID: anthropic.claude-3-5-sonnet-20241022-v2:0
+        MODEL_ID: evolutionary-scale-esm3
         POLLY_VOICE: Joanna
         # Optional: external LLM secret ARN (pass empty to skip)
         LLM_SECRET_ID: !Ref LLMSecretArn
