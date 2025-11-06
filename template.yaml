@@ -51,9 +51,15 @@ Parameters:
     Default: 5
     MinValue: 0
     Description: Hard cap on concurrent Lambda invocations (0 disables)
+  EnableApiAccessLogs:
+    Type: String
+    AllowedValues: ["true","false"]
+    Default: "true"
+    Description: Enable HttpApi access logs (single-line JSON). Disable if you hit log config issues.
 
 Conditions:
   HasSecret: !Not [!Equals [!Ref LLMSecretArn, ""]]
+  EnableLogs: !Equals [!Ref EnableApiAccessLogs, "true"]
 
 Resources:
   # --------- State (optional memory toggle only affects app behavior) ----------
@@ -95,6 +101,7 @@ Resources:
             ExpirationInDays: 7
             AbortIncompleteMultipartUpload:
               DaysAfterInitiation: 7
+
   AudioBucketPolicy:
     Type: AWS::S3::BucketPolicy
     Properties:
@@ -113,6 +120,30 @@ Resources:
               Bool:
                 aws:SecureTransport: false
 
+  # --------- API (HTTP API with logs + CORS) ----------
+  HttpApiLogs:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableLogs
+    Properties:
+      LogGroupName: !Sub "/aws/apigw/${AWS::StackName}-http"
+      RetentionInDays: 7
+
+  BrokerHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: $default
+      CorsConfiguration:
+        AllowOrigins: ['*']             # tighten later
+        AllowMethods: ['POST','OPTIONS']
+        AllowHeaders: ['content-type','x-client-session']
+      AccessLogSettings:
+        # Only include access logs when enabled
+        !If
+          - EnableLogs
+          - DestinationArn: !GetAtt HttpApiLogs.Arn
+            Format: '{ "requestId":"$context.requestId","status":$context.status,"integrationStatus":"$context.integrationStatus","integrationError":"$context.integrationErrorMessage","ip":"$context.identity.sourceIp","ua":"$context.identity.userAgent","path":"$context.path" }'
+          - !Ref "AWS::NoValue"
+
   # --------- Shared Python layer ----------
   SharedLayer:
     Type: AWS::Serverless::LayerVersion
@@ -121,29 +152,6 @@ Resources:
       ContentUri: layers/shared
       CompatibleRuntimes: [python3.11]
       RetentionPolicy: Delete
-
-  # --------- API (HTTP API with logs + CORS) ----------
-  HttpApiLogs:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub "/aws/apigw/${AWS::StackName}-http"
-      RetentionInDays: 7
-  BrokerHttpApi:
-    Type: AWS::Serverless::HttpApi
-    Properties:
-      StageName: $default
-      CorsConfiguration:
-        AllowOrigins: ['*']        # tighten to your origin(s) when you know them
-        AllowMethods: ['POST','OPTIONS']
-        AllowHeaders: ['content-type','x-client-session']
-      AccessLogSettings:
-        DestinationArn: !GetAtt HttpApiLogs.Arn
-        Format: >-
-          { "requestId":"$context.requestId","status":$context.status,
-            "integrationStatus":"$context.integrationStatus",
-            "integrationError":"$context.integrationErrorMessage",
-            "ip":"$context.identity.sourceIp","ua":"$context.identity.userAgent",
-            "path":"$context.path" }
 
   # --------- Broker Lambda ----------
   BrokerFunctionLogGroup:
@@ -169,13 +177,11 @@ Resources:
             Path: /ingest/audio
             Method: POST
       Policies:
-        # Basic execution + X-Ray
         - AWSLambdaBasicExecutionRole
         - AWSXrayWriteOnlyAccess
-        # Inline policy doc for service access
         - Version: '2012-10-17'
           Statement:
-            # DynamoDB (session memory). Safe even if USE_MEMORY=false.
+            # DynamoDB (session memory)
             - Effect: Allow
               Action:
                 - dynamodb:GetItem
@@ -185,7 +191,7 @@ Resources:
             - Effect: Allow
               Action: [polly:SynthesizeSpeech]
               Resource: '*'
-            # Bedrock (cover both classic InvokeModel and new Converse APIs)
+            # Bedrock (InvokeModel + Converse)
             - Effect: Allow
               Action:
                 - bedrock:InvokeModel
@@ -199,7 +205,6 @@ Resources:
                 - s3:PutObject
                 - s3:GetObject
               Resource: !Sub '${AudioBucket.Arn}/*'
-        # Conditionally add Secrets Manager permission iff an ARN was provided
         - !If
           - HasSecret
           - Version: '2012-10-17'
