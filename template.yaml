@@ -7,7 +7,7 @@ Globals:
     Runtime: python3.11
     Timeout: 30
     MemorySize: 512
-    Architectures: [arm64]          # IMPORTANT on Apple Silicon
+    Architectures: [arm64]
     Environment:
       Variables:
         CONVERSATION_TABLE: !Ref ConversationTable
@@ -15,6 +15,11 @@ Globals:
         LLM_SECRET_ID: !Ref LLMSecretArn
         POLLY_VOICE: Joanna
         HISTORY_LIMIT: 12
+
+Parameters:
+  LLMSecretArn:
+    Type: String
+    Description: ARN of the Secrets Manager secret containing the OpenAI/LLM API key
 
 Resources:
   ConversationTable:
@@ -40,17 +45,26 @@ Resources:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
 
+  SharedLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: shared-companion
+      ContentUri: layers/shared
+      CompatibleRuntimes:
+        - python3.11
+      RetentionPolicy: Delete
+
   BrokerFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: lambda/broker/
       Handler: app.handler
-      # Least-privilege inline policies; drop broad *FullAccess managed policies
+      Layers:
+        - !Ref SharedLayer
       Policies:
         - AWSLambdaBasicExecutionRole
         - Version: '2012-10-17'
           Statement:
-            # DynamoDB (table write/read for conversation)
             - Effect: Allow
               Action:
                 - dynamodb:PutItem
@@ -58,23 +72,19 @@ Resources:
                 - dynamodb:Query
                 - dynamodb:UpdateItem
               Resource: !GetAtt ConversationTable.Arn
-            # Polly synth (neural)
             - Effect: Allow
               Action:
                 - polly:SynthesizeSpeech
               Resource: '*'
-            # S3 put/get objects in our bucket (for cached audio if you use it)
             - Effect: Allow
               Action:
                 - s3:PutObject
                 - s3:GetObject
               Resource: !Sub '${AudioBucket.Arn}/*'
-            # Secrets Manager (OpenAI/Anthropic key)
             - Effect: Allow
               Action:
                 - secretsmanager:GetSecretValue
               Resource: !Ref LLMSecretArn
-            # Rekognition (optional: if broker calls it; keep if used)
             - Effect: Allow
               Action:
                 - rekognition:DetectLabels
@@ -86,13 +96,6 @@ Resources:
           Properties:
             Path: /ingest/audio
             Method: post
-    Metadata:
-      BuildMethod: makefile        # <-- tell SAM to use a Makefile for build
-
-Parameters:
-  LLMSecretArn:
-    Type: String
-    Description: ARN of the Secrets Manager secret containing the OpenAI/LLM API key
 
 Outputs:
   BrokerEndpoint:
