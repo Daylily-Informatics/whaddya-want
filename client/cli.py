@@ -16,7 +16,7 @@ Features
 - Sends context: {"speaker_id": "...", "acoustic_event": "dog_bark"}
 - Sends client_event on enrollment: {"enrolled_speaker": "<Name>"}
 - Honors broker client_event {"command":"exit"}
-- Writes broker TTS mp3 to ./output/
+- Optional broker TTS mp3 saving (see --save-audio flag)
 
 Install (CPU-only reference set)
   pip install amazon-transcribe sounddevice numpy requests awscrt
@@ -408,6 +408,11 @@ async def run():
         help="Preferred voice synthesis mode (default: standard)",
     )
     ap.add_argument(
+        "--save-audio",
+        action="store_true",
+        help="Save broker audio responses to ./output/ (default: disabled)",
+    )
+    ap.add_argument(
         "--verbose",
         action="store_true",
         help="Enable verbose diagnostics and debugging output",
@@ -416,6 +421,7 @@ async def run():
 
     voice_id = (args.voice or "").strip() or None
     verbose = bool(args.verbose)
+    save_audio = bool(args.save_audio)
 
     def vprint(*vargs, **vkwargs):
         if verbose:
@@ -636,12 +642,13 @@ async def run():
 
                 audio_b64 = (body.get("audio") or {}).get("audio_base64")
                 if audio_b64:
-                    outdir = Path("output")
-                    outdir.mkdir(exist_ok=True)
-                    out = outdir / f"response-{uuid.uuid4()}.mp3"
                     audio_bytes = base64.b64decode(audio_b64)
-                    out.write_bytes(audio_bytes)
-                    print(f"[saved] {out}")
+                    if save_audio:
+                        outdir = Path("output")
+                        outdir.mkdir(exist_ok=True)
+                        out = outdir / f"response-{uuid.uuid4()}.mp3"
+                        out.write_bytes(audio_bytes)
+                        print(f"[saved] {out}")
                     played = await player.play(audio_bytes)
                     if not played and not playback_warned:
                         print(
