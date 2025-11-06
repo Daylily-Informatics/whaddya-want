@@ -25,7 +25,7 @@ import sys
 import threading
 import uuid
 from pathlib import Path
-from typing import AsyncGenerator
+from typing import Any, AsyncIterator
 
 import requests
 import sounddevice as sd
@@ -36,9 +36,24 @@ from amazon_transcribe.handlers import TranscriptResultStreamHandler
 from amazon_transcribe.model import TranscriptResultStream
 
 
+DOG_KEYWORDS = {"woof", "bark", "ruff", "arf", "bow wow", "grr", "growl"}
+
+
+def infer_sound_type(transcript: str, speaker_label: str | None) -> str | None:
+    if speaker_label:
+        return "human"
+    text = (transcript or "").lower()
+    for keyword in DOG_KEYWORDS:
+        if keyword in text:
+            return "dog"
+    if text.strip():
+        return "human"
+    return None
+
+
 # ---------- Transcript handler (finals only) ----------
 class FinalsOnlyHandler(TranscriptResultStreamHandler):
-    def __init__(self, stream: TranscriptResultStream, out_q: asyncio.Queue[str]):
+    def __init__(self, stream: TranscriptResultStream, out_q: asyncio.Queue[tuple[str, str | None]]):
         super().__init__(stream)
         self.out_q = out_q
 
@@ -47,8 +62,16 @@ class FinalsOnlyHandler(TranscriptResultStreamHandler):
             if result.is_partial:
                 continue
             text = "".join(alt.transcript for alt in result.alternatives)
+            speaker_label = None
+            if result.alternatives:
+                alt = result.alternatives[0]
+                items = getattr(alt, "items", None)
+                if items:
+                    speakers = [getattr(item, "speaker", None) for item in items if getattr(item, "speaker", None)]
+                    if speakers:
+                        speaker_label = max(set(speakers), key=speakers.count)
             if text.strip():
-                await self.out_q.put(text.strip())
+                await self.out_q.put((text.strip(), speaker_label))
 
 
 # ---------- Microphone → Transcribe streaming ----------
@@ -60,7 +83,7 @@ async def stream_microphone(
     channels: int = 1,
     blocksize: int = 4096,
     input_device: int | None = None,
-) -> AsyncGenerator[str, None]:
+) -> AsyncIterator[tuple[str, str | None]]:
     """
     Async generator yielding FINAL transcripts from Amazon Transcribe Streaming.
     """
@@ -69,6 +92,7 @@ async def stream_microphone(
         language_code=language_code,
         media_sample_rate_hz=sample_rate,
         media_encoding="pcm",
+        show_speaker_label=True,
     )
 
     loop = asyncio.get_running_loop()
@@ -110,7 +134,7 @@ async def stream_microphone(
         finally:
             await stream.input_stream.end_stream()
 
-    finals_q: asyncio.Queue[str] = asyncio.Queue()
+    finals_q: asyncio.Queue[tuple[str, str | None]] = asyncio.Queue()
     handler = FinalsOnlyHandler(stream.output_stream, finals_q)
 
     send_task = asyncio.create_task(sender())
@@ -118,8 +142,7 @@ async def stream_microphone(
 
     try:
         while True:
-            text = await finals_q.get()
-            yield text
+            yield await finals_q.get()
     finally:
         send_task.cancel()
         recv_task.cancel()
@@ -147,7 +170,7 @@ async def run():
         except NotImplementedError:
             pass  # Windows
 
-    async for transcript in stream_microphone(
+    async for transcript, speaker_label in stream_microphone(
         region=args.region,
         language_code=args.language,
         sample_rate=args.rate,
@@ -155,12 +178,19 @@ async def run():
     ):
         if stop.is_set():
             break
-        print(f"YOU: {transcript}")
+        sound_type = infer_sound_type(transcript, speaker_label)
+        speaker_display = speaker_label or sound_type or "unknown"
+        print(f"YOU[{speaker_display}]: {transcript}")
         # Post to broker
+        payload: dict[str, Any] = {"session_id": args.session, "text": transcript}
+        if speaker_label:
+            payload["speaker"] = speaker_label
+        if sound_type:
+            payload["sound_type"] = sound_type
         try:
             r = requests.post(
                 args.broker_url,
-                json={"session_id": args.session, "text": transcript},
+                json=payload,
                 timeout=60,
             )
             r.raise_for_status()
@@ -172,6 +202,9 @@ async def run():
         # Expect: {"text": "...", "audio": {"audio_base64": "..."}}
         ai_text = body.get("text", "")
         print(f"AI:  {ai_text}")
+
+        if classification := body.get("classification"):
+            print(f"[classification] {classification}")
 
         audio_b64 = (body.get("audio") or {}).get("audio_base64")
         if audio_b64:
