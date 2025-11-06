@@ -10,33 +10,50 @@ Globals:
     Architectures: [arm64]
     Environment:
       Variables:
+        # --- Behavior toggles (parameterized below) ---
+        USE_MEMORY: !Ref UseMemory
+        HISTORY_LIMIT: "12"
+        # --- Resources wired at deploy ---
         CONVERSATION_TABLE: !Ref ConversationTable
         AUDIO_BUCKET: !Ref AudioBucket
-        LLM_SECRET_ID: !Ref LLMSecretArn
+        # --- LLM / TTS ---
+        MODEL_ID: anthropic.claude-3-5-sonnet-20241022-v2:0
         POLLY_VOICE: Joanna
-        HISTORY_LIMIT: 12
+        # Optional: external LLM secret ARN (pass empty to skip)
+        LLM_SECRET_ID: !Ref LLMSecretArn
 
 Parameters:
   LLMSecretArn:
     Type: String
-    Description: ARN of the Secrets Manager secret containing the OpenAI/LLM API key
+    Default: ""
+    Description: "Existing Secrets Manager secret ARN with external LLM API key (optional)"
+  UseMemory:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: "Enable short-term session memory in DynamoDB (true/false)"
+
+Conditions:
+  HasSecret: !Not [!Equals [!Ref LLMSecretArn, ""]]
 
 Resources:
+  # --------- State (optional memory toggle only affects app behavior) ----------
   ConversationTable:
     Type: AWS::DynamoDB::Table
     Properties:
+      TableName: whaddyawant_session_memory
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
-        - AttributeName: sessionId
+        - AttributeName: session_id
           AttributeType: S
-        - AttributeName: sequence
-          AttributeType: N
       KeySchema:
-        - AttributeName: sessionId
+        - AttributeName: session_id
           KeyType: HASH
-        - AttributeName: sequence
-          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
 
+  # --------- Audio artifact storage ----------
   AudioBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -44,16 +61,25 @@ Resources:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
 
+  # --------- Shared Python layer ----------
   SharedLayer:
     Type: AWS::Serverless::LayerVersion
     Properties:
       LayerName: shared-companion
       ContentUri: layers/shared
-      CompatibleRuntimes:
-        - python3.11
+      CompatibleRuntimes: [python3.11]
       RetentionPolicy: Delete
 
+  # --------- Broker Lambda ----------
   BrokerFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -62,34 +88,40 @@ Resources:
       Layers:
         - !Ref SharedLayer
       Policies:
+        # Basic execution
         - AWSLambdaBasicExecutionRole
+        # Inline policy doc for service access
         - Version: '2012-10-17'
           Statement:
+            # DynamoDB (session memory). Safe even if USE_MEMORY=false.
             - Effect: Allow
               Action:
-                - dynamodb:PutItem
                 - dynamodb:GetItem
-                - dynamodb:Query
-                - dynamodb:UpdateItem
+                - dynamodb:PutItem
               Resource: !GetAtt ConversationTable.Arn
+            # Polly for TTS
             - Effect: Allow
-              Action:
-                - polly:SynthesizeSpeech
+              Action: [polly:SynthesizeSpeech]
               Resource: '*'
+            # Bedrock (Claude 3.5 Sonnet)
+            - Effect: Allow
+              Action: [bedrock:InvokeModel]
+              Resource: '*'
+            # S3 for audio artifacts
             - Effect: Allow
               Action:
                 - s3:PutObject
                 - s3:GetObject
               Resource: !Sub '${AudioBucket.Arn}/*'
-            - Effect: Allow
-              Action:
-                - secretsmanager:GetSecretValue
-              Resource: !Ref LLMSecretArn
-            - Effect: Allow
-              Action:
-                - rekognition:DetectLabels
-                - rekognition:SearchFacesByImage
-              Resource: '*'
+        # Conditionally add Secrets Manager permission iff an ARN was provided
+        - !If
+          - HasSecret
+          - Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue]
+                Resource: !Ref LLMSecretArn
+          - !Ref 'AWS::NoValue'
       Events:
         ApiEvent:
           Type: HttpApi
@@ -101,3 +133,12 @@ Outputs:
   BrokerEndpoint:
     Description: Invoke URL for the conversation broker
     Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com/ingest/audio"
+  AudioBucketName:
+    Description: S3 bucket for audio artifacts
+    Value: !Ref AudioBucket
+  MemoryTableName:
+    Description: DynamoDB table for session memory
+    Value: !Ref ConversationTable
+  FunctionArn:
+    Description: Broker Lambda ARN
+    Value: !GetAtt BrokerFunction.Arn

@@ -210,18 +210,31 @@ components wire together:
 
 Create `.env'
 ``text
-STACK=whaddya-want
 REGION=us-west-2
 PROFILE=daylily
 ENGINE=finch
+MODEL_ID=anthropic.claude-3-5-sonnet-20241022-v2:0
+POLLY_VOICE=Joanna
+USE_MEMORY=true
+MEMORY_TABLE=whaddyawant_session_memory
+```
+
+```bash
+set -a
+. ./.env
+set +a
 ```
 
 To deploy the backend with AWS SAM:
 
 ```bash
+export AWS_REGION=us-west-2
+export AWS_DEFAULT_REGION=us-west-2
+export AWS_PROFILE=daylily
+
 sam build --use-container
 sam deploy \
-  --stack-name ai-companion \
+  --stack-name ai-companion2 \
   --capabilities CAPABILITY_IAM \
   --parameter-overrides LLMSecretArn=arn:aws:secretsmanager:...:secret:ai-companion \
   --resolve-s3 --region us-west-2
@@ -295,3 +308,20 @@ rm -f samconfig.toml
 sam delete --stack-name ai-companion --region us-west-2
 # It will prompt to delete the S3 artifacts bucket; say yes to fully clean.
 ```
+
+## delete and rebuild quick
+
+# From repo root, in the right AWS profile/region
+export AWS_PROFILE=daylily
+export AWS_REGION=us-west-2
+STACK=whaddya-want
+
+# 1) Delete stack (SAM-aware)
+sam delete --stack-name "$STACK" --region "$AWS_REGION" --profile "$AWS_PROFILE" --no-prompts
+
+# 2) Local cleanup
+make clean clean-docker clean-finch clean-hard
+
+# 3) Fresh build + deploy
+sam build --use-container
+sam deploy --guided   # or: make deploy
