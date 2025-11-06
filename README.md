@@ -194,6 +194,14 @@ components wire together:
   streams it to Amazon Transcribe, and forwards transcripts to the Lambda
   endpoint while saving synthesized audio responses to disk.
 
+Create `.env'
+``text
+STACK=whaddya-want
+REGION=us-west-2
+PROFILE=daylily
+ENGINE=finch
+```
+
 To deploy the backend with AWS SAM:
 
 ```bash
