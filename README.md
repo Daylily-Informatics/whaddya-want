@@ -25,6 +25,18 @@ After the script completes activate the environment that was created and export
 `PYTHONPATH=src` when running local tools or tests. The script will also alert
 you if required system dependencies such as the AWS CLI are missing.
 
+## Other
+```bash
+brew tap aws/tap
+brew install aws-sam-cli
+
+brew install finch
+finch vm init
+finch vm start
+finch version
+
+```
+
 ### High-Level Architecture
 
 1. **Client capture & playback**
