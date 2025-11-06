@@ -17,7 +17,7 @@ Schema per entry:
 from __future__ import annotations
 import json, os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -43,14 +43,14 @@ def list_entries() -> List[Dict[str, Any]]:
 
 def _ensure_unique(entries: List[Dict[str, Any]], name: str, etype: str) -> Optional[int]:
     nm = name.strip().lower()
-    for i,e in enumerate(entries):
-        if (e.get("type")==etype) and ((e.get("name") or "").strip().lower()==nm):
+    for i, e in enumerate(entries):
+        if (e.get("type") == etype) and ((e.get("name") or "").strip().lower() == nm):
             return i
     return None
 
 # -------- Cosine helpers --------
 def _cos(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.dot(a, b) / (np.linalg.norm(a)+1e-9) / (np.linalg.norm(b)+1e-9))
+    return float(np.dot(a, b) / (np.linalg.norm(a) + 1e-9) / (np.linalg.norm(b) + 1e-9))
 
 # -------- Enroll --------
 def enroll_face(name: str, face_vec: np.ndarray) -> None:
@@ -58,7 +58,8 @@ def enroll_face(name: str, face_vec: np.ndarray) -> None:
     idx = _ensure_unique(entries, name, "person")
     rec = (entries[idx] if idx is not None else {"name": name, "type": "person"})
     rec["face"] = face_vec.astype(float).tolist()
-    if idx is None: entries.append(rec)
+    if idx is None:
+        entries.append(rec)
     _save(entries)
 
 def enroll_voice(name: str, voice_vec: np.ndarray) -> None:
@@ -66,54 +67,63 @@ def enroll_voice(name: str, voice_vec: np.ndarray) -> None:
     idx = _ensure_unique(entries, name, "person")
     rec = (entries[idx] if idx is not None else {"name": name, "type": "person"})
     rec["voice"] = voice_vec.astype(float).tolist()
-    if idx is None: entries.append(rec)
+    if idx is None:
+        entries.append(rec)
     _save(entries)
 
 def enroll_animal(name: str, etype: str, sig_vec: np.ndarray) -> None:
-    assert etype in {"dog","cat","donkey"}
+    assert etype in {"dog", "cat", "donkey"}
     entries = _load()
     idx = _ensure_unique(entries, name, etype)
     rec = (entries[idx] if idx is not None else {"name": name, "type": etype})
     rec["sig"] = sig_vec.astype(float).tolist()
-    if idx is None: entries.append(rec)
+    if idx is None:
+        entries.append(rec)
     _save(entries)
 
 # -------- Identify --------
-def identify_face(face_vec: np.ndarray, threshold: float=0.45) -> Optional[str]:
-    """threshold: max Euclidean (via face_recognition heuristic) — we’ll translate to cosine for safety"""
-    # Use cosine with a loose guard
+def identify_face(face_vec: np.ndarray, threshold: float = 0.45) -> Optional[str]:
+    """threshold (kept for API parity); cosine sim cutoff applied internally."""
     entries = _load()
     best, best_name = -1.0, None
+    fv_query = face_vec.astype(np.float32)
     for e in entries:
         fv = e.get("face")
-        if e.get("type")!="person" or fv is None: continue
-        sim = _cos(face_vec.astype(np.float32), np.array(fv, dtype=np.float32))
+        if e.get("type") != "person" or fv is None:
+            continue
+        sim = _cos(fv_query, np.array(fv, dtype=np.float32))
         if sim > best:
             best, best_name = sim, e.get("name")
-    # empirical: sim >= 0.6-ish is decent; caller can gate further
+    # empirical: sim >= 0.60 is a decent bar; adjust upstream if needed
     return best_name if best >= 0.60 else None
 
-def identify_voice(voice_vec: np.ndarray, threshold: float=0.65) -> Optional[str]:
+def identify_voice(voice_vec: np.ndarray, threshold: float = 0.65) -> Optional[str]:
     entries = _load()
     best, best_name = -1.0, None
+    vv_query = voice_vec.astype(np.float32)
     for e in entries:
         vv = e.get("voice")
-        if e.get("type")!="person" or vv is None: continue
-        sim = _cos(voice_vec.astype(np.float32), np.array(vv, dtype=np.float32))
+        if e.get("type") != "person" or vv is None:
+            continue
+        sim = _cos(vv_query, np.array(vv, dtype=np.float32))
         if sim > best:
             best, best_name = sim, e.get("name")
     return best_name if best >= threshold else None
 
-def identify_animal(etype: str, sig_vec: np.ndarray, max_dist: float=0.22) -> Optional[str]:
+def identify_animal(etype: str, sig_vec: np.ndarray, max_dist: float = 0.22) -> Optional[str]:
+    """
+    max_dist is cosine distance cutoff; we convert to cosine similarity need = 1 - max_dist.
+    """
     entries = _load()
     best_sim, best_name = -1.0, None
-    # convert distance cutoff to cosine sim cutoff
-    # cos_dist = 1 - cos_sim -> cos_sim >= 1 - max_dist
     need = 1.0 - max_dist
     v = sig_vec.astype(np.float32)
     for e in entries:
-        if e.get("type")!=etype: continue
-        s = e.get("sig"); if s is None: continue
+        if e.get("type") != etype:
+            continue
+        s = e.get("sig")
+        if s is None:
+            continue
         sim = _cos(v, np.array(s, dtype=np.float32))
         if sim > best_sim:
             best_sim, best_name = sim, e.get("name")
