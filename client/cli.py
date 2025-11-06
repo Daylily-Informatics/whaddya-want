@@ -96,9 +96,10 @@ except Exception as e:
 class AudioPlayer:
     """Decode mp3 bytes and play them through the default sounddevice output."""
 
-    def __init__(self) -> None:
+    def __init__(self, mute_guard: threading.Event | None = None) -> None:
         self.enabled = _MP3_READY
         self._warned_decode_error = False
+        self._mute_guard = mute_guard
 
     def _decode(self, data: bytes) -> tuple[np.ndarray, int] | tuple[None, None]:
         if not self.enabled:
@@ -126,12 +127,20 @@ class AudioPlayer:
     async def play(self, data: bytes) -> bool:
         if not self.enabled:
             return False
-        loop = asyncio.get_running_loop()
-        audio, rate = await loop.run_in_executor(None, self._decode, data)
-        if audio is None or rate is None:
-            return False
-        sd.play(audio, rate)
-        await loop.run_in_executor(None, sd.wait)
+        if self._mute_guard is not None:
+            self._mute_guard.set()
+        try:
+            loop = asyncio.get_running_loop()
+            audio, rate = await loop.run_in_executor(None, self._decode, data)
+            if audio is None or rate is None:
+                return False
+            sd.play(audio, rate)
+            await loop.run_in_executor(None, sd.wait)
+            if self._mute_guard is not None:
+                await asyncio.sleep(0.15)
+        finally:
+            if self._mute_guard is not None:
+                self._mute_guard.clear()
         return True
 
 
@@ -268,6 +277,7 @@ async def stream_microphone(
     blocksize: int = 4096,
     input_device: int | None = None,
     analysis_buf: deque | None = None,
+    mute_event: threading.Event | None = None,
 ) -> AsyncGenerator[str, None]:
     """Yield FINAL transcripts; optionally fill analysis_buf with float32 @16k mono."""
     client = TranscribeStreamingClient(region=region)
@@ -284,6 +294,8 @@ async def stream_microphone(
     def audio_cb(indata, frames, time_info, status):
         if status:
             print(status, file=sys.stderr)
+        if mute_event is not None and mute_event.is_set():
+            return
         try:
             raw = bytes(indata)
             if analysis_buf is not None:
@@ -401,7 +413,8 @@ async def run():
     # Models
     spkid = SpeakerID()
     bark = BarkDetector()
-    player = AudioPlayer()
+    playback_mute = threading.Event()
+    player = AudioPlayer(mute_guard=playback_mute)
     print(
         "[diag] speaker-id enabled={}  bark-detector enabled={}  playback enabled={}".format(
             spkid.enabled, bark.enabled, player.enabled
@@ -438,6 +451,7 @@ async def run():
         channels=args.channels,
         input_device=args.input_device,
         analysis_buf=analysis_buf,
+        mute_event=playback_mute,
     ):
         if stop.is_set():
             break
