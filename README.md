@@ -254,3 +254,29 @@ python client/cli.py --broker-url https://xxxx.execute-api.us-east-1.amazonaws.c
 
 For deployments that require maximum control or reduced cost over time, see the
 hybrid or fully local alternatives to complement this approach.
+
+
+# Other
+## Cleanup
+
+```bash
+# SAM build artifacts
+rm -rf .aws-sam/
+
+# Any zipped artifacts you created manually
+find . -name '*.zip' -maxdepth 3 -print -delete
+
+# Python build junk (if any)
+find . -name '__pycache__' -type d -prune -print -exec rm -rf {} +
+find . -name '*.pyc' -print -delete
+
+# Optional: wipe venv (if you want to rebuild deps)
+rm -rf .venv/
+
+finch ps -a | awk 'NR>1 {print $1}' | xargs -r finch rm -f
+finch images | awk 'NR>1 && /public\.ecr\.aws\/sam\/(build-|emulation-)/ {print $3}' | xargs -r finch rmi -f
+finch system prune -f
+rm -f samconfig.toml
+sam delete --stack-name ai-companion --region us-west-2
+# It will prompt to delete the S3 artifacts bucket; say yes to fully clean.
+```

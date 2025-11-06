@@ -6,7 +6,6 @@ build-BrokerFunction:
 	cp app.py "$(ARTIFACTS_DIR)/"
 	# 3) Vendor shared code (your repo has src/ at ../../src)
 	rsync -a --delete ../../src/ "$(ARTIFACTS_DIR)/"
-
 	# 4) Sanity check
 	python - <<'PY'
 import os
