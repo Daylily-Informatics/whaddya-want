@@ -37,12 +37,14 @@ import argparse
 import asyncio
 import base64
 import contextlib
+import json
 import io
 import os
 import queue
 import re
 import signal
 import sys
+import traceback
 import threading
 import uuid
 import warnings
@@ -422,6 +424,18 @@ async def run():
     voice_id = (args.voice or "").strip() or None
     verbose = bool(args.verbose)
     save_audio = bool(args.save_audio)
+    # Optional low-level HTTP debug for requests/urllib3
+    if "--debug-http" in sys.argv:
+        try:
+            import http.client as _http_client  # type: ignore
+            _http_client.HTTPConnection.debuglevel = 1
+            import logging
+            logging.basicConfig()
+            logging.getLogger("urllib3").setLevel(logging.DEBUG)
+            logging.getLogger("urllib3").propagate = True
+            verbose = True
+        except Exception:
+            pass
 
     def vprint(*vargs, **vkwargs):
         if verbose:
@@ -610,12 +624,58 @@ async def run():
                     payload["voice_id"] = voice_id
                 payload["voice_mode"] = args.voice_mode
 
+                vprint(f"[diag] POST {args.broker_url}")
+                vprint("[diag] payload=", json.dumps(payload, indent=2) if verbose else "<hidden>")
                 try:
-                    r = requests.post(args.broker_url, json=payload, timeout=60)
-                    r.raise_for_status()
+                    r = requests.post(
+                        args.broker_url,
+                        json=payload,
+                        timeout=60,
+                        headers={"X-Client-Session": args.session},
+                    )
+                    if not r.ok:
+                        # Rich error: status, request IDs, headers, body
+                        rid = r.headers.get("x-amzn-RequestId") or r.headers.get("x-amz-apigw-id") or "?"
+                        print(
+                            f"[broker error] HTTP {r.status_code} {r.reason}  request-id={rid}",
+                            file=sys.stderr,
+                        )
+                        # Show a compact header subset that’s useful for AWS
+                        h_subset = {k: r.headers.get(k) for k in [
+                            "x-amzn-RequestId", "x-amz-apigw-id", "content-type", "date"
+                        ] if r.headers.get(k)}
+                        if h_subset:
+                            print(f"[broker headers] {h_subset}", file=sys.stderr)
+                        # Try JSON body first; fall back to text
+                        try:
+                            errj = r.json()
+                            print("[broker body.json]", json.dumps(errj, indent=2), file=sys.stderr)
+                        except Exception:
+                            body_text = (r.text or "").strip()
+                            if body_text:
+                                # Keep it on one screen if it's huge
+                                preview = body_text if len(body_text) < 4000 else body_text[:4000] + "\n…(truncated)…"
+                                print("[broker body.text]", preview, file=sys.stderr)
+                        # Local traceback context if something else raised
+                        vprint("[diag] call-site", traceback.format_stack()[-2].strip())
+                        continue
                     body = r.json()
-                except Exception as e:
-                    print(f"[broker error] {e}", file=sys.stderr)
+                except requests.RequestException as e:
+                    # Network/timeout/connection errors
+                    msg = getattr(e, "args", [repr(e)])[0]
+                    print(f"[broker error] request failed: {msg}", file=sys.stderr)
+                    try:
+                        r = e.response
+                        if r is not None:
+                            rid = r.headers.get("x-amzn-RequestId") or r.headers.get("x-amz-apigw-id") or "?"
+                            print(
+                                f"[broker error] HTTP {r.status_code} {r.reason} request-id={rid}",
+                                file=sys.stderr,
+                            )
+                            print("[broker body]", r.text, file=sys.stderr)
+                    except Exception:
+                        pass
+                    vprint("[diag] exception", traceback.format_exc())
                     continue
 
                 # Honor broker-requested exit

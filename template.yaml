@@ -7,31 +7,50 @@ Globals:
     Runtime: python3.11
     Timeout: 30
     MemorySize: 512
+    Tracing: Active
     Architectures: [arm64]
     Environment:
       Variables:
         # --- Behavior toggles (parameterized below) ---
         USE_MEMORY: !Ref UseMemory
-        HISTORY_LIMIT: "12"
+        HISTORY_LIMIT: !Ref HistoryLimit
         # --- Resources wired at deploy ---
         CONVERSATION_TABLE: !Ref ConversationTable
         AUDIO_BUCKET: !Ref AudioBucket
         # --- LLM / TTS ---
-        MODEL_ID: deepseek.v3-v1:0
-        POLLY_VOICE: Joanna
+        MODEL_ID: !Ref ModelId
+        POLLY_VOICE: !Ref PollyVoice
+        AI_NAME: Marvin
         # Optional: external LLM secret ARN (pass empty to skip)
         LLM_SECRET_ID: !Ref LLMSecretArn
 
 Parameters:
+  ModelId:
+    Type: String
+    Default: deepseek.v3-v1:0
+    Description: Bedrock model ID (or inference profile ARN). Titan text uses amazon.titan-text-express-v1.
+  PollyVoice:
+    Type: String
+    Default: Joanna
+  HistoryLimit:
+    Type: Number
+    Default: 12
+    MinValue: 0
+    MaxValue: 64
   LLMSecretArn:
     Type: String
     Default: ""
-    Description: "Existing Secrets Manager secret ARN with external LLM API key (optional)"
+    Description: Existing Secrets Manager secret ARN with external LLM API key (optional)
   UseMemory:
     Type: String
     AllowedValues: ["true", "false"]
     Default: "true"
-    Description: "Enable short-term session memory in DynamoDB (true/false)"
+    Description: Enable short-term session memory in DynamoDB (true/false)
+  ReservedConcurrency:
+    Type: Number
+    Default: 5
+    MinValue: 0
+    Description: Hard cap on concurrent Lambda invocations (0 disables)
 
 Conditions:
   HasSecret: !Not [!Equals [!Ref LLMSecretArn, ""]]
@@ -69,6 +88,30 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-audio
+            Status: Enabled
+            ExpirationInDays: 7
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+  AudioBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AudioBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnforceTLS
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !Sub "${AudioBucket.Arn}"
+              - !Sub "${AudioBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: false
 
   # --------- Shared Python layer ----------
   SharedLayer:
@@ -79,17 +122,56 @@ Resources:
       CompatibleRuntimes: [python3.11]
       RetentionPolicy: Delete
 
+  # --------- API (HTTP API with logs + CORS) ----------
+  HttpApiLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigw/${AWS::StackName}-http"
+      RetentionInDays: 7
+  BrokerHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: $default
+      CorsConfiguration:
+        AllowOrigins: ['*']        # tighten to your origin(s) when you know them
+        AllowMethods: ['POST','OPTIONS']
+        AllowHeaders: ['content-type','x-client-session']
+      AccessLogSettings:
+        DestinationArn: !GetAtt HttpApiLogs.Arn
+        Format: >-
+          { "requestId":"$context.requestId","status":$context.status,
+            "integrationStatus":"$context.integrationStatus",
+            "integrationError":"$context.integrationErrorMessage",
+            "ip":"$context.identity.sourceIp","ua":"$context.identity.userAgent",
+            "path":"$context.path" }
+
   # --------- Broker Lambda ----------
+  BrokerFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-broker"
+      RetentionInDays: 7
+
   BrokerFunction:
     Type: AWS::Serverless::Function
     Properties:
+      FunctionName: !Sub "${AWS::StackName}-broker"
       CodeUri: lambda/broker/
       Handler: app.handler
       Layers:
         - !Ref SharedLayer
+      ReservedConcurrentExecutions: !Ref ReservedConcurrency
+      Events:
+        ApiEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref BrokerHttpApi
+            Path: /ingest/audio
+            Method: POST
       Policies:
-        # Basic execution
+        # Basic execution + X-Ray
         - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
         # Inline policy doc for service access
         - Version: '2012-10-17'
           Statement:
@@ -103,9 +185,13 @@ Resources:
             - Effect: Allow
               Action: [polly:SynthesizeSpeech]
               Resource: '*'
-            # Bedrock (Claude 3.5 Sonnet)
+            # Bedrock (cover both classic InvokeModel and new Converse APIs)
             - Effect: Allow
-              Action: [bedrock:InvokeModel]
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+                - bedrock:Converse
+                - bedrock:ConverseStream
               Resource: '*'
             # S3 for audio artifacts
             - Effect: Allow
@@ -122,17 +208,14 @@ Resources:
                 Action: [secretsmanager:GetSecretValue]
                 Resource: !Ref LLMSecretArn
           - !Ref 'AWS::NoValue'
-      Events:
-        ApiEvent:
-          Type: HttpApi
-          Properties:
-            Path: /ingest/audio
-            Method: post
 
 Outputs:
   BrokerEndpoint:
     Description: Invoke URL for the conversation broker
-    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com/ingest/audio"
+    Value: !Sub "https://${BrokerHttpApi}.execute-api.${AWS::Region}.amazonaws.com/ingest/audio"
+  ApiId:
+    Description: HTTP API ID
+    Value: !Ref BrokerHttpApi
   AudioBucketName:
     Description: S3 bucket for audio artifacts
     Value: !Ref AudioBucket

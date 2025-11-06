@@ -1,6 +1,8 @@
 # lambda/broker/app.py
-import os, json, base64, re, time
-from typing import List, Dict, Any, Optional
+from __future__ import annotations
+
+import os, json, base64, re, time, traceback
+from typing import List, Dict, Any, Optional, Tuple
 
 import boto3
 from botocore.config import Config
@@ -8,8 +10,6 @@ from botocore.config import Config
 # ----- Env -----
 REGION: str = os.environ.get("AWS_REGION", "us-west-2")
 POLLY_VOICE: str = os.environ.get("POLLY_VOICE", "Joanna")
-
-# Default to Titan since that's what you're using. You can change at runtime via env update.
 MODEL_ID: str = os.environ.get("MODEL_ID", "amazon.titan-text-express-v1")
 
 HISTORY_LIMIT: int = int(os.environ.get("HISTORY_LIMIT", "12"))
@@ -25,16 +25,40 @@ dynamodb = boto3.resource("dynamodb", region_name=REGION) if USE_MEMORY and TABL
 mem_table = dynamodb.Table(TABLE) if dynamodb else None
 
 
-# ----- Utils -----
-def _ok(body: Dict[str, Any]) -> Dict[str, Any]:
-    return {"statusCode": 200, "headers": {"content-type": "application/json"}, "body": json.dumps(body)}
+# ----- HTTP helpers -----
+def _base_headers(extra: Dict[str, str] | None = None) -> Dict[str, str]:
+    h = {"content-type": "application/json"}
+    if extra:
+        h.update({k: v for k, v in extra.items() if v})
+    return h
 
-def _tts(text: str, voice_id: Optional[str] = None) -> Dict[str, Any]:
-    voice = voice_id or POLLY_VOICE
-    r = polly.synthesize_speech(Text=text, VoiceId=voice, OutputFormat="mp3")
-    audio = r["AudioStream"].read()
-    return {"text": text, "audio": {"audio_base64": base64.b64encode(audio).decode()}}
+def _ok(body: Dict[str, Any], *, headers: Dict[str, str] | None = None) -> Dict[str, Any]:
+    return {"statusCode": 200, "headers": _base_headers(headers), "isBase64Encoded": False, "body": json.dumps(body)}
 
+def _bad_request(msg: str, *, headers: Dict[str, str] | None = None) -> Dict[str, Any]:
+    return {
+        "statusCode": 400,
+        "headers": _base_headers(headers),
+        "isBase64Encoded": False,
+        "body": json.dumps({"error": "bad_request", "message": msg}),
+    }
+
+def _server_error(exc: Exception, *, headers: Dict[str, str] | None, request_id: str, code: int = 500) -> Dict[str, Any]:
+    tb_lines = traceback.format_exc().strip().splitlines()
+    tail = tb_lines[-8:] if tb_lines else []
+    h = _base_headers(
+        {
+            "x-lambda-request-id": request_id,
+            "x-error-class": exc.__class__.__name__,
+            "x-error-msg": (str(exc)[:200] if exc else ""),
+            **(headers or {}),
+        }
+    )
+    body = {"error": "internal_error", "message": str(exc), "trace_tail": tail}
+    return {"statusCode": code, "headers": h, "isBase64Encoded": False, "body": json.dumps(body)}
+
+
+# ----- Memory -----
 def _get_memory(session_id: str) -> List[Dict[str, str]]:
     if not mem_table:
         return []
@@ -47,9 +71,9 @@ def _put_memory(session_id: str, turns: List[Dict[str, str]]) -> None:
     turns = turns[-HISTORY_LIMIT:]
     mem_table.put_item(Item={"session_id": session_id, "turns": turns, "ttl": int(time.time()) + 7 * 24 * 3600})
 
+
+# ----- Prompting -----
 def _system_prompt(speaker: Optional[str], acoustic_event: Optional[str]) -> str:
-    # NOTE: Some models (e.g., Titan Text Express) don't support system messages in Converse,
-    # so we only use this when the model supports it (or we embed it into the prompt text).
     lines = [
         "You are Forge, a concise, capable home/office companion.",
         "Be natural, brief, and helpful. Avoid fluff.",
@@ -61,33 +85,38 @@ def _system_prompt(speaker: Optional[str], acoustic_event: Optional[str]) -> str
         lines.append("A dog bark was detected recently; briefly acknowledge then continue.")
     return "\n".join(lines)
 
-def _parse_body(event: Dict[str, Any]) -> Dict[str, Any]:
+
+# ----- Body parsing -----
+def _parse_body(event: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     body = event.get("body")
+    if body is None:
+        return None, "missing body"
     if isinstance(body, str):
         if event.get("isBase64Encoded"):
             try:
-                body = base64.b64decode(body).decode("utf-8")
+                body = base64.b64decode(body).decode("utf-8", "replace")
             except Exception:
-                pass
+                return None, "body base64 decode failed"
         try:
             body = json.loads(body)
         except Exception:
-            body = {}
-    return body or {}
+            return None, "body is not valid JSON"
+    if not isinstance(body, dict):
+        return None, "body is not an object"
+    return body, None
+
+
+# ----- TTS -----
+def _tts(text: str, voice_id: Optional[str] = None) -> Dict[str, Any]:
+    """Synthesize speech. Raises on Polly errors (caught in handler)."""
+    voice = voice_id or POLLY_VOICE
+    r = polly.synthesize_speech(Text=text, VoiceId=voice, OutputFormat="mp3")
+    audio = r["AudioStream"].read()
+    return {"text": text, "audio": {"audio_base64": base64.b64encode(audio).decode()}}
 
 
 # ----- LLM calls -----
 def _call_titan_text_express(system: str, history: List[Dict[str, str]], user_text: str) -> str:
-    """
-    Titan Text Express (amazon.titan-text-express-v1) via InvokeModel.
-    Schema:
-      {
-        "inputText": "...",
-        "textGenerationConfig": {
-           "maxTokenCount": int, "temperature": float, "topP": float, "stopSequences": [str,...]
-        }
-      }
-    """
     # Titan doesn't have a separate system channel. Embed it into plain text.
     parts = []
     if system:
@@ -125,19 +154,17 @@ def _call_titan_text_express(system: str, history: List[Dict[str, str]], user_te
 
 
 def _call_converse(model_id: str, system: str, history: List[Dict[str, str]], user_text: str) -> str:
-    """
-    Model-agnostic Bedrock Converse call.
-    Some models don't support 'system' messages; in that case we retry without 'system'.
-    """
+    """Model-agnostic Bedrock Converse call; retry without system if unsupported."""
     def _msgs():
         msgs: List[Dict[str, Any]] = []
         for t in history:
-            msgs.append({"role": "user", "content": [{"text": t["user"]}]})
-            msgs.append({"role": "assistant", "content": [{"text": t["assistant"]}]})
+            if "user" in t:
+                msgs.append({"role": "user", "content": [{"text": t["user"]}]})
+            if "assistant" in t:
+                msgs.append({"role": "assistant", "content": [{"text": t["assistant"]}]})
         msgs.append({"role": "user", "content": [{"text": user_text or "Respond briefly."}]})
         return msgs
 
-    # First try WITH system, then retry WITHOUT if the model complains.
     kwargs: Dict[str, Any] = {
         "modelId": model_id,
         "messages": _msgs(),
@@ -154,31 +181,41 @@ def _call_converse(model_id: str, system: str, history: List[Dict[str, str]], us
     except Exception as e:
         msg = str(e)
         if had_system and ("system" in msg.lower() or "doesn't support system" in msg.lower()):
-            # Retry without system
             kwargs.pop("system", None)
             out = brt.converse(**kwargs)
             return out["output"]["message"]["content"][0]["text"]
         raise
 
 def _call_llm(model_id: str, system: str, history: List[Dict[str, str]], user_text: str) -> str:
-    """
-    Route Titan Text Express through InvokeModel; others through Converse (with system if supported).
-    If you later set MODEL_ID to an inference-profile ARN (e.g., Nova), this will use Converse correctly.
-    """
     if model_id.startswith("amazon.titan-text-express"):
         return _call_titan_text_express(system, history, user_text)
     return _call_converse(model_id, system, history, user_text)
 
 
 # ----- Lambda handler -----
-def handler(event, _ctx):
-    body = _parse_body(event)
+def handler(event, context):
+    # Correlate with client
+    hdr_in = event.get("headers") or {}
+    client_session = hdr_in.get("x-client-session") or hdr_in.get("X-Client-Session") or ""
+    out_hdr = {"x-client-session": client_session} if client_session else {}
 
-    session_id = (body.get("session_id") or "anon").strip() or "anon"
+    # Parse body
+    body, berr = _parse_body(event)
+    if berr:
+        return _bad_request(berr, headers=out_hdr)
+
+    # Validate inputs early → clear 4xx instead of mystery 500s
+    session_id = (body.get("session_id") or "").strip()
     text       = (body.get("text") or "").strip()
-    context    = body.get("context") or {}
-    speaker    = context.get("speaker_id")
-    acoustic   = context.get("acoustic_event")
+    if not session_id:
+        return _bad_request("missing or invalid 'session_id'", headers=out_hdr)
+    if not text:
+        return _bad_request("missing or invalid 'text'", headers=out_hdr)
+
+    context_in = body.get("context") or {}
+    speaker    = context_in.get("speaker_id")
+    acoustic   = context_in.get("acoustic_event")
+
     voice_id   = body.get("voice_id")
     if isinstance(voice_id, str):
         voice_id = voice_id.strip() or None
@@ -187,21 +224,38 @@ def handler(event, _ctx):
 
     # Identity fast-path
     if speaker and re.search(r"\b(who am i|what'?s my name|who'?s speaking)\b", text.lower()):
-        return _ok(_tts(f"You are {speaker}.", voice_id))
+        try:
+            return _ok(_tts(f"You are {speaker}.", voice_id), headers=out_hdr)
+        except Exception as exc:
+            # If Polly fails, still give a 200 with text only to avoid breaking UX on identity
+            return _ok({"text": f"You are {speaker}.", "audio": {"audio_base64": None}}, headers=out_hdr)
 
     # Short memory (optional)
-    history: List[Dict[str, str]] = _get_memory(session_id) if USE_MEMORY else []
+    try:
+        history: List[Dict[str, str]] = _get_memory(session_id) if USE_MEMORY else []
+    except Exception as exc:
+        # Memory failures should not 500 the whole request
+        history = []
 
     system = _system_prompt(speaker, acoustic)
 
+    # Generate reply (LLM)
     try:
         reply = _call_llm(MODEL_ID, system, history, text)
-    except Exception as e:
-        # Never hard-fail the request
-        reply = f"{(speaker + ': ') if speaker else ''}I heard you say: {text or '<silence>'}. (LLM unavailable: {e})"
+    except Exception as exc:
+        # Return structured 502 so the client can see cause immediately
+        return _server_error(exc, headers=out_hdr, request_id=getattr(context, "aws_request_id", "unknown"), code=502)
 
-    if USE_MEMORY:
-        history.append({"user": text, "assistant": reply})
-        _put_memory(session_id, history)
+    # Update memory (best-effort)
+    try:
+        if USE_MEMORY:
+            history.append({"user": text, "assistant": reply})
+            _put_memory(session_id, history)
+    except Exception:
+        pass
 
-    return _ok(_tts(reply, voice_id))
+    # TTS (Polly) — if Polly fails, report a 502 with details instead of 500
+    try:
+        return _ok(_tts(reply, voice_id), headers=out_hdr)
+    except Exception as exc:
+        return _server_error(exc, headers=out_hdr, request_id=getattr(context, "aws_request_id", "unknown"), code=502)
