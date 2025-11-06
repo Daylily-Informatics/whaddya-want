@@ -167,13 +167,17 @@ class BarkDetector:
         self._ensure_model()
         if self.model is None or self.labels is None:
             return False
+
         waveform = tf.convert_to_tensor(wav16, dtype=tf.float32)
-        scores, _, _ = self.model(waveform)
-        mean_scores = tf.reduce_mean(scores, axis=0).numpy()
+        scores, _, _ = self.model(waveform)              # [frames, 521]
+        mean_scores = tf.reduce_mean(scores, axis=0).numpy()  # [521]
         idx = {lbl: i for i, lbl in enumerate(self.labels)}
-        p_dog = mean_scores.get(idx["Dog"], 0.0) if "Dog" in idx else 0.0
-        p_bark = mean_scores.get(idx["Bark"], 0.0) if "Bark" in idx else 0.0
-        return max(float(p_dog), float(p_bark)) >= prob_threshold
+
+        p_dog  = float(mean_scores[idx["Dog"]])  if "Dog"  in idx else 0.0
+        p_bark = float(mean_scores[idx["Bark"]]) if "Bark" in idx else 0.0
+
+        return max(p_dog, p_bark) >= prob_threshold
+
 
 
 # ---- Transcript handler (finals only) ----
@@ -429,8 +433,11 @@ async def run():
             who = spkid.identify(wav_id, threshold=args.id_threshold)
             if who:
                 context["speaker_id"] = who
-            if bark.detect(wav_id):
-                context["acoustic_event"] = "dog_bark"
+            try:
+                if bark.detect(wav_id):
+                    context["acoustic_event"] = "dog_bark"
+            except Exception as e:
+                print("[diag] bark detect error:", e, file=sys.stderr)
 
         client_event = {}
         if enrolled_name:
