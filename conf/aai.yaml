@@ -1,0 +1,21 @@
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - bash=5.2.37
+  - jq=1.8.1
+  - yq=3.4.3
+  - rclone=1.71.0
+  - parallel
+  - perl
+  - yamllint
+  - fd-find
+  - ipython
+  - yaml
+  - setuptools<81
+  - awscli==2.22.4
+  - nodejs
+  - pip
+  - pip:
+    - assemblyai
