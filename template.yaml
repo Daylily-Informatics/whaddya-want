@@ -1,0 +1,76 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Serverless resources for the AI companion conversation broker
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 30
+    MemorySize: 512
+    Environment:
+      Variables:
+        CONVERSATION_TABLE: !Ref ConversationTable
+        AUDIO_BUCKET: !Ref AudioBucket
+        LLM_SECRET_ID: !Ref LLMSecretArn
+        POLLY_VOICE: Joanna
+        HISTORY_LIMIT: 12
+Resources:
+  ConversationTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: sessionId
+          AttributeType: S
+        - AttributeName: sequence
+          AttributeType: N
+      KeySchema:
+        - AttributeName: sessionId
+          KeyType: HASH
+        - AttributeName: sequence
+          KeyType: RANGE
+  AudioBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+  BrokerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambda/broker/
+      Handler: app.handler
+      Policies:
+        - AmazonDynamoDBFullAccess
+        - AmazonPollyFullAccess
+        - AmazonS3FullAccess
+        - AWSLambdaBasicExecutionRole
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Ref LLMSecretArn
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - transcribe:StartStreamTranscription
+                - rekognition:DetectLabels
+                - rekognition:SearchFacesByImage
+              Resource: '*'
+      Events:
+        ApiEvent:
+          Type: HttpApi
+          Properties:
+            Path: /ingest/audio
+            Method: post
+Parameters:
+  LLMSecretArn:
+    Type: String
+    Description: ARN of the Secrets Manager secret containing the OpenAI API key
+Outputs:
+  BrokerEndpoint:
+    Description: Invoke URL for the conversation broker
+    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com/ingest/audio"
