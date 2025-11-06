@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import io
 import os
 import queue
 import re
@@ -79,6 +80,59 @@ except Exception as e:
 
 _SPK_DIR = Path(os.path.expanduser("~/.whaddya/speakers"))
 _SPK_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ---- AI audio playback (mp3 → speaker) ----
+_MP3_READY = False
+try:
+    from pydub import AudioSegment  # type: ignore
+
+    _MP3_READY = True
+except Exception as e:
+    print("[diag] mp3 playback disabled (pydub import failed):", repr(e), file=sys.stderr)
+    _MP3_READY = False
+
+
+class AudioPlayer:
+    """Decode mp3 bytes and play them through the default sounddevice output."""
+
+    def __init__(self) -> None:
+        self.enabled = _MP3_READY
+        self._warned_decode_error = False
+
+    def _decode(self, data: bytes) -> tuple[np.ndarray, int] | tuple[None, None]:
+        if not self.enabled:
+            return (None, None)
+        try:
+            segment = AudioSegment.from_file(io.BytesIO(data), format="mp3")
+        except Exception as exc:
+            if not self._warned_decode_error:
+                print(
+                    "[diag] unable to decode mp3 audio — install ffmpeg or libav for pydub:",
+                    exc,
+                    file=sys.stderr,
+                )
+                self._warned_decode_error = True
+            return (None, None)
+        samples = np.array(segment.get_array_of_samples())
+        if segment.channels > 1:
+            samples = samples.reshape((-1, segment.channels))
+        else:
+            samples = samples.reshape((-1, 1))
+        scale = float(1 << (8 * segment.sample_width - 1))
+        audio = samples.astype(np.float32) / scale
+        return audio, int(segment.frame_rate)
+
+    async def play(self, data: bytes) -> bool:
+        if not self.enabled:
+            return False
+        loop = asyncio.get_running_loop()
+        audio, rate = await loop.run_in_executor(None, self._decode, data)
+        if audio is None or rate is None:
+            return False
+        sd.play(audio, rate)
+        await loop.run_in_executor(None, sd.wait)
+        return True
 
 
 class SpeakerID:
@@ -347,7 +401,12 @@ async def run():
     # Models
     spkid = SpeakerID()
     bark = BarkDetector()
-    print(f"[diag] speaker-id enabled={spkid.enabled}  bark-detector enabled={bark.enabled}")
+    player = AudioPlayer()
+    print(
+        "[diag] speaker-id enabled={}  bark-detector enabled={}  playback enabled={}".format(
+            spkid.enabled, bark.enabled, player.enabled
+        )
+    )
     print("[hint] Press ENTER to enroll last ~3s as 'Major' (or type a name then ENTER). Type 'q' + ENTER to quit.")
 
     # Manual enroll / quit via stdin
@@ -370,6 +429,7 @@ async def run():
     threading.Thread(target=_stdin_watcher, daemon=True).start()
 
     forced_done = False
+    playback_warned = False
 
     async for transcript in stream_microphone(
         region=args.region,
@@ -484,8 +544,16 @@ async def run():
             outdir = Path("output")
             outdir.mkdir(exist_ok=True)
             out = outdir / f"response-{uuid.uuid4()}.mp3"
-            out.write_bytes(base64.b64decode(audio_b64))
+            audio_bytes = base64.b64decode(audio_b64)
+            out.write_bytes(audio_bytes)
             print(f"[saved] {out}")
+            played = await player.play(audio_bytes)
+            if not played and not playback_warned:
+                print(
+                    "[hint] Install 'pydub' and ffmpeg (or libav) to enable speaker playback.",
+                    file=sys.stderr,
+                )
+                playback_warned = True
 
         if stop.is_set():
             break
