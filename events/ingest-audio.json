@@ -1,0 +1,6 @@
+{
+  "requestContext": { "http": { "method": "POST", "path": "/ingest/audio" } },
+  "headers": { "content-type": "application/json" },
+  "body": "{\"session_id\":\"test\",\"text\":\"hello\"}",
+  "isBase64Encoded": false
+}

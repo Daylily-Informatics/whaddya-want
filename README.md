@@ -212,6 +212,14 @@ at it:
 python -m venv .venv
 source .venv/bin/activate
 pip install -r client/requirements.txt
+pip install amazon-transcribe sounddevice numpy requests
+pip install --upgrade awscrt
+pip install --upgrade pip
+pip install amazon-transcribe sounddevice numpy requests awscrt
+
+export AWS_REGION=us-west-2
+export AWS_DEFAULT_REGION=us-west-2
+
 python client/cli.py --broker-url https://xxxx.execute-api.us-east-1.amazonaws.com/ingest/audio
 ```
 

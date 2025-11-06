@@ -1,76 +1,198 @@
-"""Minimal CLI client that streams audio chunks to Amazon Transcribe and calls the broker."""
+#!/usr/bin/env python3
+"""
+Minimal voice client for the cloud companion.
+
+- Streams microphone audio to Amazon Transcribe (Streaming) using the amazon-transcribe SDK
+- Sends FINAL transcripts to a broker (API Gateway/Lambda) as JSON
+- Prints AI text and writes returned MP3 (base64) to ./output/
+
+Deps:
+  pip install amazon-transcribe sounddevice numpy requests awscrt
+
+Env:
+  AWS_REGION / AWS_DEFAULT_REGION (or use --region)
+"""
+
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
+import os
 import queue
+import signal
+import sys
 import threading
 import uuid
 from pathlib import Path
+from typing import AsyncGenerator
 
-import boto3
 import requests
 import sounddevice as sd
 
+# Transcribe Streaming SDK (NOT boto3)
+from amazon_transcribe.client import TranscribeStreamingClient
+from amazon_transcribe.handlers import TranscriptResultStreamHandler
+from amazon_transcribe.model import TranscriptResultStream
 
-def stream_microphone(language_code: str = "en-US", sample_rate: int = 16000):
-    transcribe = boto3.client("transcribe")
-    q: queue.Queue[bytes] = queue.Queue()
 
-    def callback(indata, frames, time, status):  # pragma: no cover - audio callback
-        if status:
-            print(status)
-        q.put(bytes(indata))
+# ---------- Transcript handler (finals only) ----------
+class FinalsOnlyHandler(TranscriptResultStreamHandler):
+    def __init__(self, stream: TranscriptResultStream, out_q: asyncio.Queue[str]):
+        super().__init__(stream)
+        self.out_q = out_q
 
-    stream = transcribe.start_stream_transcription(
-        LanguageCode=language_code,
-        MediaSampleRateHertz=sample_rate,
-        MediaEncoding="pcm",
+    async def handle_transcript_event(self, transcript_event):
+        for result in transcript_event.transcript.results:
+            if result.is_partial:
+                continue
+            text = "".join(alt.transcript for alt in result.alternatives)
+            if text.strip():
+                await self.out_q.put(text.strip())
+
+
+# ---------- Microphone → Transcribe streaming ----------
+async def stream_microphone(
+    *,
+    region: str,
+    language_code: str = "en-US",
+    sample_rate: int = 16000,
+    channels: int = 1,
+    blocksize: int = 4096,
+    input_device: int | None = None,
+) -> AsyncGenerator[str, None]:
+    """
+    Async generator yielding FINAL transcripts from Amazon Transcribe Streaming.
+    """
+    client = TranscribeStreamingClient(region=region)
+    stream = await client.start_stream_transcription(
+        language_code=language_code,
+        media_sample_rate_hz=sample_rate,
+        media_encoding="pcm",
     )
 
-    def producer():  # pragma: no cover - network stream
+    loop = asyncio.get_running_loop()
+
+    # Bridge: PortAudio callback -> blocking queue -> asyncio queue
+    raw_q: queue.Queue[bytes] = queue.Queue(maxsize=100)
+    async_q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=100)
+
+    def audio_cb(indata, frames, time_info, status):
+        if status:
+            # Non-fatal; prints XRuns, etc.
+            print(status, file=sys.stderr)
+        try:
+            raw_q.put_nowait(bytes(indata))
+        except queue.Full:
+            pass  # drop if back-pressured
+
+    def mic_thread():
         with sd.RawInputStream(
             samplerate=sample_rate,
-            blocksize=4096,
+            blocksize=blocksize,
             dtype="int16",
-            channels=1,
-            callback=callback,
+            channels=channels,
+            device=input_device,
+            callback=audio_cb,
         ):
             while True:
-                chunk = q.get()
-                stream.send_audio_event(AudioChunk=chunk)
+                chunk = raw_q.get()
+                loop.call_soon_threadsafe(async_q.put_nowait, chunk)
 
-    threading.Thread(target=producer, daemon=True).start()
-    for event in stream:  # pragma: no cover - stream consumption
-        if "Transcript" in event:
-            results = event["Transcript"]["Results"]
-            for result in results:
-                if not result.get("IsPartial"):
-                    yield result["Alternatives"][0]["Transcript"]
+    t = threading.Thread(target=mic_thread, daemon=True)
+    t.start()
 
+    async def sender():
+        try:
+            while True:
+                chunk = await async_q.get()
+                await stream.input_stream.send_audio_event(audio_chunk=chunk)
+        finally:
+            await stream.input_stream.end_stream()
 
-def main() -> None:  # pragma: no cover - CLI entry
-    parser = argparse.ArgumentParser(description="Interact with the cloud AI companion")
-    parser.add_argument("--broker-url", required=True, help="Invoke URL of the broker Lambda")
-    parser.add_argument("--session", default=str(uuid.uuid4()))
-    args = parser.parse_args()
+    finals_q: asyncio.Queue[str] = asyncio.Queue()
+    handler = FinalsOnlyHandler(stream.output_stream, finals_q)
 
-    session = args.session
-    print(f"Starting session {session}")
+    send_task = asyncio.create_task(sender())
+    recv_task = asyncio.create_task(handler.handle_events())
 
-    for transcript in stream_microphone():
-        payload = {"session_id": session, "text": transcript}
-        response = requests.post(args.broker_url, json=payload, timeout=30)
-        response.raise_for_status()
-        body = response.json()
-        print(f"AI: {body['text']}")
-        audio_path = Path("output")
-        audio_path.mkdir(exist_ok=True)
-        file_path = audio_path / f"response-{uuid.uuid4()}.mp3"
-        audio_bytes = base64.b64decode(body["audio"]["audio_base64"])
-        file_path.write_bytes(audio_bytes)
-        print(f"Saved audio to {file_path}")
+    try:
+        while True:
+            text = await finals_q.get()
+            yield text
+    finally:
+        send_task.cancel()
+        recv_task.cancel()
 
 
-if __name__ == "__main__":  # pragma: no cover - CLI entry
+# ---------- CLI / Broker loop ----------
+async def run():
+    ap = argparse.ArgumentParser(description="Cloud AI companion voice client")
+    ap.add_argument("--broker-url", required=True, help="API Gateway invoke URL (e.g., https://xxx.execute-api.../ingest/audio)")
+    ap.add_argument("--session", default=str(uuid.uuid4()), help="Session UUID (auto if omitted)")
+    ap.add_argument("--region", default=os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "us-west-2")
+    ap.add_argument("--language", default="en-US", help="Transcribe language code (default: en-US)")
+    ap.add_argument("--input-device", type=int, default=None, help="sounddevice input device index (optional)")
+    ap.add_argument("--rate", type=int, default=16000, help="sample rate (default 16000)")
+    args = ap.parse_args()
+
+    print(f"Starting session {args.session} (region={args.region}, lang={args.language})")
+    print("Tip: list devices with: python - <<'PY'\nimport sounddevice as sd; print(sd.query_devices())\nPY")
+
+    # graceful Ctrl-C
+    stop = asyncio.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            asyncio.get_running_loop().add_signal_handler(sig, stop.set)
+        except NotImplementedError:
+            pass  # Windows
+
+    async for transcript in stream_microphone(
+        region=args.region,
+        language_code=args.language,
+        sample_rate=args.rate,
+        input_device=args.input_device,
+    ):
+        if stop.is_set():
+            break
+        print(f"YOU: {transcript}")
+        # Post to broker
+        try:
+            r = requests.post(
+                args.broker_url,
+                json={"session_id": args.session, "text": transcript},
+                timeout=60,
+            )
+            r.raise_for_status()
+            body = r.json()
+        except Exception as e:
+            print(f"[broker error] {e}", file=sys.stderr)
+            continue
+
+        # Expect: {"text": "...", "audio": {"audio_base64": "..."}}
+        ai_text = body.get("text", "")
+        print(f"AI:  {ai_text}")
+
+        audio_b64 = (body.get("audio") or {}).get("audio_base64")
+        if audio_b64:
+            outdir = Path("output")
+            outdir.mkdir(exist_ok=True)
+            out = outdir / f"response-{uuid.uuid4()}.mp3"
+            out.write_bytes(base64.b64decode(audio_b64))
+            print(f"[saved] {out}")
+
+        if stop.is_set():
+            break
+
+    print("Exiting.")
+
+
+def main():
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
     main()
