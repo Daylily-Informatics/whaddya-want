@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import contextlib
 import io
 import os
 import queue
@@ -449,10 +450,14 @@ async def run():
             spkid.enabled, bark.enabled, player.enabled
         )
     )
-    print("[hint] Press ENTER to enroll last ~3s as 'Major' (or type a name then ENTER). Type 'q' + ENTER to quit.")
+    print(
+        "[hint] Press ENTER to enroll last ~3s as 'Major' (or type a name then ENTER). "
+        "Type 'q' + ENTER to quit, 'r' + ENTER to reset the listener."
+    )
 
     # Manual enroll / quit via stdin
-    manual_q = queue.Queue()
+    loop = asyncio.get_running_loop()
+    manual_q: asyncio.Queue[str] = asyncio.Queue()
 
     def _stdin_watcher():
         try:
@@ -461,10 +466,15 @@ async def run():
                 if not line:
                     break
                 s = line.strip()
-                if s.lower() in ("q", "quit", "exit"):
-                    manual_q.put("__QUIT__")
-                else:
-                    manual_q.put(s)
+                try:
+                    if s.lower() in ("q", "quit", "exit"):
+                        loop.call_soon_threadsafe(manual_q.put_nowait, "__QUIT__")
+                    elif s.lower() in ("r", "reset", "restart"):
+                        loop.call_soon_threadsafe(manual_q.put_nowait, "__RESET__")
+                    else:
+                        loop.call_soon_threadsafe(manual_q.put_nowait, s)
+                except RuntimeError:
+                    break
         except Exception:
             pass
 
@@ -472,139 +482,186 @@ async def run():
 
     forced_done = False
     playback_warned = False
+    while not stop.is_set():
+        mic = stream_microphone(
+            region=args.region,
+            language_code=args.language,
+            sample_rate=args.rate,
+            channels=args.channels,
+            input_device=args.input_device,
+            analysis_buf=analysis_buf,
+            mute_event=playback_mute,
+            verbose=verbose,
+        )
 
-    async for transcript in stream_microphone(
-        region=args.region,
-        language_code=args.language,
-        sample_rate=args.rate,
-        channels=args.channels,
-        input_device=args.input_device,
-        analysis_buf=analysis_buf,
-        mute_event=playback_mute,
-        verbose=verbose,
-    ):
-        if stop.is_set():
-            break
-
-        print(f"YOU: {transcript}")
-
-        # Local voice exit
-        if _EXIT_RE.search(transcript):
-            print("[voice] exit requested — shutting down.")
-            break
-
-        need = int(args.id_window * args.rate)
-        vprint(f"[diag] buf_samples={len(analysis_buf)} need~{need}")
-
-        # One-shot forced enrollment
-        if args.force_enroll and not forced_done:
-            wav_fe = take_latest_seconds(analysis_buf, args.id_window, args.rate)
-            if wav_fe is not None and spkid.enroll(args.force_enroll, wav_fe):
-                forced_done = True
-                print(f"[enrolled voice] {args.force_enroll} (forced)")
-
-        # Manual enroll / quit via stdin
-        while not manual_q.empty():
-            typed = manual_q.get()
-            if typed == "__QUIT__":
-                print("[keyboard] quit requested — shutting down.")
-                stop.set()
-                break
-            target = typed if typed else "Major"
-            wav_m = take_latest_seconds(analysis_buf, max(args.id_window, 3.0), args.rate)
-            if wav_m is not None and spkid.enroll(target, wav_m):
-                print(f"[enrolled voice] {target} (manual)")
-            else:
-                print("[enrollment failed] buffer too short or model unavailable", file=sys.stderr)
-        if stop.is_set():
-            break
-
-        # Enrollment phrase from transcript
-        enrolled_name = None
-        name = parse_enrollment(transcript)
-        if name:
-            wav = take_latest_seconds(analysis_buf, args.id_window, args.rate)
-            if wav is not None and spkid.enroll(name, wav):
-                enrolled_name = name
-                print(f"[enrolled voice] {name}")
-            else:
-                print("[enrollment failed] not enough audio or model unavailable.", file=sys.stderr)
-
-        # Build context for broker
-        context = {}
-        wav_id = take_latest_seconds(analysis_buf, args.id_window, args.rate)
-        if wav_id is not None:
-            who = spkid.identify(wav_id, threshold=args.id_threshold)
-            if who:
-                context["speaker_id"] = who
-            try:
-                if bark.detect(wav_id):
-                    context["acoustic_event"] = "dog_bark"
-            except Exception as e:
-                if verbose:
-                    print("[diag] bark detect error:", e, file=sys.stderr)
-
-        client_event = {}
-        if enrolled_name:
-            client_event["enrolled_speaker"] = enrolled_name
-
-        # POST to broker
-        payload = {"session_id": args.session, "text": transcript}
-        if context:
-            payload["context"] = context
-        if client_event:
-            payload["client_event"] = client_event
-        if voice_id:
-            payload["voice_id"] = voice_id
-        payload["voice_mode"] = args.voice_mode
+        mic_task = asyncio.create_task(mic.__anext__())
+        reset_requested = False
 
         try:
-            r = requests.post(args.broker_url, json=payload, timeout=60)
-            r.raise_for_status()
-            body = r.json()
-        except Exception as e:
-            print(f"[broker error] {e}", file=sys.stderr)
-            continue
+            while not stop.is_set():
+                # Handle manual keyboard commands promptly
+                handled_manual = False
+                while True:
+                    try:
+                        typed = manual_q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
 
-        # Honor broker-requested exit
-        ce = body.get("client_event") or {}
-        if isinstance(ce, dict) and ce.get("command") == "exit":
-            print("[broker] requested exit — shutting down.")
-            break
+                    handled_manual = True
+                    if typed == "__QUIT__":
+                        print("[keyboard] quit requested — shutting down.")
+                        stop.set()
+                        break
+                    if typed == "__RESET__":
+                        print("[keyboard] reset requested — restarting listener.")
+                        analysis_buf.clear()
+                        reset_requested = True
+                        break
 
-        # Expect: {"text": "...", "audio": {"audio_base64": "..."}}
-        ai_text = body.get("text", "")
-        if context.get("speaker_id"):
-            vprint(f"[ctx] speaker={context['speaker_id']}", end="")
-            if context.get("acoustic_event"):
-                vprint(f"  event={context['acoustic_event']}")
-            else:
-                vprint()
-        elif context.get("acoustic_event"):
-            vprint(f"[ctx] event={context['acoustic_event']}")
-        if client_event:
-            print(f"[event] enrolled_speaker={client_event['enrolled_speaker']}")
+                    target = typed if typed else "Major"
+                    wav_m = take_latest_seconds(analysis_buf, max(args.id_window, 3.0), args.rate)
+                    if wav_m is not None and spkid.enroll(target, wav_m):
+                        print(f"[enrolled voice] {target} (manual)")
+                    else:
+                        print(
+                            "[enrollment failed] buffer too short or model unavailable",
+                            file=sys.stderr,
+                        )
 
-        print(f"AI:  {ai_text}")
+                if stop.is_set() or reset_requested:
+                    break
 
-        audio_b64 = (body.get("audio") or {}).get("audio_base64")
-        if audio_b64:
-            outdir = Path("output")
-            outdir.mkdir(exist_ok=True)
-            out = outdir / f"response-{uuid.uuid4()}.mp3"
-            audio_bytes = base64.b64decode(audio_b64)
-            out.write_bytes(audio_bytes)
-            print(f"[saved] {out}")
-            played = await player.play(audio_bytes)
-            if not played and not playback_warned:
-                print(
-                    "[hint] Install 'pydub' and ffmpeg (or libav) to enable speaker playback.",
-                    file=sys.stderr,
-                )
-                playback_warned = True
+                if handled_manual:
+                    continue
+
+                try:
+                    transcript = await asyncio.wait_for(asyncio.shield(mic_task), timeout=0.2)
+                except asyncio.TimeoutError:
+                    continue
+                except StopAsyncIteration:
+                    stop.set()
+                    break
+
+                mic_task = asyncio.create_task(mic.__anext__())
+
+                print(f"YOU: {transcript}")
+
+                # Local voice exit
+                if _EXIT_RE.search(transcript):
+                    print("[voice] exit requested — shutting down.")
+                    stop.set()
+                    break
+
+                need = int(args.id_window * args.rate)
+                vprint(f"[diag] buf_samples={len(analysis_buf)} need~{need}")
+
+                # One-shot forced enrollment
+                if args.force_enroll and not forced_done:
+                    wav_fe = take_latest_seconds(analysis_buf, args.id_window, args.rate)
+                    if wav_fe is not None and spkid.enroll(args.force_enroll, wav_fe):
+                        forced_done = True
+                        print(f"[enrolled voice] {args.force_enroll} (forced)")
+
+                # Enrollment phrase from transcript
+                enrolled_name = None
+                name = parse_enrollment(transcript)
+                if name:
+                    wav = take_latest_seconds(analysis_buf, args.id_window, args.rate)
+                    if wav is not None and spkid.enroll(name, wav):
+                        enrolled_name = name
+                        print(f"[enrolled voice] {name}")
+                    else:
+                        print(
+                            "[enrollment failed] not enough audio or model unavailable.",
+                            file=sys.stderr,
+                        )
+
+                # Build context for broker
+                context = {}
+                wav_id = take_latest_seconds(analysis_buf, args.id_window, args.rate)
+                if wav_id is not None:
+                    who = spkid.identify(wav_id, threshold=args.id_threshold)
+                    if who:
+                        context["speaker_id"] = who
+                    try:
+                        if bark.detect(wav_id):
+                            context["acoustic_event"] = "dog_bark"
+                    except Exception as e:
+                        if verbose:
+                            print("[diag] bark detect error:", e, file=sys.stderr)
+
+                client_event = {}
+                if enrolled_name:
+                    client_event["enrolled_speaker"] = enrolled_name
+
+                # POST to broker
+                payload = {"session_id": args.session, "text": transcript}
+                if context:
+                    payload["context"] = context
+                if client_event:
+                    payload["client_event"] = client_event
+                if voice_id:
+                    payload["voice_id"] = voice_id
+                payload["voice_mode"] = args.voice_mode
+
+                try:
+                    r = requests.post(args.broker_url, json=payload, timeout=60)
+                    r.raise_for_status()
+                    body = r.json()
+                except Exception as e:
+                    print(f"[broker error] {e}", file=sys.stderr)
+                    continue
+
+                # Honor broker-requested exit
+                ce = body.get("client_event") or {}
+                if isinstance(ce, dict) and ce.get("command") == "exit":
+                    print("[broker] requested exit — shutting down.")
+                    stop.set()
+                    break
+
+                # Expect: {"text": "...", "audio": {"audio_base64": "..."}}
+                ai_text = body.get("text", "")
+                if context.get("speaker_id"):
+                    vprint(f"[ctx] speaker={context['speaker_id']}", end="")
+                    if context.get("acoustic_event"):
+                        vprint(f"  event={context['acoustic_event']}")
+                    else:
+                        vprint()
+                elif context.get("acoustic_event"):
+                    vprint(f"[ctx] event={context['acoustic_event']}")
+                if client_event:
+                    print(f"[event] enrolled_speaker={client_event['enrolled_speaker']}")
+
+                print(f"AI:  {ai_text}")
+
+                audio_b64 = (body.get("audio") or {}).get("audio_base64")
+                if audio_b64:
+                    outdir = Path("output")
+                    outdir.mkdir(exist_ok=True)
+                    out = outdir / f"response-{uuid.uuid4()}.mp3"
+                    audio_bytes = base64.b64decode(audio_b64)
+                    out.write_bytes(audio_bytes)
+                    print(f"[saved] {out}")
+                    played = await player.play(audio_bytes)
+                    if not played and not playback_warned:
+                        print(
+                            "[hint] Install 'pydub' and ffmpeg (or libav) to enable speaker playback.",
+                            file=sys.stderr,
+                        )
+                        playback_warned = True
+
+        finally:
+            mic_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
+                await mic_task
+            with contextlib.suppress(Exception):
+                await mic.aclose()
 
         if stop.is_set():
             break
+        if reset_requested:
+            continue
+        break
 
     print("Exiting.")
 
