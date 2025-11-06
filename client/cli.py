@@ -248,7 +248,7 @@ async def run():
     ap.add_argument("--language", default="en-US")
     ap.add_argument("--input-device", type=int, default=None)
     ap.add_argument("--setup-devices", action="store_true")
-    ap.add_argument("--identify-image", type=str, default=None, help="Optional: identify a face from an image and exit")
+    ap.add_argument("--identify_image", type=str, default=None, help="Optional: identify a face from an image and exit")
     ap.add_argument("--rate", type=int, default=16000)
     ap.add_argument("--channels", type=int, default=1)
     ap.add_argument("--id-threshold", type=float, default=0.65)
@@ -261,11 +261,11 @@ async def run():
     args = ap.parse_args()
 
     # Face ID one-shot (shared memory)
-    if args.identify-image:
+    if args.identify_image:
         if not _FACE_OK:
             print("[face] face_recognition not available.", file=sys.stderr)
             sys.exit(2)
-        img = face_recognition.load_image_file(args.identify-image)  # noqa: E999 (dash)
+        img = face_recognition.load_image_file(args.identify_image)  # noqa: E999 (dash)
         locs = face_recognition.face_locations(img, model="hog")
         if not locs:
             print("No face found.")
@@ -393,10 +393,13 @@ async def run():
             if _MONITOR_RE.search(transcript):
                 cmd = [
                     sys.executable, "-m", "client.monitor",
+                    "--broker-url", args.broker_url,
+                    "--session", args.session,
+                    "--voice", (voice_id or ""),
+                    "--voice-mode", args.voice_mode,
                     f"--camera-index={cam_idx if cam_idx is not None else 0}",
                     f"--mic-index={mic_idx if mic_idx is not None else -1}",
                     f"--speaker-index={spk_idx if spk_idx is not None else -1}",
-                    "--tts=auto", "--voice", (voice_id or ""),
                 ]
                 try:
                     subprocess.Popen(cmd, stdout=None, stderr=None, close_fds=True)
