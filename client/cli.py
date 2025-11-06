@@ -394,7 +394,17 @@ async def run():
     ap.add_argument("--id-threshold", type=float, default=0.65, help="speaker cosine threshold (default 0.65)")
     ap.add_argument("--id-window", type=float, default=2.0, help="seconds of audio for ID/enroll (default 2.0)")
     ap.add_argument("--force-enroll", default=None, help="Enroll given name from the first usable buffer (one-shot)")
+    ap.add_argument(
+        "--voice",
+        default=os.getenv("POLLY_VOICE"),
+        help="Optional Amazon Polly voice ID override (default: server configuration)",
+    )
     args = ap.parse_args()
+
+    voice_id = (args.voice or "").strip() or None
+
+    if voice_id:
+        print(f"[diag] overriding Polly voice to '{voice_id}'")
 
     print(f"Starting session {args.session} (region={args.region}, lang={args.language})")
     print("Tip: list devices with:\n  python - <<'PY'\nimport sounddevice as sd; print(sd.query_devices())\nPY\n")
@@ -523,6 +533,8 @@ async def run():
             payload["context"] = context
         if client_event:
             payload["client_event"] = client_event
+        if voice_id:
+            payload["voice_id"] = voice_id
 
         try:
             r = requests.post(args.broker_url, json=payload, timeout=60)
