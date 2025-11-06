@@ -9,6 +9,22 @@ responses that the cloud services generate. All heavy computation—speech
 recognition, multimodal perception, reasoning, and text-to-speech—runs on the
 cloud provider.
 
+## Bootstrapping the repository
+
+Run the helper script to create a Python environment (either a virtual
+environment or Conda) and install the runtime dependencies for the Lambda
+function and optional CLI client:
+
+```bash
+bin/bootstrap.sh            # creates .venv/ by default
+# or
+bin/bootstrap.sh --mode conda
+```
+
+After the script completes activate the environment that was created and export
+`PYTHONPATH=src` when running local tools or tests. The script will also alert
+you if required system dependencies such as the AWS CLI are missing.
+
 ### High-Level Architecture
 
 1. **Client capture & playback**
