@@ -16,6 +16,7 @@ environment or Conda) and install the runtime dependencies for the Lambda
 function and optional CLI client:
 
 ```bash
+export AWS_PROFILE=your-aws-profile   # optional
 bin/bootstrap.sh            # creates .venv/ by default
 # or
 bin/bootstrap.sh --mode conda
@@ -200,7 +201,8 @@ sam build --use-container
 sam deploy \
   --stack-name ai-companion \
   --capabilities CAPABILITY_IAM \
-  --parameter-overrides LLMSecretArn=arn:aws:secretsmanager:...:secret:ai-companion
+  --parameter-overrides LLMSecretArn=arn:aws:secretsmanager:...:secret:ai-companion \
+  --resolve-s3 --region us-west-2
 ```
 
 After deployment copy the output `BrokerEndpoint` URL and point the CLI client

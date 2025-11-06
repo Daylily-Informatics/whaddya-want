@@ -26,7 +26,6 @@ dependencies:
     - replicate
     - groq
     - boto
-    - amazon-transcribe-streaming-sdk 
     - sounddevice 
     - opencv-python 
     - numpy
