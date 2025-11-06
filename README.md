@@ -234,7 +234,7 @@ export AWS_PROFILE=daylily
 
 sam build --use-container
 sam deploy \
-  --stack-name ai-companion2 \
+  --stack-name ai-companion \
   --capabilities CAPABILITY_IAM \
   --parameter-overrides LLMSecretArn=arn:aws:secretsmanager:...:secret:ai-companion \
   --resolve-s3 --region us-west-2
