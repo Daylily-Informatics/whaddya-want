@@ -19,6 +19,8 @@ import requests
 from client import identity
 from client.shared_audio import AudioPlayer
 
+from client.shared_audio import _audio_loop  # import the global loop
+
 # Paths & state
 STATE_DIR = Path(os.path.expanduser("~/.whaddya"))
 STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -131,11 +133,11 @@ def parse_args():
     p.add_argument("--camera-index", type=int, default=None)
     p.add_argument("--mic-index", type=int, default=None)
     p.add_argument("--speaker-index", type=int, default=None)
-    p.add_argument("--person-conf", type=float, default=0.60)
-    p.add_argument("--animal-conf", type=float, default=0.70)
-    p.add_argument("--min-area-frac", type=float, default=0.02)
-    p.add_argument("--persist-frames", type=int, default=4)
-    p.add_argument("--entry-cooldown-s", type=float, default=5.0)
+    p.add_argument("--person-conf", type=float, default=0.40)
+    p.add_argument("--animal-conf", type=float, default=0.40)
+    p.add_argument("--min-area-frac", type=float, default=0.005)
+    p.add_argument("--persist-frames", type=int, default=1)
+    p.add_argument("--entry-cooldown-s", type=float, default=1.0)
     p.add_argument("--roi", type=str, default="0,0,1,1")
     p.add_argument("--animal-match-thresh", type=float, default=0.22)
     return p.parse_args()
@@ -150,23 +152,52 @@ def _parse_roi(s: str):
         return 0,0,1,1
 
 # ---------- Broker speech (Polly via AudioPlayer) ----------
+# ---------- Broker speech (Polly via AudioPlayer) ----------
 def _say_via_broker(broker_url: str, session: str, text: str, voice: str, voice_mode: str,
                     player: AudioPlayer, playback_mute: threading.Event):
-    payload={"session_id": session, "text": text, "voice_id": voice, "voice_mode": voice_mode}
+    payload = {
+        "session_id": session,
+        "text": text,
+        "voice_id": voice,
+        "voice_mode": voice_mode,
+    }
     try:
-        r = requests.post(broker_url, json=payload, timeout=30, headers={"X-Client-Session": session})
-        if not r.ok: return
+        print('a', session, text, voice, voice_mode, player, playback_mute)
+        r = requests.post(
+            broker_url,
+            json=payload,
+            timeout=30,
+            headers={"X-Client-Session": session},
+        )
+        if not r.ok:
+            print("[monitor] broker HTTP", r.status_code, r.text)
+            return
+
         body = r.json()
         audio_b64 = (body.get("audio") or {}).get("audio_base64")
-        if not audio_b64: return
+        print('b')
+        if not audio_b64:
+            print("[monitor] no audio_base64 in broker response")
+            return
+
         data = base64.b64decode(audio_b64)
+        print('c')
         try:
-            loop = asyncio.get_event_loop()
-            loop.create_task(player.play(data))
-        except RuntimeError:
-            asyncio.run(player.play(data))
-    except Exception:
-        pass
+            # schedule playback on the dedicated audio loop
+            fut = asyncio.run_coroutine_threadsafe(player.play(data), _audio_loop)
+            # optional: wait a hair so errors surface here
+            # fut.result(timeout=0.1)
+            print('f')
+        except Exception as e:
+            print('g')
+            print(f"[monitor] broker speech error: {e}", file=sys.stderr)
+            
+
+    except Exception as e:
+        print('g')
+        print(f"[monitor] broker speech error: {e}", file=sys.stderr)
+
+
 
 # ---------- Name capture (Vosk) ----------
 def _extract_name_freeform(text: str) -> str|None:
@@ -292,7 +323,30 @@ def main():
                 absent_ok = (time.monotonic() - absence_start) >= REENTRY_ABSENCE_SEC
 
                 if qualified and not prev_qualified:
+                    # DEBUG: did we ever actually fire an entry event?
+                    print(
+                        "                    [monitor] ENTRY EVENT fired; ents =",
+                        ents,
+                        "                      present_frames =",
+                        present_frames,
+                        flush=True,
+                    )
+
                     now_ts=time.time()
+                    print(
+                        "                    [monitor] ",
+                        now_ts - last_entry_ts,
+                        "s since last entry); ents =",
+                         args.entry_cooldown_s,
+                         " had any =", had_any, ".... absent_ok =", absent_ok, "....",
+                        flush=True,
+                    )
+                    _say_via_broker(
+                                            args.broker_url, args.session,
+                                            "Ahoy! I don't know you yet. Please tell me your name.",
+                                            args.voice, args.voice_mode, player, playback_mute
+                                        )
+
                     if (now_ts - last_entry_ts) >= args.entry_cooldown_s and (not had_any or absent_ok):
                         last_entry_ts=now_ts; had_any=True
                         # snapshot

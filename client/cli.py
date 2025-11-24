@@ -119,7 +119,7 @@ async def stream_microphone(*, region: str, language_code="en-US", sample_rate=1
 # ---- Helpers / commands ----
 _ENROLL_RE = re.compile(
     r"""(?xi)
-    \b(?:enrol+|in\s*rol+|and\s*rol+|role)\s+(?:my\s+voice|me)\s*
+    \b(?:register|enrol+|in\s*rol+|and\s*rol+|role)\s+(?:my\s+voice|me)\s*
       (?:as\s+)?(?:(?:i'?m|i\s+am|this\s+is|says)\s+)?([A-Za-z][\w\s'\-]{0,31})\b
     | \bcall\s+me\s+([A-Za-z][\w\s'\-]{0,31})\b
     """

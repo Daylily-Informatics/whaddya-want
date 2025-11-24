@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
 """Shared abortable MP3 player for Polly output (used by cli + monitor)."""
 from __future__ import annotations
-import asyncio, io, sys
+import asyncio, io, sys, threading
 import numpy as np
+
+
+# Global audio event loop
+_audio_loop = asyncio.new_event_loop()
+
+def _run_audio_loop(loop):
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+    
+_audio_thread = threading.Thread(target=_run_audio_loop, args=(_audio_loop,), daemon=True)
+_audio_thread.start()
 
 _MP3_READY = False
 try:
