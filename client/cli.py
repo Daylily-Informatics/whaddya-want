@@ -82,11 +82,11 @@ async def stream_microphone(*, region: str, language_code="en-US", sample_rate=1
             print(status, file=sys.stderr)
         try:
             raw = bytes(indata)
+            if mute_event is not None and mute_event.is_set():
+                return
             if analysis_buf is not None:
                 fmono = _bytes_to_float_mono_int16(raw, channels)
                 analysis_buf.extend(fmono.tolist())
-            if mute_event is not None and mute_event.is_set():
-                return
             raw_q.put_nowait(raw)
         except queue.Full:
             pass

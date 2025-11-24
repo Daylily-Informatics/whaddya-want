@@ -20,6 +20,7 @@ from client import identity
 from client.shared_audio import AudioPlayer
 
 from client.shared_audio import _audio_loop  # import the global loop
+from client.shared_audio import AudioPlayer, _audio_loop, say_via_broker_sync
 
 # Paths & state
 STATE_DIR = Path(os.path.expanduser("~/.whaddya"))
@@ -154,52 +155,6 @@ def _parse_roi(s: str):
     except Exception:
         return 0,0,1,1
 
-# ---------- Broker speech (Polly via AudioPlayer) ----------
-# ---------- Broker speech (Polly via AudioPlayer) ----------
-def _say_via_broker(broker_url: str, session: str, text: str, voice: str, voice_mode: str,
-                    player: AudioPlayer, playback_mute: threading.Event):
-    payload = {
-        "session_id": session,
-        "text": text,
-        "voice_id": voice,
-        "voice_mode": voice_mode,
-    }
-    try:
-        print('a', session, text, voice, voice_mode, player, playback_mute)
-        r = requests.post(
-            broker_url,
-            json=payload,
-            timeout=30,
-            headers={"X-Client-Session": session},
-        )
-        if not r.ok:
-            print("[monitor] broker HTTP", r.status_code, r.text)
-            return
-
-        body = r.json()
-        audio_b64 = (body.get("audio") or {}).get("audio_base64")
-        print('b')
-        if not audio_b64:
-            print("[monitor] no audio_base64 in broker response")
-            return
-
-        data = base64.b64decode(audio_b64)
-        print('c')
-        try:
-            # schedule playback on the dedicated audio loop
-            fut = asyncio.run_coroutine_threadsafe(player.play(data), _audio_loop)
-            # optional: wait a hair so errors surface here
-            # fut.result(timeout=0.1)
-            print('f')
-        except Exception as e:
-            print('g')
-            print(f"[monitor] broker speech error: {e}", file=sys.stderr)
-            
-
-    except Exception as e:
-        print('g')
-        print(f"[monitor] broker speech error: {e}", file=sys.stderr)
-
 
 
 # ---------- Name capture (Vosk) ----------
@@ -291,14 +246,14 @@ def main():
                     kind, val = events.get_nowait()
                     if kind=="cmd":
                         if val=="exit":
-                            _say_via_broker(args.broker_url, args.session, "Exiting monitor.", args.voice, args.voice_mode, player, playback_mute)
+                            say_via_broker_sync(args.broker_url, args.session, "Exiting monitor.", args.voice, args.voice_mode, player, playback_mute)
                             return
                         elif val=="pause":
                             state["paused"]=True
-                            _say_via_broker(args.broker_url, args.session, "Paused detection.", args.voice, args.voice_mode, player, playback_mute)
+                            say_via_broker_sync(args.broker_url, args.session, "Paused detection.", args.voice, args.voice_mode, player, playback_mute)
                         elif val=="resume":
                             state["paused"]=False
-                            _say_via_broker(args.broker_url, args.session, "Resumed detection.", args.voice, args.voice_mode, player, playback_mute)
+                            say_via_broker_sync(args.broker_url, args.session, "Resumed detection.", args.voice, args.voice_mode, player, playback_mute)
             except queue.Empty:
                 pass
 
@@ -348,7 +303,7 @@ def main():
                          " had any =", had_any, ".... absent_ok =", absent_ok, "....",
                         flush=True,
                     )
-                    _say_via_broker(
+                    say_via_broker_sync(
                                             args.broker_url, args.session,
                                             "Ahoy! I don't know you yet. Please tell me your name.",
                                             args.voice, args.voice_mode, player, playback_mute
@@ -372,7 +327,7 @@ def main():
                                         names.append(f["name"])
                                     else:
                                         # Unknown person → ask name, capture, enroll face
-                                        _say_via_broker(
+                                        say_via_broker_sync(
                                             args.broker_url, args.session,
                                             "Ahoy! I don't know you yet. Please tell me your name.",
                                             args.voice, args.voice_mode, player, playback_mute
@@ -397,14 +352,14 @@ def main():
                                 names.append(who)
                             else:
                                 prompt = f"Hello {et}. I don't know your name yet. What should I call you?"
-                                _say_via_broker(args.broker_url, args.session, prompt, args.voice, args.voice_mode, player, playback_mute)
+                                say_via_broker_sync(args.broker_url, args.session, prompt, args.voice, args.voice_mode, player, playback_mute)
                                 nm = listen_for_name(mic_idx, timeout_s=7.0)
                                 if nm:
                                     identity.enroll_animal(nm, et, sig)
                                     names.append(nm)
 
                         greet = "Ahoy " + ", ".join(sorted(set(names))) if names else "Ahoy!"
-                        _say_via_broker(args.broker_url, args.session, greet, args.voice, args.voice_mode, player, playback_mute)
+                        say_via_broker_sync(args.broker_url, args.session, greet, args.voice, args.voice_mode, player, playback_mute)
 
                 prev_qualified = qualified
 
