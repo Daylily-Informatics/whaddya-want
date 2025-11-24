@@ -83,10 +83,13 @@ _CMD_EXIT={"exit","quit","bye","goodbye"}
 def _normalize(s:str)->str:
     return re.sub(r"\s+"," ", re.sub(r"[^\w\s]"," ", s.lower())).strip()
 
-def asr_listener(event_q: queue.Queue, stop_ev: threading.Event, mic_device: int|None=None):
+def asr_listener(event_q: queue.Queue, stop_ev: threading.Event, mic_device: int|None=None,
+                 playback_mute: threading.Event|None=None):
     rec=KaldiRecognizer(load_asr_model(), ASR_SAMPLE_RATE); rec.SetWords(False)
     def cb(indata, frames, timeinfo, status):
         if stop_ev.is_set(): raise sd.CallbackStop()
+        if playback_mute is not None and playback_mute.is_set():
+            return
         if not rec.AcceptWaveform(bytes(indata)): return
         phrase=(json.loads(rec.Result()).get("text") or "").strip()
         if not phrase: return
@@ -253,14 +256,18 @@ def main():
     except Exception:
         pass
 
-    # Threads
-    events: "queue.Queue[tuple]" = queue.Queue()
-    stop_ev = threading.Event()
-    threading.Thread(target=asr_listener, args=(events, stop_ev, mic_idx), daemon=True).start()
-
     # Audio player (Polly mp3 from broker)
     playback_mute = threading.Event()
     player = AudioPlayer(mute_guard=playback_mute)
+
+    # Threads
+    events: "queue.Queue[tuple]" = queue.Queue()
+    stop_ev = threading.Event()
+    threading.Thread(
+        target=asr_listener,
+        args=(events, stop_ev, mic_idx, playback_mute),
+        daemon=True,
+    ).start()
 
     # YOLO + camera
     model = YOLO("yolov8n.pt")
