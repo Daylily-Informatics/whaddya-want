@@ -119,7 +119,7 @@ async def stream_microphone(*, region: str, language_code="en-US", sample_rate=1
 # ---- Helpers / commands ----
 _ENROLL_RE = re.compile(
     r"""(?xi)
-    \b(?:enrol+|in\s*rol+|and\s*rol+|role)\s+(?:my\s+voice|me)\s*
+    \b(?:register|enrol+|in\s*rol+|and\s*rol+|role)\s+(?:my\s+voice|me)\s*
       (?:as\s+)?(?:(?:i'?m|i\s+am|this\s+is|says)\s+)?([A-Za-z][\w\s'\-]{0,31})\b
     | \bcall\s+me\s+([A-Za-z][\w\s'\-]{0,31})\b
     """
@@ -256,6 +256,7 @@ async def run():
     ap.add_argument("--force-enroll", default=None)
     ap.add_argument("--voice", default=os.getenv("POLLY_VOICE"))
     ap.add_argument("--voice-mode", choices=["standard","neural","generative"], default="standard")
+    ap.add_argument("--text-only", action="store_true", help="Request text-only responses from the broker")
     ap.add_argument("--save-audio", action="store_true")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
@@ -443,6 +444,7 @@ async def run():
             payload = {"session_id": args.session, "text": transcript, "voice_mode": args.voice_mode}
             if voice_id: payload["voice_id"] = voice_id
             if context: payload["context"] = context
+            if args.text_only: payload["text_only"] = True
             if verbose:
                 print(f"[diag] POST {args.broker_url}")
                 print("[diag] payload=", json.dumps(payload, indent=2))
@@ -502,3 +504,14 @@ def main():
 
 if __name__=="__main__":
     main()
+
+# Danielle
+# Joanna
+# Ruth
+# Salli
+# Matthew
+# Ayanda
+# Amy
+# Olivia
+# Stephen
+# Kajal
