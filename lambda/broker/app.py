@@ -106,6 +106,15 @@ def _parse_body(event: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Option
     return body, None
 
 
+# ----- Flags -----
+def _is_truthy(val: Any) -> bool:
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return False
+
+
 # ----- TTS -----
 def _tts(text: str, voice_id: Optional[str] = None) -> Dict[str, Any]:
     """Synthesize speech. Raises on Polly errors (caught in handler)."""
@@ -222,13 +231,18 @@ def handler(event, context):
     else:
         voice_id = None
 
+    text_only  = _is_truthy(body.get("text_only"))
+
     # Identity fast-path
     if speaker and re.search(r"\b(who am i|what'?s my name|who'?s speaking)\b", text.lower()):
+        plain = {"text": f"You are {speaker}.", "audio": {"audio_base64": None}}
+        if text_only:
+            return _ok(plain, headers=out_hdr)
         try:
-            return _ok(_tts(f"You are {speaker}.", voice_id), headers=out_hdr)
+            return _ok(_tts(plain["text"], voice_id), headers=out_hdr)
         except Exception as exc:
             # If Polly fails, still give a 200 with text only to avoid breaking UX on identity
-            return _ok({"text": f"You are {speaker}.", "audio": {"audio_base64": None}}, headers=out_hdr)
+            return _ok(plain, headers=out_hdr)
 
     # Short memory (optional)
     try:
@@ -255,6 +269,8 @@ def handler(event, context):
         pass
 
     # TTS (Polly) — if Polly fails, report a 502 with details instead of 500
+    if text_only:
+        return _ok({"text": reply, "audio": {"audio_base64": None}}, headers=out_hdr)
     try:
         return _ok(_tts(reply, voice_id), headers=out_hdr)
     except Exception as exc:
