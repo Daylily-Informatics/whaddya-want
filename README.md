@@ -213,7 +213,7 @@ Create `.env'
 REGION=us-west-2
 PROFILE=daylily
 ENGINE=finch
-MODEL_ID=meta.llama3-1-8b-instruct-v1:0
+MODEL_ID=amazon.nova-lite-v1
 POLLY_VOICE=Joanna
 USE_MEMORY=true
 MEMORY_TABLE=whaddyawant_session_memory
@@ -232,9 +232,9 @@ export AWS_REGION=us-west-2
 export AWS_DEFAULT_REGION=us-west-2
 export AWS_PROFILE=daylily
 
-sam build  # --use-container
+sam build  
 sam deploy \
-  --stack-name ai-companion3 \
+  --stack-name ai-companion5 \
   --capabilities CAPABILITY_IAM \
   --parameter-overrides LLMSecretArn=arn:aws:secretsmanager:...:secret:ai-companion \
   --resolve-s3 --region us-west-2
