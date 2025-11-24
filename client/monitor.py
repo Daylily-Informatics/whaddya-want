@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, json, os, sys, time, queue, re, threading, base64
+# Allow running as "python client/monitor.py" by adding repo root to sys.path (optional safety)
+if __package__ is None or __package__ == "":
+    import sys as _sys, pathlib as _pathlib
+    _sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parents[1]))
+
+import argparse, json, os, sys, time, queue, re, threading, base64, asyncio
 from pathlib import Path
 from typing import Tuple
 
@@ -26,14 +31,14 @@ COCO_PERSON, COCO_CAT, COCO_DOG, COCO_HORSE = 0,15,16,17
 SPECIES_LABEL = {COCO_PERSON:"person", COCO_CAT:"cat", COCO_DOG:"dog", COCO_HORSE:"donkey"}
 DETECT_CLASSES = [COCO_PERSON, COCO_CAT, COCO_DOG, COCO_HORSE]
 
-FACE_MATCH_SIM_NEED = 0.60
 REENTRY_ABSENCE_SEC = 2.0
 
-# Animal signature (HSV+LBP)
+# ---------- Animal signature (HSV+LBP) ----------
 def _lbp_hist(gray: np.ndarray) -> np.ndarray:
     g=gray.astype(np.int16); c=g[1:-1,1:-1]
     codes=((g[0:-2,1:-1]>=c)<<0)|((g[0:-2,2:]>=c)<<1)|((g[1:-1,2:]>=c)<<2)|((g[2:,2:]>=c)<<3)|((g[2:,1:-1]>=c)<<4)|((g[2:,0:-2]>=c)<<5)|((g[1:-1,0:-2]>=c)<<6)|((g[0:-2,0:-2]>=c)<<7)
     h=np.bincount(codes.ravel(), minlength=256).astype(np.float32); h/= (h.sum()+1e-9); return h
+
 def compute_animal_signature(bgr_roi: np.ndarray) -> np.ndarray:
     if bgr_roi.size==0: return np.zeros(768, np.float32)
     hsv=cv2.cvtColor(bgr_roi, cv2.COLOR_BGR2HSV)
@@ -43,7 +48,7 @@ def compute_animal_signature(bgr_roi: np.ndarray) -> np.ndarray:
     lbp=_lbp_hist(gray)
     sig=np.concatenate([hist,lbp]).astype(np.float32); sig/= (np.linalg.norm(sig)+1e-9); return sig
 
-# Faces
+# ---------- Faces ----------
 _FACE_OK=False
 try:
     import face_recognition
@@ -59,11 +64,11 @@ def analyze_faces(frame: np.ndarray):
     encs=face_recognition.face_encodings(rgb, locs, num_jitters=1)
     out=[]
     for loc,enc in zip(locs,encs):
-        nm=identity.identify_face(enc, threshold=0.45)  # we re-threshold by sim inside identity
+        nm=identity.identify_face(enc, threshold=0.45)
         out.append({"location":loc,"encoding":enc,"name":nm})
     return out
 
-# Vosk ASR for simple monitor commands
+# ---------- Vosk ASR for simple monitor commands ----------
 def load_asr_model()->Model:
     for c in ["vosk-model-small-en-us-0.15","vosk-model-en-us-0.22"]:
         if os.path.isdir(c): return Model(c)
@@ -91,7 +96,7 @@ def asr_listener(event_q: queue.Queue, stop_ev: threading.Event, mic_device: int
                            channels=1,callback=cb,device=mic_device):
         while not stop_ev.is_set(): sd.sleep(100)
 
-# YOLO utils
+# ---------- YOLO utils ----------
 def yolo_entities_strict(results, frame_shape, roi, person_conf, animal_conf, min_area_frac):
     H,W=frame_shape[:2]; area_min=min_area_frac*(W*H)
     ent=[]; det=results[0]
@@ -144,6 +149,7 @@ def _parse_roi(s: str):
     except Exception:
         return 0,0,1,1
 
+# ---------- Broker speech (Polly via AudioPlayer) ----------
 def _say_via_broker(broker_url: str, session: str, text: str, voice: str, voice_mode: str,
                     player: AudioPlayer, playback_mute: threading.Event):
     payload={"session_id": session, "text": text, "voice_id": voice, "voice_mode": voice_mode}
@@ -154,17 +160,56 @@ def _say_via_broker(broker_url: str, session: str, text: str, voice: str, voice_
         audio_b64 = (body.get("audio") or {}).get("audio_base64")
         if not audio_b64: return
         data = base64.b64decode(audio_b64)
-        loop = asyncio.get_event_loop()
-        # If not in an event loop (we’re in a thread), run blocking
         try:
+            loop = asyncio.get_event_loop()
             loop.create_task(player.play(data))
         except RuntimeError:
             asyncio.run(player.play(data))
     except Exception:
         pass
 
-import asyncio
+# ---------- Name capture (Vosk) ----------
+def _extract_name_freeform(text: str) -> str|None:
+    t=_normalize(text)
+    for trig in ["my name is","i am","i'm","call me","it's","its","name is"]:
+        if trig in t:
+            tail=t.split(trig,1)[1].strip()
+            toks=tail.split()
+            cand=" ".join(toks[:3]).strip().title()
+            cand=re.sub(r"^(the|a|an)\s+","",cand)
+            if len(cand)>=2: return cand[:60]
+    toks=t.split()
+    if 1<=len(toks)<=3 and all(len(x)>1 for x in toks):
+        return " ".join(toks).title()
+    return None
 
+def listen_for_name(mic_device: int|None, timeout_s: float=7.0) -> str|None:
+    rec=KaldiRecognizer(load_asr_model(), ASR_SAMPLE_RATE); rec.SetWords(False)
+    got=[]; stop_ev=threading.Event()
+    def cb(indata,frames,timeinfo,status):
+        if stop_ev.is_set(): raise sd.CallbackStop()
+        if not rec.AcceptWaveform(bytes(indata)): return
+        phrase=(json.loads(rec.Result()).get("text") or "").strip()
+        if phrase: got.append(phrase)
+        nm=_extract_name_freeform(phrase or "")
+        if nm:
+            got.append(f"__NAME__:{nm}")
+            stop_ev.set(); raise sd.CallbackStop()
+    deadline=time.monotonic()+timeout_s
+    try:
+        with sd.RawInputStream(samplerate=ASR_SAMPLE_RATE,blocksize=8000,dtype="int16",
+                               channels=1,callback=cb,device=mic_device):
+            while not stop_ev.is_set() and time.monotonic()<deadline: sd.sleep(100)
+    except sd.CallbackStop:
+        pass
+    for h in got:
+        if h.startswith("__NAME__:"):
+            return h.split(":",1)[1]
+    if got:
+        return _extract_name_freeform(" ".join(got))
+    return None
+
+# ---------- Main ----------
 def main():
     args = parse_args()
     cam_s, mic_s, spk_s = load_saved_devices()
@@ -255,6 +300,7 @@ def main():
                             cv2.imwrite(str(IMAGES_DIR / f"entry_{time.strftime('%Y%m%d_%H%M%S')}.jpg"), frame)
                         except Exception:
                             pass
+
                         # Identify persons
                         names=[]
                         if any(e=="person" for e,_ in ents):
@@ -264,21 +310,46 @@ def main():
                                     if f["name"]:
                                         names.append(f["name"])
                                     else:
-                                        # ask name via broker; here we just say hello
-                                        pass
+                                        # Unknown person → ask name, capture, enroll face
+                                        _say_via_broker(
+                                            args.broker_url, args.session,
+                                            "Ahoy! I don't know you yet. Please tell me your name.",
+                                            args.voice, args.voice_mode, player, playback_mute
+                                        )
+                                        nm = listen_for_name(mic_idx, timeout_s=7.0)
+                                        if nm:
+                                            identity.enroll_face(nm, f["encoding"])
+                                            names.append(nm)
+                                        else:
+                                            names.append("Friend")
+                            else:
+                                # No face encoding; generic
+                                names.append("Friend")
+
                         # Animals
                         for et,(x1,y1,x2,y2) in ents:
                             if et=="person": continue
                             roi_img = frame[max(0,y1):min(H,y2), max(0,x1):min(W,x2)]
                             sig = compute_animal_signature(roi_img)
                             who = identity.identify_animal(et, sig, max_dist=args.animal_match_thresh)
-                            if who: names.append(who)
+                            if who:
+                                names.append(who)
+                            else:
+                                prompt = f"Hello {et}. I don't know your name yet. What should I call you?"
+                                _say_via_broker(args.broker_url, args.session, prompt, args.voice, args.voice_mode, player, playback_mute)
+                                nm = listen_for_name(mic_idx, timeout_s=7.0)
+                                if nm:
+                                    identity.enroll_animal(nm, et, sig)
+                                    names.append(nm)
+
                         greet = "Ahoy " + ", ".join(sorted(set(names))) if names else "Ahoy!"
                         _say_via_broker(args.broker_url, args.session, greet, args.voice, args.voice_mode, player, playback_mute)
+
                 prev_qualified = qualified
 
             cv2.imshow("Marvin Monitor (press q to quit)", frame)
             if (cv2.waitKey(1) & 0xff)==ord('q'): break
+
     finally:
         stop_ev.set()
         try: cap.release()

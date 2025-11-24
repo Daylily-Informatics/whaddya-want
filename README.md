@@ -232,7 +232,7 @@ export AWS_REGION=us-west-2
 export AWS_DEFAULT_REGION=us-west-2
 export AWS_PROFILE=daylily
 
-sam build --use-container
+sam build  # --use-container
 sam deploy \
   --stack-name ai-companion \
   --capabilities CAPABILITY_IAM \
@@ -248,7 +248,10 @@ at it:
 export AWS_REGION=us-west-2
 export AWS_DEFAULT_REGION=us-west-2
 
-python client/cli.py --broker-url https://xxxx.execute-api.us-east-1.amazonaws.com/ingest/audio
+#python client/cli.py --broker-url https://xxxx.execute-api.us-east-1.amazonaws.com/ingest/audio
+
+ PYTHONPATH=. python -m client.cli --broker-url  https://dqetkdpsj6.execute-api.us-west-2.amazonaws.com/ingest/audio --setup-devices --voice Joanna --voice-mode neural --verbose
+ 
 ```
 
 ### Usage Loop
@@ -325,3 +328,6 @@ make clean clean-docker clean-finch clean-hard
 # 3) Fresh build + deploy
 sam build --use-container
 sam deploy --guided   # or: make deploy
+
+
+Danielle generative,neural Gregory neural Joanna generative,neural,standard Ruth generative,neural Jasmine neural Kevin neural Geraint standard Salli generative,neural,standard Matthew generative,neural,standard Kimberly neural,standard Kendra neural,standard Justin neural,standard Joey neural,standard Ivy neural,standard Aria neural Ayanda generative,neural Raveena standard Aditi standard Emma neural,standard Brian neural,standard Amy generative,neural,standard Russell standard Nicole standard Olivia generative,neural Stephen generative,neural Kajal generative,neural Niamh neural Arthur neural
