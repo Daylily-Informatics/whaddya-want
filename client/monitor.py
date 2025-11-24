@@ -181,6 +181,16 @@ def _say_via_broker(broker_url: str, session: str, text: str, voice: str, voice_
             return
 
         data = base64.b64decode(audio_b64)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop in this thread; fall back to a blocking call.
+            asyncio.run(player.play(data))
+        else:
+            # We already have a running loop (likely because we are invoked
+            # from async context); schedule playback without blocking.
+            loop.create_task(player.play(data))
+    except Exception:
         print('c')
         try:
             # schedule playback on the dedicated audio loop
