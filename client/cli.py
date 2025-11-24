@@ -259,6 +259,12 @@ async def run():
     ap.add_argument("--text-only", action="store_true", help="Request text-only responses from the broker")
     ap.add_argument("--save-audio", action="store_true")
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument(
+        "--self-voice-name",
+        type=str,
+        default=os.getenv("SELF_VOICE_NAME"),
+        help="If set, ignore transcripts whose speaker ID matches this enrolled voice (self-talk suppression).",
+    )
     args = ap.parse_args()
 
     # Face ID one-shot (shared memory)
@@ -277,6 +283,7 @@ async def run():
         sys.exit(0)
 
     voice_id = (args.voice or "").strip() or None
+    self_voice = (args.self_voice_name or "").strip().lower() or None
     verbose = bool(args.verbose)
     save_audio = bool(args.save_audio)
 
@@ -434,11 +441,20 @@ async def run():
             # build context with voice ID from shared registry
             wav_id = take_latest_seconds(analysis_buf, args.id_window, args.rate)
             context: Dict[str, Any] = {}
+            is_self_voice = False
             if wav_id is not None:
                 vec = spk_embed.embed(wav_id)
                 if vec is not None:
                     who = identity.identify_voice(vec, threshold=args.id_threshold)
-                    if who: context["speaker_id"] = who
+                    if who:
+                        if self_voice and who.strip().lower() == self_voice:
+                            print(f"[voice] Ignoring self voice signature ({who}).")
+                            is_self_voice = True
+                        else:
+                            context["speaker_id"] = who
+
+            if is_self_voice:
+                continue
 
             # POST to broker
             payload = {"session_id": args.session, "text": transcript, "voice_mode": args.voice_mode}
