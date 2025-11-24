@@ -27,7 +27,7 @@ Globals:
 Parameters:
   ModelId:
     Type: String
-    Default: deepseek.v3-v1:0
+    Default: amazon.titan-text-express-v1
     Description: Bedrock model ID (or inference profile ARN). Titan text uses amazon.titan-text-express-v1.
   PollyVoice:
     Type: String

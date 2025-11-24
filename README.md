@@ -213,7 +213,7 @@ Create `.env'
 REGION=us-west-2
 PROFILE=daylily
 ENGINE=finch
-MODEL_ID=deepseek.v3-v1:0
+MODEL_ID=amazon.titan-text-express-v1
 POLLY_VOICE=Joanna
 USE_MEMORY=true
 MEMORY_TABLE=whaddyawant_session_memory
