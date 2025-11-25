@@ -8,7 +8,7 @@ import io
 import json
 import sys
 import threading
-from typing import Any, Dict, Optional, Callable, Awaitable
+from typing import Any, Dict, Optional, Callable, Awaitable, Tuple
 
 import numpy as np
 import requests
@@ -98,6 +98,26 @@ async def _play_on_audio_loop(player: "AudioPlayer", data: bytes) -> bool:
     """Run player.play on the dedicated audio loop and await completion."""
     fut = asyncio.run_coroutine_threadsafe(player.play(data), _audio_loop)
     return await asyncio.wrap_future(fut)
+
+
+# ---- Shared player / mute guard helpers ----
+_shared_playback_mute: threading.Event | None = None
+_shared_player: AudioPlayer | None = None
+
+
+def get_shared_audio() -> Tuple[AudioPlayer, threading.Event]:
+    """Return the process-wide audio player and playback mute guard.
+
+    Both the CLI and monitor reuse these objects so that Marvin's voice output and
+    the "Marvin is talking" signal stay consistent across subsystems.
+    """
+
+    global _shared_playback_mute, _shared_player
+    if _shared_playback_mute is None:
+        _shared_playback_mute = threading.Event()
+    if _shared_player is None:
+        _shared_player = AudioPlayer(mute_guard=_shared_playback_mute)
+    return _shared_player, _shared_playback_mute
 
 
 async def speak_via_broker(

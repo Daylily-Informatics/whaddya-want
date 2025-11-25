@@ -18,7 +18,7 @@ from amazon_transcribe.model import TranscriptResultStream
 # Shared identity + audio
 from client import identity
 from client import monitor as monitor_module
-from client.shared_audio import AudioPlayer, speak_via_broker
+from client.shared_audio import AudioPlayer, speak_via_broker, get_shared_audio
 
 # ---- Speaker embedding (SpeechBrain) ----
 _SPK_READY = False
@@ -432,8 +432,7 @@ async def run() -> bool:
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
-    playback_mute = threading.Event()
-    player = AudioPlayer(mute_guard=playback_mute)
+    player, playback_mute = get_shared_audio()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try: loop.add_signal_handler(sig, lambda s=sig: (player.stop(), stop.set()))
         except NotImplementedError: pass
