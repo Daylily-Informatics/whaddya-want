@@ -126,6 +126,27 @@ _ENROLL_RE = re.compile(
 _EXIT_RE = re.compile(r"\b(exit|quit|stop listening|goodbye|stop now)\b", re.I)
 _WAKE_RE = re.compile(r"\b(?:hey|ok|okay)\s+marvin\b", re.I)
 _MONITOR_RE = re.compile(r"^\s*marvin[, ]+monitor\b", re.I)
+_DEVICE_CMD_RE = re.compile(
+    r"""(?xi)
+    \b(?:switch|change|set|use|select)\s+(?:the\s+)?
+    (camera|mic|microphone|speaker|speakers|output)\s*
+    (?:to|number|device)?\s*([\w-]+)
+    """
+)
+
+_NUM_WORDS = {
+    "zero": 0,
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+}
 
 def parse_enrollment(text: str) -> Optional[str]:
     m = _ENROLL_RE.search(text)
@@ -217,6 +238,44 @@ def load_saved_devices() -> Tuple[int|None,int|None,int|None]:
         except Exception:
             return None,None,None
     return None,None,None
+
+
+def _persist_devices(camera: int | None, mic: int | None, speaker: int | None) -> None:
+    try:
+        _DEVICES_JSON.write_text(
+            json.dumps(
+                {
+                    "camera_index": camera,
+                    "mic_index": mic,
+                    "speaker_index": speaker,
+                },
+                indent=2,
+            )
+        )
+    except Exception:
+        pass
+
+
+def parse_device_command(text: str) -> tuple[str, int] | None:
+    m = _DEVICE_CMD_RE.search(text)
+    if not m:
+        return None
+    raw_kind = m.group(1).lower()
+    idx_token = (m.group(2) or "").strip().lower()
+    idx: int | None
+    if idx_token.isdigit():
+        idx = int(idx_token)
+    else:
+        idx = _NUM_WORDS.get(idx_token)
+    if idx is None:
+        return None
+    if raw_kind.startswith("cam"):
+        kind = "camera"
+    elif raw_kind.startswith("mic") or raw_kind.startswith("micro"):
+        kind = "microphone"
+    else:
+        kind = "speaker"
+    return kind, idx
 
 # ---- Voice embedding model (for identity) ----
 class SpeakerEmbed:
@@ -332,6 +391,60 @@ async def run():
     analysis_buf = deque(maxlen=int(args.rate * 6))
     spk_embed = SpeakerEmbed()
 
+    async def _switch_microphone(new_idx: int) -> bool:
+        nonlocal mic, mic_task, mic_idx
+        try:
+            sd.check_input_settings(device=new_idx, samplerate=args.rate, channels=args.channels)
+            with sd.InputStream(device=new_idx, channels=args.channels, samplerate=args.rate) as s:
+                s.read(1)
+        except Exception as exc:
+            print(f"[voice] unable to switch microphone: {exc}", file=sys.stderr)
+            return False
+
+        mic_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
+            await mic_task
+        with contextlib.suppress(Exception):
+            await mic.aclose()
+
+        analysis_buf.clear()
+        mic = stream_microphone(
+            region=args.region,
+            language_code=args.language,
+            sample_rate=args.rate,
+            channels=args.channels,
+            input_device=new_idx,
+            analysis_buf=analysis_buf,
+            mute_event=playback_mute,
+            verbose=verbose,
+        )
+        mic_task = asyncio.create_task(mic.__anext__())
+        mic_idx = new_idx
+        try:
+            sd.default.device = (mic_idx, spk_idx)
+        except Exception:
+            pass
+        _persist_devices(cam_idx, mic_idx, spk_idx)
+        print(f"[voice] microphone switched to index {mic_idx}.")
+        return True
+
+    async def _switch_speaker(new_idx: int) -> bool:
+        nonlocal spk_idx
+        try:
+            sd.check_output_settings(device=new_idx, samplerate=args.rate, channels=1)
+        except Exception as exc:
+            print(f"[voice] unable to switch speaker: {exc}", file=sys.stderr)
+            return False
+
+        spk_idx = new_idx
+        try:
+            sd.default.device = (mic_idx, spk_idx)
+        except Exception:
+            pass
+        _persist_devices(cam_idx, mic_idx, spk_idx)
+        print(f"[voice] speaker switched to index {spk_idx}.")
+        return True
+
     # stdin watcher
     manual_q: asyncio.Queue[str] = asyncio.Queue()
     def _stdin_watcher():
@@ -425,6 +538,22 @@ async def run():
                     print("[voice] exit requested — shutting down."); stop.set(); break
                 else:
                     print("[voice] 'exit' ignored (say 'hey Marvin' first).")
+
+            device_cmd = parse_device_command(transcript)
+            if device_cmd:
+                if now > cmd_window_until:
+                    print("[voice] device change ignored (say 'hey Marvin' first).")
+                    continue
+                kind, idx = device_cmd
+                if kind == "camera":
+                    cam_idx = idx
+                    _persist_devices(cam_idx, mic_idx, spk_idx)
+                    print(f"[voice] camera switched to index {cam_idx}.")
+                elif kind == "microphone":
+                    await _switch_microphone(idx)
+                else:
+                    await _switch_speaker(idx)
+                continue
 
             # enrollment via phrase
             name = parse_enrollment(transcript)
