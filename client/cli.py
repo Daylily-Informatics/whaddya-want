@@ -461,11 +461,19 @@ async def run() -> bool:
 
     monitor_thread: threading.Thread | None = None
     monitor_stop: threading.Event | None = None
+    monitor_proc: subprocess.Popen[str] | None = None
     mic: AsyncGenerator[str, None] | None = None
     mic_task: asyncio.Task[str] | None = None
 
     def _stop_monitor():
-        nonlocal monitor_thread, monitor_stop
+        nonlocal monitor_thread, monitor_stop, monitor_proc
+        if monitor_proc is not None:
+            monitor_proc.terminate()
+            try:
+                monitor_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                monitor_proc.kill()
+            monitor_proc = None
         if monitor_thread is None:
             return
         if monitor_stop is not None:
@@ -475,8 +483,37 @@ async def run() -> bool:
         monitor_stop = None
 
     def _launch_monitor():
-        nonlocal monitor_thread, monitor_stop
+        nonlocal monitor_thread, monitor_stop, monitor_proc
         _stop_monitor()
+        if sys.platform == "darwin":
+            try:
+                monitor_proc = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-m",
+                        "client.monitor",
+                        "--broker-url",
+                        args.broker_url,
+                        "--session",
+                        args.session,
+                        "--voice",
+                        voice_id or "",
+                        "--voice-mode",
+                        args.voice_mode,
+                        "--camera-index",
+                        str(cam_idx if cam_idx is not None else 0),
+                        "--mic-index",
+                        str(mic_idx if mic_idx is not None else -1),
+                        "--speaker-index",
+                        str(spk_idx if spk_idx is not None else -1),
+                    ]
+                )
+                print("[monitor] started as external process (press 'q' in its window to quit).")
+            except Exception as e:
+                monitor_proc = None
+                print(f"[monitor error] {e}", file=sys.stderr)
+            return
+
         monitor_stop = threading.Event()
         try:
             monitor_thread = threading.Thread(
