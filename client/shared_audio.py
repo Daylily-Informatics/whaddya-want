@@ -1,17 +1,27 @@
 #!/usr/bin/env python3
-"""Shared abortable MP3 player for Polly output (used by cli + monitor)."""
+"""Shared broker + audio helpers for the CLI and monitor."""
 from __future__ import annotations
-import asyncio, io, sys, threading
-import numpy as np
 
+import asyncio
+import base64
+import io
+import json
+import sys
+import threading
+from typing import Any, Dict, Optional, Callable, Awaitable
+
+import numpy as np
+import requests
 
 # Global audio event loop
 _audio_loop = asyncio.new_event_loop()
 
+
 def _run_audio_loop(loop):
     asyncio.set_event_loop(loop)
     loop.run_forever()
-    
+
+
 _audio_thread = threading.Thread(target=_run_audio_loop, args=(_audio_loop,), daemon=True)
 _audio_thread.start()
 
@@ -84,10 +94,102 @@ class AudioPlayer:
         except Exception:
             pass
 
+async def _play_on_audio_loop(player: "AudioPlayer", data: bytes) -> bool:
+    """Run player.play on the dedicated audio loop and await completion."""
+    fut = asyncio.run_coroutine_threadsafe(player.play(data), _audio_loop)
+    return await asyncio.wrap_future(fut)
 
 
-import base64, json, requests  # at top with other imports
-from typing import Optional, Dict, Any
+async def speak_via_broker(
+    *,
+    broker_url: str,
+    session_id: str,
+    text: str,
+    voice_id: Optional[str],
+    voice_mode: str,
+    player: "AudioPlayer",
+    playback_mute: threading.Event,
+    context: Optional[Dict[str, Any]] = None,
+    text_only: bool = False,
+    timeout: int = 60,
+    verbose: bool = False,
+    barge_monitor: Optional[Callable[[], Awaitable[None]]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Shared broker interaction: POST text and optionally play returned audio.
+
+    The HTTP call is offloaded to a thread to avoid blocking event loops. Playback is
+    always driven through the shared audio loop so callers from different threads
+    and event loops share the same machinery.
+    """
+
+    payload: Dict[str, Any] = {
+        "session_id": session_id,
+        "text": text,
+        "voice_mode": voice_mode,
+    }
+    if voice_id:
+        payload["voice_id"] = voice_id
+    if context:
+        payload["context"] = context
+    if text_only:
+        payload["text_only"] = True
+
+    if verbose:
+        print(f"[diag] POST {broker_url}")
+        print("[diag] payload=", json.dumps(payload, indent=2))
+
+    try:
+        r = await asyncio.to_thread(
+            requests.post,
+            broker_url,
+            json=payload,
+            timeout=timeout,
+            headers={"X-Client-Session": session_id},
+        )
+    except requests.RequestException as e:
+        print(f"[broker error] request failed: {getattr(e,'args',[repr(e)])[0]}", file=sys.stderr)
+        return None
+
+    if not r.ok:
+        rid = r.headers.get("x-amzn-RequestId") or r.headers.get("x-amz-apigw-id") or "?"
+        print(f"[broker error] HTTP {r.status_code} {r.reason}  request-id={rid}", file=sys.stderr)
+        h_subset = {k: r.headers.get(k) for k in ["x-amzn-RequestId", "x-amz-apigw-id", "content-type", "date"] if r.headers.get(k)}
+        if h_subset:
+            print(f"[broker headers] {h_subset}", file=sys.stderr)
+        try:
+            errj = r.json()
+            print("[broker body.json]", json.dumps(errj, indent=2), file=sys.stderr)
+        except Exception:
+            bt = (r.text or "").strip()
+            if bt:
+                print("[broker body.text]", bt[:4000] + ("…(truncated)…" if len(bt) > 4000 else ""), file=sys.stderr)
+        return None
+
+    try:
+        body = r.json()
+    except Exception as e:
+        print(f"[broker error] invalid JSON response: {e}", file=sys.stderr)
+        return None
+
+    audio_b64 = (body.get("audio") or {}).get("audio_base64")
+    if audio_b64 and not text_only:
+        data = base64.b64decode(audio_b64)
+
+        async def _play():
+            mon = asyncio.create_task(barge_monitor()) if barge_monitor else None
+            try:
+                return await _play_on_audio_loop(player, data)
+            finally:
+                if mon:
+                    mon.cancel()
+
+        try:
+            await _play()
+        except Exception as e:
+            print(f"[speech] playback error: {e}", file=sys.stderr)
+
+    return body
+
 
 def say_via_broker_sync(
     *,
@@ -101,41 +203,22 @@ def say_via_broker_sync(
     context: Optional[Dict[str, Any]] = None,
     text_only: bool = False,
     timeout: int = 60,
+    verbose: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    """Synchronous helper: POST text to broker and play any returned audio on the global audio loop."""
-    payload: Dict[str, Any] = {
-        "session_id": session_id,
-        "text": text,
-        "voice_mode": voice_mode,
-    }
-    if voice_id:
-        payload["voice_id"] = voice_id
-    if context:
-        payload["context"] = context
-    if text_only:
-        payload["text_only"] = True
+    """Synchronous wrapper around speak_via_broker for threading callers."""
 
-    try:
-        r = requests.post(
-            broker_url,
-            json=payload,
+    return asyncio.run(
+        speak_via_broker(
+            broker_url=broker_url,
+            session_id=session_id,
+            text=text,
+            voice_id=voice_id,
+            voice_mode=voice_mode,
+            player=player,
+            playback_mute=playback_mute,
+            context=context,
+            text_only=text_only,
             timeout=timeout,
-            headers={"X-Client-Session": session_id},
+            verbose=verbose,
         )
-        if not r.ok:
-            print(f"[speech] broker HTTP {r.status_code} {r.text}", file=sys.stderr)
-            return None
-        body = r.json()
-    except Exception as e:
-        print(f"[speech] broker call error: {e}", file=sys.stderr)
-        return None
-
-    audio_b64 = (body.get("audio") or {}).get("audio_base64")
-    if audio_b64 and not text_only:
-        data = base64.b64decode(audio_b64)
-        try:
-            asyncio.run_coroutine_threadsafe(player.play(data), _audio_loop)
-        except Exception as e:
-            print(f"[speech] playback error: {e}", file=sys.stderr)
-
-    return body
+    )

@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, asyncio, base64, contextlib, io, json, os, queue, re, signal, sys, traceback, threading, uuid, warnings, subprocess
+import argparse, asyncio, contextlib, io, json, os, queue, re, signal, sys, traceback, threading, uuid, warnings, subprocess
 from collections import deque
 from pathlib import Path
 from typing import AsyncGenerator, Optional, Tuple, Dict, Any
 
 import numpy as np
-import requests
 import sounddevice as sd
 
 warnings.filterwarnings("ignore", message="torchvision is not available")
@@ -18,7 +17,7 @@ from amazon_transcribe.model import TranscriptResultStream
 
 # Shared identity + audio
 from client import identity
-from client.shared_audio import AudioPlayer
+from client.shared_audio import AudioPlayer, speak_via_broker
 
 # ---- Speaker embedding (SpeechBrain) ----
 _SPK_READY = False
@@ -361,7 +360,6 @@ async def run():
     mic_task = asyncio.create_task(mic.__anext__())
     reset_requested = False
     cmd_window_until = 0.0
-    playback_warned = False
     forced_done = False
 
     try:
@@ -456,55 +454,36 @@ async def run():
             if is_self_voice:
                 continue
 
-            # POST to broker
-            payload = {"session_id": args.session, "text": transcript, "voice_mode": args.voice_mode}
-            if voice_id: payload["voice_id"] = voice_id
-            if context: payload["context"] = context
-            if args.text_only: payload["text_only"] = True
-            if verbose:
-                print(f"[diag] POST {args.broker_url}")
-                print("[diag] payload=", json.dumps(payload, indent=2))
-            try:
-                r = requests.post(args.broker_url, json=payload, timeout=60, headers={"X-Client-Session": args.session})
-                if not r.ok:
-                    rid = r.headers.get("x-amzn-RequestId") or r.headers.get("x-amz-apigw-id") or "?"
-                    print(f"[broker error] HTTP {r.status_code} {r.reason}  request-id={rid}", file=sys.stderr)
-                    h_subset = {k: r.headers.get(k) for k in ["x-amzn-RequestId","x-amz-apigw-id","content-type","date"] if r.headers.get(k)}
-                    if h_subset: print(f"[broker headers] {h_subset}", file=sys.stderr)
-                    try:
-                        errj=r.json(); print("[broker body.json]", json.dumps(errj, indent=2), file=sys.stderr)
-                    except Exception:
-                        bt=(r.text or "").strip()
-                        if bt: print("[broker body.text]", bt[:4000]+("…(truncated)…" if len(bt)>4000 else ""), file=sys.stderr)
-                    continue
-                body=r.json()
-            except requests.RequestException as e:
-                print(f"[broker error] request failed: {getattr(e,'args',[repr(e)])[0]}", file=sys.stderr)
+            async def _barge_monitor():
+                need = int(0.3 * args.rate)
+                while playback_mute.is_set() and not stop.is_set():
+                    if len(analysis_buf) >= need:
+                        arr = np.array([analysis_buf[i] for i in range(len(analysis_buf) - need, len(analysis_buf))], dtype=np.float32)
+                        rms = float(np.sqrt(np.mean(arr * arr)))
+                        if rms >= 0.04:
+                            player.stop(); break
+                    await asyncio.sleep(0.05)
+
+            body = await speak_via_broker(
+                broker_url=args.broker_url,
+                session_id=args.session,
+                text=transcript,
+                voice_id=voice_id,
+                voice_mode=args.voice_mode,
+                player=player,
+                playback_mute=playback_mute,
+                context=context or None,
+                text_only=args.text_only,
+                timeout=60,
+                verbose=verbose,
+                barge_monitor=None if args.text_only else _barge_monitor,
+            )
+
+            if not body:
                 continue
 
-            # TTS playback (abortable / barge-in)
-            ai_text = body.get("text","")
+            ai_text = body.get("text", "")
             print(f"AI:  {ai_text}")
-            audio_b64 = (body.get("audio") or {}).get("audio_base64")
-            if audio_b64:
-                audio_bytes = base64.b64decode(audio_b64)
-                async def _barge_monitor():
-                    need = int(0.3 * args.rate)
-                    while playback_mute.is_set() and not stop.is_set():
-                        if len(analysis_buf) >= need:
-                            arr = np.array([analysis_buf[i] for i in range(len(analysis_buf) - need, len(analysis_buf))], dtype=np.float32)
-                            rms = float(np.sqrt(np.mean(arr * arr)))
-                            if rms >= 0.04:
-                                player.stop(); break
-                        await asyncio.sleep(0.05)
-                bm = asyncio.create_task(_barge_monitor())
-                try:
-                    played = await player.play(audio_bytes)
-                finally:
-                    bm.cancel()
-                if not played and not playback_warned:
-                    print("[hint] Install pydub + ffmpeg/libav for mp3 playback.", file=sys.stderr)
-                    playback_warned=True
 
     finally:
         mic_task.cancel()
