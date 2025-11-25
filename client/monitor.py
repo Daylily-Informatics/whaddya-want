@@ -426,8 +426,6 @@ def run_monitor(
 
                 if ents:
                     now_mono = time.monotonic()
-                    for et, _ in ents:
-                        presence_last_seen[et] = now_mono
                 else:
                     # Clear presence cache after a brief absence so re-entries can trigger.
                     stale = [k for k, v in presence_last_seen.items() if (time.monotonic() - v) >= REENTRY_ABSENCE_SEC]
@@ -470,6 +468,7 @@ def run_monitor(
 
                         pending_names: list[str] = []
                         unknown_people: list[dict] = []
+                        detected_labels: set[str] = set()
 
                         # Identify persons (shared assistant session)
                         if any(e == "person" for e, _ in ents):
@@ -477,17 +476,18 @@ def run_monitor(
                             if faces:
                                 for f in faces:
                                     label = f["name"] or "unknown_person"
-                                    presence_last_seen[label] = now_mono
+                                    detected_labels.add(label)
                                     if f["name"] and _should_announce(label, now_mono=now_mono, absent_ok=absent_ok):
                                         pending_names.append(f["name"])
                                         last_spoken[label] = now_mono
                                     elif not f["name"]:
                                         unknown_people.append(f)
                             elif _should_announce("unknown_person", now_mono=now_mono, absent_ok=absent_ok):
+                                detected_labels.add("unknown_person")
                                 unknown_people.append({"encoding": None})
 
                         if unknown_people:
-                            presence_last_seen["unknown_person"] = now_mono
+                            detected_labels.add("unknown_person")
                             new_unknowns: list[tuple[str, dict]] = []
                             for person in unknown_people:
                                 key = _unknown_key(person)
@@ -548,7 +548,7 @@ def run_monitor(
                                         pending_names.append(nm)
                                         label = nm
                                     last_spoken[label] = now_mono
-                            presence_last_seen[label] = now_mono
+                            detected_labels.add(label)
 
                         if pending_names:
                             greet = "Ahoy " + ", ".join(sorted(set(pending_names)))
@@ -562,6 +562,9 @@ def run_monitor(
                                 player=player,
                                 playback_mute=playback_mute,
                             )
+
+                        for label in detected_labels:
+                            presence_last_seen[label] = now_mono
 
                 prev_qualified = qualified
 
