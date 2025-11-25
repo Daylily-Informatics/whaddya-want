@@ -501,10 +501,13 @@ def run_monitor(
                                 say_via_broker_sync(
                                     broker_url=args.broker_url,
                                     session_id=args.session,
-                                    text="I see someone I don't recognize; what should I call you?",
+                                    text=(
+                                        "The monitor sees someone entering, but I don't recognize them. "
+                                        "Greet them in Marvin's voice, ask who they are, and request a name."
+                                    ),
                                     voice_id=args.voice,
                                     voice_mode=args.voice_mode,
-                                    context={"intro_already_sent": True},
+                                    context={"intro_already_sent": True, "monitor_event": "entry_unknown_person"},
                                     player=player,
                                     playback_mute=playback_mute,
                                 )
@@ -531,14 +534,17 @@ def run_monitor(
                                     last_spoken[label] = now_mono
                             else:
                                 if _should_announce(label, now_mono=now_mono, absent_ok=absent_ok):
-                                    prompt = f"I see a {et} I don't know yet. What should I call you?"
+                                    prompt = (
+                                        f"The monitor spotted a {et} entering and doesn't recognize them. "
+                                        "Greet them as Marvin and ask what name to use."
+                                    )
                                     say_via_broker_sync(
                                         broker_url=args.broker_url,
                                         session_id=args.session,
                                         text=prompt,
                                         voice_id=args.voice,
                                         voice_mode=args.voice_mode,
-                                        context={"intro_already_sent": True},
+                                        context={"intro_already_sent": True, "monitor_event": "entry_unknown_animal"},
                                         player=player,
                                         playback_mute=playback_mute,
                                     )
@@ -551,14 +557,17 @@ def run_monitor(
                             detected_labels.add(label)
 
                         if pending_names:
-                            greet = "Ahoy " + ", ".join(sorted(set(pending_names)))
+                            arrivals = ", ".join(sorted(set(pending_names)))
                             say_via_broker_sync(
                                 broker_url=args.broker_url,
                                 session_id=args.session,
-                                text=greet,
+                                text=(
+                                    f"The monitor sees {arrivals} entering. Greet them as Marvin, say their name, "
+                                    "and welcome them."
+                                ),
                                 voice_id=args.voice,
                                 voice_mode=args.voice_mode,
-                                context={"intro_already_sent": True},
+                                context={"intro_already_sent": True, "monitor_event": "entry_known"},
                                 player=player,
                                 playback_mute=playback_mute,
                             )
