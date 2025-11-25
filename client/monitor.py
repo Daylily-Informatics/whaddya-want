@@ -297,6 +297,10 @@ def run_monitor(
     window_title = "Marvin Monitor (press q to quit)"
     display_enabled = True
     try:
+        if threading.current_thread() is not threading.main_thread():
+            # Allow OpenCV windows to function even when the monitor is launched
+            # from a background thread (common when invoked from the CLI client).
+            cv2.startWindowThread()
         cv2.namedWindow(window_title, cv2.WINDOW_NORMAL)
     except cv2.error:
         display_enabled = False
