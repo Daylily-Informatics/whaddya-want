@@ -116,7 +116,7 @@ async def stream_microphone(*, region: str, language_code="en-US", sample_rate=1
         recv_task.cancel()
 
 # ---- Helpers / commands ----
-_ENROLL_RE = re.compile(
+_REGISTER_RE = re.compile(
     r"""(?xi)
     \b(?:register|enrol+|in\s*rol+|and\s*rol+|role)\s+(?:my\s+voice|me)\s*
       (?:as\s+)?(?:(?:i'?m|i\s+am|this\s+is|says)\s+)?([A-Za-z][\w\s'\-]{0,31})\b
@@ -149,8 +149,8 @@ _NUM_WORDS = {
     "ten": 10,
 }
 
-def parse_enrollment(text: str) -> Optional[str]:
-    m = _ENROLL_RE.search(text)
+def parse_registration(text: str) -> Optional[str]:
+    m = _REGISTER_RE.search(text)
     if not m:
         return None
     name = (m.group(1) or m.group(2) or "").strip()
@@ -312,6 +312,12 @@ async def run():
     ap.add_argument("--channels", type=int, default=1)
     ap.add_argument("--id-threshold", type=float, default=0.65)
     ap.add_argument("--id-window", type=float, default=2.0)
+    ap.add_argument(
+        "--auto-register-name",
+        type=str,
+        default=None,
+        help="If set, automatically register an unknown speaker with this name.",
+    )
     ap.add_argument("--force-enroll", default=None)
     ap.add_argument("--voice", default=os.getenv("POLLY_VOICE"))
     ap.add_argument("--voice-mode", choices=["standard","neural","generative"], default="standard")
@@ -391,14 +397,40 @@ async def run():
 
     analysis_buf = deque(maxlen=int(args.rate * 6))
     spk_embed = SpeakerEmbed()
+    auto_register_name = (args.auto_register_name or args.force_enroll or "").strip()
     help_lines = [
         "Say 'hey Marvin' or 'ok Marvin' to enable command mode for 8 seconds.",
         "While command mode is active, say 'exit' to stop the client.",
         "While command mode is active, say 'switch/change/set/use/select' the camera, microphone, or speaker to a device number.",
         "Say 'marvin monitor' to launch the monitor window.",
-        "Say 'register/enroll my voice as <name>' or 'call me <name>' to save a voice profile.",
+        "Say 'register my voice as <name>' or 'call me <name>' to save a voice profile.",
         "Say 'marvin help' to hear this list again.",
     ]
+
+    intro_text = (
+        "Hello, I'm Marvin. Say 'marvin help' any time to hear the available commands."
+    )
+    if not spk_embed.enabled:
+        print(
+            "[identity] Speaker embedding model unavailable; voice identification and auto-registration are disabled.",
+            file=sys.stderr,
+        )
+
+    print(f"AI:  {intro_text}")
+    await speak_via_broker(
+        broker_url=args.broker_url,
+        session_id=args.session,
+        text=intro_text,
+        voice_id=voice_id,
+        voice_mode=args.voice_mode,
+        player=player,
+        playback_mute=playback_mute,
+        context=None,
+        text_only=args.text_only,
+        timeout=30,
+        verbose=verbose,
+        barge_monitor=None,
+    )
 
     async def _switch_microphone(new_idx: int) -> bool:
         nonlocal mic, mic_task, mic_idx
@@ -483,6 +515,7 @@ async def run():
     reset_requested = False
     cmd_window_until = 0.0
     forced_done = False
+    auto_registered_name: str | None = None
 
     try:
         while not stop.is_set():
@@ -586,7 +619,7 @@ async def run():
                 continue
 
             # enrollment via phrase
-            name = parse_enrollment(transcript)
+            name = parse_registration(transcript)
             if name:
                 wav = take_latest_seconds(analysis_buf, args.id_window, args.rate)
                 if wav is not None:
@@ -600,15 +633,27 @@ async def run():
             context: Dict[str, Any] = {}
             is_self_voice = False
             if wav_id is not None:
-                vec = spk_embed.embed(wav_id)
-                if vec is not None:
-                    who = identity.identify_voice(vec, threshold=args.id_threshold)
-                    if who:
-                        if self_voice and who.strip().lower() == self_voice:
-                            print(f"[voice] Ignoring self voice signature ({who}).")
-                            is_self_voice = True
-                        else:
-                            context["speaker_id"] = who
+                if not spk_embed.enabled:
+                    vprint("[identity] Speaker embedding disabled; skipping voice matching.")
+                else:
+                    vec = spk_embed.embed(wav_id)
+                    if vec is None:
+                        vprint("[identity] Unable to embed current voice sample.")
+                    else:
+                        who = identity.identify_voice(vec, threshold=args.id_threshold)
+                        if who:
+                            if self_voice and who.strip().lower() == self_voice:
+                                print(f"[voice] Ignoring self voice signature ({who}).")
+                                is_self_voice = True
+                            else:
+                                context["speaker_id"] = who
+                                print(f"[identity] Recognized speaker: {who}")
+                        elif auto_registered_name is None:
+                            new_name = auto_register_name or f"Guest-{args.session[:8]}"
+                            identity.enroll_voice(new_name, vec)
+                            auto_registered_name = new_name
+                            context["speaker_id"] = new_name
+                            print(f"[identity] Auto-registered voice as {new_name}.")
 
             if is_self_voice:
                 continue

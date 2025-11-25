@@ -32,7 +32,14 @@ class ConversationBroker:
     def handle(self, session_id: str, user_text: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
         history = self._memory.fetch_history(session_id=session_id, limit=self._config.history_limit)
         messages = [
-            {"role": "system", "content": "You are a helpful, proactive AI companion."},
+            {
+                "role": "system",
+                "content": (
+                    "You are Marvin, a proactive AI companion with a calm, encouraging tone. "
+                    "Always introduce yourself as Marvin, keep replies concise, and stay helpful "
+                    "and attentive to the user's needs."
+                ),
+            },
             *({"role": turn.role, "content": turn.content} for turn in history),
             {"role": "user", "content": user_text},
         ]
