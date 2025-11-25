@@ -551,9 +551,6 @@ async def run() -> bool:
         "Say 'marvin help' to hear this list again.",
     ]
 
-    intro_text = (
-        "Hello, I'm Marvin. Say 'marvin help' any time to hear the available commands."
-    )
     intro_sent = False
     if not spk_embed.enabled:
         print(
@@ -617,22 +614,6 @@ async def run() -> bool:
         monitor_engine = None
         monitor_task = None
 
-    print(f"AI:  {intro_text}")
-    await speak_via_broker(
-        broker_url=args.broker_url,
-        session_id=args.session,
-        text=intro_text,
-        voice_id=voice_id,
-        voice_mode=args.voice_mode,
-        player=player,
-        playback_mute=playback_mute,
-        context=None,
-        text_only=args.text_only,
-        timeout=30,
-        verbose=verbose,
-        barge_monitor=None,
-    )
-    intro_sent = True
     if args.auto_start_monitor:
         await _start_monitor()
 
