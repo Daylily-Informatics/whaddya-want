@@ -19,7 +19,7 @@ TABLE: Optional[str] = os.environ.get("CONVERSATION_TABLE")  # only used if USE_
 # ----- Clients -----
 _cfg = Config(retries={"max_attempts": 3, "mode": "standard"})
 polly = boto3.client("polly", region_name=REGION, config=_cfg)
-brt   = boto3.client("bedrock-runtime", region_name=REGION, config=_cfg)
+brt = boto3.client("bedrock-runtime", region_name=REGION, config=_cfg)
 
 dynamodb = boto3.resource("dynamodb", region_name=REGION) if USE_MEMORY and TABLE else None
 mem_table = dynamodb.Table(TABLE) if dynamodb else None
@@ -32,8 +32,15 @@ def _base_headers(extra: Dict[str, str] | None = None) -> Dict[str, str]:
         h.update({k: v for k, v in extra.items() if v})
     return h
 
+
 def _ok(body: Dict[str, Any], *, headers: Dict[str, str] | None = None) -> Dict[str, Any]:
-    return {"statusCode": 200, "headers": _base_headers(headers), "isBase64Encoded": False, "body": json.dumps(body)}
+    return {
+        "statusCode": 200,
+        "headers": _base_headers(headers),
+        "isBase64Encoded": False,
+        "body": json.dumps(body),
+    }
+
 
 def _bad_request(msg: str, *, headers: Dict[str, str] | None = None) -> Dict[str, Any]:
     return {
@@ -42,6 +49,7 @@ def _bad_request(msg: str, *, headers: Dict[str, str] | None = None) -> Dict[str
         "isBase64Encoded": False,
         "body": json.dumps({"error": "bad_request", "message": msg}),
     }
+
 
 def _server_error(exc: Exception, *, headers: Dict[str, str] | None, request_id: str, code: int = 500) -> Dict[str, Any]:
     tb_lines = traceback.format_exc().strip().splitlines()
@@ -65,11 +73,18 @@ def _get_memory(session_id: str) -> List[Dict[str, str]]:
     item = mem_table.get_item(Key={"session_id": session_id}).get("Item")
     return item.get("turns", []) if item else []
 
+
 def _put_memory(session_id: str, turns: List[Dict[str, str]]) -> None:
     if not mem_table:
         return
     turns = turns[-HISTORY_LIMIT:]
-    mem_table.put_item(Item={"session_id": session_id, "turns": turns, "ttl": int(time.time()) + 7 * 24 * 3600})
+    mem_table.put_item(
+        Item={
+            "session_id": session_id,
+            "turns": turns,
+            "ttl": int(time.time()) + 7 * 24 * 3600,
+        }
+    )
 
 
 # ----- Prompting -----
@@ -88,10 +103,10 @@ def _system_prompt(speaker: Optional[str], acoustic_event: Optional[str]) -> str
         "",
         "Command API:",
         "- At the very end of every reply, output a line of the form:",
-        "  COMMAND: {\"name\": \"...\", \"args\": {...}}",
+        '  COMMAND: {"name": "...", "args": {...}}',
         "- Valid command names: 'launch_monitor', 'set_device', 'noop'.",
         "- 'noop' means no local action is needed.",
-        "- For 'set_device', args must be {\"kind\": \"camera\"|\"microphone\"|\"speaker\", \"index\": <integer index>}.",
+        '- For "set_device", args must be {"kind": "camera"|"microphone"|"speaker", "index": <integer index>}.',
         "- If no action is needed, set name to 'noop'.",
         "Behavioral rules:",
         "- Answer concisely first, then add a short sardonic aside if appropriate.",
@@ -112,6 +127,29 @@ def _system_prompt(speaker: Optional[str], acoustic_event: Optional[str]) -> str
         lines.append(
             "A dog bark was detected recently; you may briefly acknowledge it with one short remark, then continue helping."
         )
+
+    # Monitor / vision events: MONITOR_EVENT-protocol
+    lines.extend(
+        [
+            "",
+            "Monitor events:",
+            "- Sometimes the 'user' text will actually be a camera/monitor event instead of normal conversation.",
+            "- These events always start with 'MONITOR_EVENT:' on the first line.",
+            "- Example shape:",
+            '  MONITOR_EVENT: entry',
+            '  HUMANS: known=["Major"] unknown_count=1',
+            '  ANIMALS: known=["Chester"] unknown_species=["dog"]',
+            "  TASK: Greet the known humans by name and briefly ask unknown humans what you should call them. Do NOT re-introduce yourself.",
+            "- For monitor events:",
+            "  * Treat the event as coming from your sensors, not from a person talking to you.",
+            "  * Greet any known humans by name.",
+            "  * Optionally acknowledge known animals in one short phrase.",
+            "  * If there are unknown humans, politely ask what you should call them.",
+            "  * Use one or two short spoken sentences total.",
+            "  * Do NOT re-introduce yourself on monitor events.",
+        ]
+    )
+
     return "\n".join(lines)
 
 
@@ -156,7 +194,7 @@ def _tts(text: str, voice_id: Optional[str] = None) -> Dict[str, Any]:
 # ----- LLM calls -----
 def _call_titan_text_express(system: str, history: List[Dict[str, str]], user_text: str) -> str:
     # Titan doesn't have a separate system channel. Embed it into plain text.
-    parts = []
+    parts: List[str] = []
     if system:
         parts.append(f"System:\n{system}\n")
     for t in history:
@@ -179,7 +217,7 @@ def _call_titan_text_express(system: str, history: List[Dict[str, str]], user_te
     }
 
     resp = brt.invoke_model(
-        modelId="amazon.titan-text-express-v1",  # lock to Titan schema here
+        modelId="amazon.titan-text-express-v1",
         contentType="application/json",
         accept="application/json",
         body=json.dumps(payload),
@@ -193,6 +231,7 @@ def _call_titan_text_express(system: str, history: List[Dict[str, str]], user_te
 
 def _call_converse(model_id: str, system: str, history: List[Dict[str, str]], user_text: str) -> str:
     """Model-agnostic Bedrock Converse call; retry without system if unsupported."""
+
     def _msgs():
         msgs: List[Dict[str, Any]] = []
         for t in history:
@@ -223,6 +262,7 @@ def _call_converse(model_id: str, system: str, history: List[Dict[str, str]], us
             out = brt.converse(**kwargs)
             return out["output"]["message"]["content"][0]["text"]
         raise
+
 
 def _call_llm(model_id: str, system: str, history: List[Dict[str, str]], user_text: str) -> str:
     if model_id.startswith("amazon.titan-text-express"):
@@ -281,23 +321,23 @@ def handler(event, context):
 
     # Validate inputs early → clear 4xx instead of mystery 500s
     session_id = (body.get("session_id") or "").strip()
-    text       = (body.get("text") or "").strip()
+    text = (body.get("text") or "").strip()
     if not session_id:
         return _bad_request("missing or invalid 'session_id'", headers=out_hdr)
     if not text:
         return _bad_request("missing or invalid 'text'", headers=out_hdr)
 
     context_in = body.get("context") or {}
-    speaker    = context_in.get("speaker_id")
-    acoustic   = context_in.get("acoustic_event")
+    speaker = context_in.get("speaker_id")
+    acoustic = context_in.get("acoustic_event")
 
-    voice_id   = body.get("voice_id")
+    voice_id = body.get("voice_id")
     if isinstance(voice_id, str):
         voice_id = voice_id.strip() or None
     else:
         voice_id = None
 
-    text_only  = _is_truthy(body.get("text_only"))
+    text_only = _is_truthy(body.get("text_only"))
 
     # Identity fast-path
     if speaker and re.search(r"\b(who am i|what'?s my name|who'?s speaking)\b", text.lower()):
@@ -313,7 +353,7 @@ def handler(event, context):
     # Short memory (optional)
     try:
         history: List[Dict[str, str]] = _get_memory(session_id) if USE_MEMORY else []
-    except Exception as exc:
+    except Exception:
         # Memory failures should not 500 the whole request
         history = []
 
