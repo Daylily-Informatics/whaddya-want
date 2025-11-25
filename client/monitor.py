@@ -32,9 +32,16 @@ SPECIES_LABEL = {COCO_PERSON: "person", COCO_CAT: "cat", COCO_DOG: "dog", COCO_H
 DETECT_CLASSES = [COCO_PERSON, COCO_CAT, COCO_DOG, COCO_HORSE]
 
 REENTRY_ABSENCE_SEC = 2.0
+FRAME_BUFFER_SIZE = 5  # how many recent frames to keep for picking the sharpest for ID
 
-# ---------- Animal signature (HSV+LBP) ----------
-def _lbp_hist(gray: np.ndarray) -> np.ndarray:
+
+def compute_animal_signature(bgr_roi: np.ndarray) -> np.ndarray:
+    if bgr_roi.size == 0:
+        return np.zeros(768, np.float32)
+    hsv = cv2.cvtColor(bgr_roi, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1, 2], None, [8, 8, 8], [0, 180, 0, 256, 0, 256]).astype(np.float32).ravel()
+    hist /= (np.linalg.norm(hist) + 1e-9)
+    gray = cv2.cvtColor(bgr_roi, cv2.COLOR_BGR2GRAY)
     g = gray.astype(np.int16)
     c = g[1:-1, 1:-1]
     codes = (
@@ -47,22 +54,16 @@ def _lbp_hist(gray: np.ndarray) -> np.ndarray:
         | ((g[1:-1, 0:-2] >= c) << 6)
         | ((g[0:-2, 0:-2] >= c) << 7)
     )
-    h = np.bincount(codes.ravel(), minlength=256).astype(np.float32)
-    h /= (h.sum() + 1e-9)
-    return h
-
-
-def compute_animal_signature(bgr_roi: np.ndarray) -> np.ndarray:
-    if bgr_roi.size == 0:
-        return np.zeros(768, np.float32)
-    hsv = cv2.cvtColor(bgr_roi, cv2.COLOR_BGR2HSV)
-    hist = cv2.calcHist([hsv], [0, 1, 2], None, [8, 8, 8], [0, 180, 0, 256, 0, 256]).astype(np.float32).ravel()
-    hist /= (np.linalg.norm(hist) + 1e-9)
-    gray = cv2.cvtColor(bgr_roi, cv2.COLOR_BGR2GRAY)
-    lbp = _lbp_hist(gray)
-    sig = np.concatenate([hist, lbp]).astype(np.float32)
+    lbp_hist = np.bincount(codes.ravel(), minlength=256).astype(np.float32)
+    lbp_hist /= (lbp_hist.sum() + 1e-9)
+    sig = np.concatenate([hist, lbp_hist]).astype(np.float32)
     sig /= (np.linalg.norm(sig) + 1e-9)
     return sig
+
+
+def compute_sharpness(bgr: np.ndarray) -> float:
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    return cv2.Laplacian(gray, cv2.CV_64F).var()
 
 
 # ---------- Faces ----------
@@ -401,11 +402,8 @@ def run_monitor(
     window_title = "Marvin Monitor (press q to quit)"
     display_enabled = True
     try:
-        # On Linux/X11, startWindowThread can make background-thread windows usable.
-        # On macOS (Cocoa) it’s flaky and can throw opaque C++ exceptions.
         if (threading.current_thread() is not threading.main_thread()) and sys.platform.startswith("linux"):
             cv2.startWindowThread()
-
         cv2.namedWindow(window_title, cv2.WINDOW_NORMAL)
     except cv2.error as e:
         display_enabled = False
@@ -425,6 +423,11 @@ def run_monitor(
     presence_last_seen: dict[str, float] = {}
     last_spoken: dict[str, float] = {}
     unknown_prompted: set[str] = set()
+
+    # buffer of recent frames for picking cleanest (sharpest) ID shot
+    frame_buffer: list[dict[str, object]] = []
+    # labels to overlay on bounding boxes: type -> "Major" / "unknown" / "Chester"
+    display_id_labels: dict[str, str] = {}
 
     def _should_announce(label: str, *, now_mono: float, absent_ok: bool) -> bool:
         """Gate announcements so we only speak on meaningful arrivals."""
@@ -491,9 +494,9 @@ def run_monitor(
                 print("[monitor] frame grab failed")
                 break
 
-            # HUD ROI
             H, W = frame.shape[:2]
             rx1, ry1, rx2, ry2 = roi
+            # HUD ROI
             cv2.rectangle(
                 frame,
                 (int(rx1 * W), int(ry1 * H)),
@@ -502,7 +505,9 @@ def run_monitor(
                 1,
             )
 
+            ents = []
             if not state["paused"]:
+                # Run detector
                 results = model.predict(
                     source=frame,
                     verbose=False,
@@ -518,12 +523,36 @@ def run_monitor(
                     args.min_area_frac,
                 )
 
+                # Update frame buffer for ID (use pre-overlay frame copy)
+                sharpness = compute_sharpness(frame)
+                frame_buffer.append({"frame": frame.copy(), "sharpness": sharpness, "ents": ents})
+                if len(frame_buffer) > FRAME_BUFFER_SIZE:
+                    frame_buffer.pop(0)
+
+                # Draw boxes with identity labels (if known)
                 for et, (x1, y1, x2, y2) in ents:
-                    color = (0, 255, 0) if et == "person" else (255, 165, 0) if et in {"dog", "cat"} else (255, 0, 255)
+                    if et == "person":
+                        color = (0, 255, 0)
+                    elif et in {"dog", "cat"}:
+                        color = (255, 165, 0)
+                    else:
+                        color = (255, 0, 255)
+
                     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+                    label_suffix = display_id_labels.get(et)
+                    if label_suffix:
+                        label_text = f"{et}: {label_suffix}"
+                    else:
+                        # default to explicit unknown for tracked entity types
+                        if et in {"person", "dog", "cat", "donkey"}:
+                            label_text = f"{et}: unknown"
+                        else:
+                            label_text = et
+
                     cv2.putText(
                         frame,
-                        et,
+                        label_text,
                         (x1, max(20, y1 - 8)),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.6,
@@ -531,6 +560,7 @@ def run_monitor(
                         2,
                     )
 
+                # Presence / entry gating
                 if ents:
                     present_frames += 1
                 else:
@@ -552,9 +582,9 @@ def run_monitor(
                     ]
                     for k in stale:
                         presence_last_seen.pop(k, None)
+                    now_mono = time.monotonic()
 
                 if qualified and not prev_qualified:
-                    # DEBUG: did we ever actually fire an entry event?
                     print(
                         "                    [monitor] ENTRY EVENT fired; ents =",
                         ents,
@@ -564,7 +594,6 @@ def run_monitor(
                     )
 
                     now_ts = time.time()
-                    now_mono = time.monotonic()
                     print(
                         "                    [monitor] ",
                         now_ts - last_entry_ts,
@@ -581,39 +610,53 @@ def run_monitor(
                     if (now_ts - last_entry_ts) >= args.entry_cooldown_s and (not had_any or absent_ok):
                         last_entry_ts = now_ts
                         had_any = True
-                        # snapshot
+
+                        # Choose the sharpest recent frame that contains a person if possible
+                        id_frame_info = None
+                        for item in frame_buffer:
+                            item_ents = item.get("ents") or []
+                            if any(e == "person" for e, _ in item_ents):
+                                if id_frame_info is None or item["sharpness"] > id_frame_info["sharpness"]:
+                                    id_frame_info = item
+                        if id_frame_info is None:
+                            id_frame_info = frame_buffer[-1] if frame_buffer else {
+                                "frame": frame.copy(),
+                                "sharpness": sharpness,
+                                "ents": ents,
+                            }
+
+                        id_frame = id_frame_info["frame"]  # type: ignore[index]
+                        id_ents = id_frame_info.get("ents") or ents  # type: ignore[assignment]
+                        H_id, W_id = id_frame.shape[:2]
+
+                        # snapshot for debugging / inspection
                         try:
                             cv2.imwrite(
                                 str(IMAGES_DIR / f"entry_{time.strftime('%Y%m%d_%H%M%S')}.jpg"),
-                                frame,
+                                id_frame,
                             )
                         except Exception:
                             pass
 
                         known_humans: list[str] = []
                         unknown_people: list[dict] = []
-                        known_animals: list[str] = []
-                        unknown_animals: list[str] = []
+                        known_animals_by_type: dict[str, list[str]] = {}
+                        unknown_animals_by_type: dict[str, int] = {}
                         detected_labels: set[str] = set()
-
                         needs_human_name_capture = False
                         human_unknown_target: dict | None = None
                         animal_name_capture_targets: list[tuple[str, np.ndarray]] = []
 
-                        # Identify persons (shared assistant session)
-                        if any(e == "person" for e, _ in ents):
-                            faces = analyze_faces(frame)
+                        # Identify persons (shared assistant session) using best (sharpest) frame
+                        if any(e == "person" for e, _ in id_ents):
+                            faces = analyze_faces(id_frame)
                             if faces:
                                 for f in faces:
                                     label = f["name"] or "unknown_person"
                                     detected_labels.add(label)
                                     if f["name"]:
                                         known_humans.append(f["name"])
-                                        if _should_announce(
-                                            label,
-                                            now_mono=now_mono,
-                                            absent_ok=absent_ok,
-                                        ):
+                                        if _should_announce(label, now_mono=now_mono, absent_ok=absent_ok):
                                             last_spoken[label] = now_mono
                                     else:
                                         unknown_people.append(f)
@@ -622,7 +665,6 @@ def run_monitor(
                                 unknown_people.append({"encoding": None})
 
                         if unknown_people:
-                            detected_labels.add("unknown_person")
                             new_unknowns: list[tuple[str, dict]] = []
                             for person in unknown_people:
                                 key = _unknown_key(person)
@@ -640,21 +682,21 @@ def run_monitor(
                                 needs_human_name_capture = True
                                 human_unknown_target = first_unknown
 
-                        # Animals
-                        for et, (x1, y1, x2, y2) in ents:
+                        # Animals from best frame
+                        for et, (x1, y1, x2, y2) in id_ents:
                             if et == "person":
                                 continue
-                            roi_img = frame[max(0, y1) : min(H, y2), max(0, x1) : min(W, x2)]
+                            roi_img = id_frame[max(0, y1):min(H_id, y2), max(0, x1):min(W_id, x2)]
                             sig = compute_animal_signature(roi_img)
                             label = f"unknown_{et}"
                             who = identity.identify_animal(et, sig, max_dist=args.animal_match_thresh)
                             if who:
                                 label = who
-                                known_animals.append(who)
+                                known_animals_by_type.setdefault(et, []).append(who)
                                 if _should_announce(label, now_mono=now_mono, absent_ok=absent_ok):
                                     last_spoken[label] = now_mono
                             else:
-                                unknown_animals.append(et)
+                                unknown_animals_by_type[et] = unknown_animals_by_type.get(et, 0) + 1
                                 if _should_announce(label, now_mono=now_mono, absent_ok=absent_ok):
                                     animal_name_capture_targets.append((et, sig))
                                     last_spoken[label] = now_mono
@@ -674,16 +716,22 @@ def run_monitor(
                             humans_parts.append("none")
 
                         animals_parts: list[str] = []
-                        if known_animals:
+                        all_known_animals: list[str] = []
+                        for _, names in known_animals_by_type.items():
+                            all_known_animals.extend(names)
+                        if all_known_animals:
                             animals_parts.append(
                                 "known=["
-                                + ", ".join(sorted(repr(a) for a in set(known_animals)))
+                                + ", ".join(sorted(repr(a) for a in set(all_known_animals)))
                                 + "]"
                             )
-                        if unknown_animals:
+                        all_unknown_species: list[str] = []
+                        for et, count in unknown_animals_by_type.items():
+                            all_unknown_species.extend([et] * count)
+                        if all_unknown_species:
                             animals_parts.append(
                                 "unknown_species=["
-                                + ", ".join(sorted(repr(a) for a in set(unknown_animals)))
+                                + ", ".join(sorted(repr(a) for a in set(all_unknown_species)))
                                 + "]"
                             )
                         if not animals_parts:
@@ -696,7 +744,7 @@ def run_monitor(
                             task_bits.append(
                                 "Ask the unknown human(s), briefly and politely, what you should call them."
                             )
-                        if known_animals or unknown_animals:
+                        if all_known_animals or all_unknown_species:
                             task_bits.append(
                                 "Optionally acknowledge animals in one short remark, then focus back on helping humans."
                             )
@@ -737,14 +785,28 @@ def run_monitor(
                             nm = listen_for_name(mic_idx, timeout_s=7.0)
                             if nm:
                                 identity.enroll_animal(nm, et, sig)
-                                known_animals.append(nm)
+                                known_animals_by_type.setdefault(et, []).append(nm)
                                 presence_last_seen[nm] = now_mono
 
                         for label in detected_labels:
                             presence_last_seen[label] = now_mono
 
+                        # Update display labels for overlay: type -> identity/unknown
+                        display_id_labels.clear()
+                        if known_humans:
+                            display_id_labels["person"] = ", ".join(sorted(set(known_humans)))
+                        elif unknown_people:
+                            display_id_labels["person"] = "unknown"
+
+                        for et, names in known_animals_by_type.items():
+                            display_id_labels[et] = ", ".join(sorted(set(names)))
+                        for et, _ in unknown_animals_by_type.items():
+                            if et not in display_id_labels:
+                                display_id_labels[et] = "unknown"
+
                 prev_qualified = qualified
 
+            # Show frame
             if display_enabled:
                 try:
                     cv2.imshow(window_title, frame)
