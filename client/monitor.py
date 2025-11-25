@@ -277,6 +277,14 @@ def run_monitor(args, stop_event: threading.Event | None = None):
     if not cap.isOpened(): raise RuntimeError(f"Cannot open camera index {cam_idx}")
     print("[monitor] ready — press 'q' to quit.")
 
+    window_title = "Marvin Monitor (press q to quit)"
+    display_enabled = True
+    try:
+        cv2.namedWindow(window_title, cv2.WINDOW_NORMAL)
+    except cv2.error:
+        display_enabled = False
+        print("[monitor] GUI display unavailable; running headless (no preview window).", file=sys.stderr)
+
     roi = _parse_roi(args.roi)
     present_frames=0
     prev_qualified=False
@@ -465,16 +473,25 @@ def run_monitor(args, stop_event: threading.Event | None = None):
 
                 prev_qualified = qualified
 
-            cv2.imshow("Marvin Monitor (press q to quit)", frame)
-            if (cv2.waitKey(1) & 0xff)==ord('q'):
-                break
+            if display_enabled:
+                try:
+                    cv2.imshow(window_title, frame)
+                    if (cv2.waitKey(1) & 0xff)==ord('q'):
+                        break
+                except cv2.error:
+                    display_enabled = False
+                    print(
+                        "[monitor] GUI display disabled after OpenCV error; continuing headless.",
+                        file=sys.stderr,
+                    )
 
     finally:
         stop_signal.set()
         try: cap.release()
         except Exception: pass
-        try: cv2.destroyAllWindows()
-        except Exception: pass
+        if display_enabled:
+            try: cv2.destroyAllWindows()
+            except Exception: pass
         try: sd.stop()
         except Exception: pass
 
