@@ -219,22 +219,73 @@ class MonitorEngine:
             cv2.destroyWindow(self.window_title)
         except Exception:
             pass
-
+    
     def enroll_pending_face(self, name: str) -> bool:
         """
-        Enroll the most recent unknown face under the given name.
-        Called by the CLI when it successfully parses 'call me <name>' etc.
+        Enroll a face for `name`.
+
+        Strategy:
+        - If we previously captured an unknown face embedding at an entry event
+          (pending_face_enc), use that.
+        - Otherwise, grab the sharpest recent frame with a person, run
+          face_recognition on it, and enroll the first face we see.
         """
-        if self.pending_face_enc is None:
-            print("[monitor] enroll_pending_face: no pending face.")
-            return False
-        try:
-            identity.enroll_face(name, self.pending_face_enc)
-            print(f"[monitor] enrolled pending face as {name}")
-        finally:
+        enc: Optional[np.ndarray] = None
+
+        # 1) Use pending embedding from entry event if we have one
+        if self.pending_face_enc is not None:
+            enc = self.pending_face_enc
+            print("[monitor] enroll_pending_face: using pending face embedding.")
             self.pending_face_enc = None
+        else:
+            print("[monitor] enroll_pending_face: no pending face, trying current frame buffer.")
+            # 2) Fallback: choose the sharpest recent frame with a person and extract a face
+            if not _FACE_OK:
+                print("[monitor] enroll_pending_face: face_recognition not available.")
+                return False
+
+            id_frame_info: Optional[Dict[str, Any]] = None
+            for item in self.frame_buffer:
+                item_ents = item.get("ents") or []
+                if any(e == "person" for e, _ in item_ents):
+                    if id_frame_info is None or item["sharpness"] > id_frame_info["sharpness"]:
+                        id_frame_info = item
+
+            if id_frame_info is None:
+                print("[monitor] enroll_pending_face: no recent frame with a person.")
+                return False
+
+            frame = id_frame_info.get("frame")
+            if frame is None:
+                print("[monitor] enroll_pending_face: best frame has no image data.")
+                return False
+
+            faces = analyze_faces(frame)
+            if not faces:
+                print("[monitor] enroll_pending_face: no faces found in best frame.")
+                return False
+
+            # Prefer an unknown face if any; otherwise just take the first
+            chosen = None
+            for f in faces:
+                if not f.get("name"):
+                    chosen = f
+                    break
+            if chosen is None:
+                chosen = faces[0]
+
+            enc = np.asarray(chosen.get("encoding"), dtype=np.float32)
+            print("[monitor] enroll_pending_face: using fresh face encoding from current frame.")
+
+        if enc is None:
+            print("[monitor] enroll_pending_face: no usable encoding.")
+            return False
+
+        identity.enroll_face(name, enc)
+        print(f"[monitor] enrolled face as {name}")
         return True
 
+   
     def identify_current_face_name(self) -> Optional[str]:
         """
         Try to identify the most prominent face in the recent frames.
