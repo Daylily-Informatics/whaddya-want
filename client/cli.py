@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, asyncio, contextlib, io, json, os, queue, re, signal, sys, traceback, threading, uuid, warnings
+import argparse, asyncio, contextlib, io, json, os, queue, re, signal, subprocess, sys, traceback, threading, uuid, warnings
 from collections import deque
 from dataclasses import replace
 from pathlib import Path
@@ -777,13 +777,11 @@ async def run() -> bool:
 
     threading.Thread(target=_stdin_watcher, daemon=True).start()
 
-    # Mic stream
     _start_microphone(mic_idx)
     reset_requested = False
     cmd_window_until = 0.0
     auto_registered_name: Optional[str] = None
 
-    # Echo suppression state
     last_ai_text_norm: Optional[str] = None
     last_ai_time: float = 0.0
 
@@ -920,6 +918,7 @@ async def run() -> bool:
                     await _switch_speaker(idx)
                 continue
 
+            # Name registration: voice AND pending face (if any)
             name = parse_registration(transcript)
             if name:
                 wav = take_latest_seconds(
@@ -930,6 +929,9 @@ async def run() -> bool:
                     if vec is not None:
                         identity.enroll_voice(name, vec)
                         print(f"[enrolled voice] {name}")
+                if monitor_engine is not None:
+                    if monitor_engine.enroll_pending_face(name):
+                        print(f"[enrolled face] {name}")
 
             wav_id = take_latest_seconds(analysis_buf, args.id_window, args.rate)
             context: Dict[str, Any] = {"intro_already_sent": intro_sent}
