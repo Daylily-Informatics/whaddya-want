@@ -17,10 +17,7 @@ from vosk import Model, KaldiRecognizer
 import requests
 
 from client import identity
-from client.shared_audio import AudioPlayer
-
-from client.shared_audio import _audio_loop  # import the global loop
-from client.shared_audio import AudioPlayer, _audio_loop, say_via_broker_sync
+from client.shared_audio import AudioPlayer, say_via_broker_sync
 
 # Paths & state
 STATE_DIR = Path(os.path.expanduser("~/.whaddya"))
