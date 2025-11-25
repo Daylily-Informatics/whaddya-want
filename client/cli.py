@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, asyncio, contextlib, io, json, os, queue, re, signal, subprocess, sys, traceback, threading, uuid, warnings
+import argparse, asyncio, contextlib, io, json, os, queue, re, signal, subprocess, sys, traceback, threading, uuid, warnings, multiprocessing
 from collections import deque
 from pathlib import Path
 from typing import AsyncGenerator, Optional, Tuple, Dict, Any
@@ -459,8 +459,8 @@ async def run() -> bool:
             file=sys.stderr,
         )
 
-    monitor_thread: threading.Thread | None = None
-    monitor_stop: threading.Event | None = None
+    monitor_thread: threading.Thread | multiprocessing.Process | None = None
+    monitor_stop: threading.Event | multiprocessing.Event | None = None
     mic: AsyncGenerator[str, None] | None = None
     mic_task: asyncio.Task[str] | None = None
 
@@ -471,30 +471,34 @@ async def run() -> bool:
         if monitor_stop is not None:
             monitor_stop.set()
         monitor_thread.join(timeout=5)
+        if isinstance(monitor_thread, multiprocessing.Process) and monitor_thread.is_alive():
+            monitor_thread.terminate()
         monitor_thread = None
         monitor_stop = None
 
     def _launch_monitor():
         nonlocal monitor_thread, monitor_stop
         _stop_monitor()
-        monitor_stop = threading.Event()
+        use_process = sys.platform == "darwin"
+        monitor_stop = multiprocessing.Event() if use_process else threading.Event()
         try:
-            monitor_thread = threading.Thread(
-                target=monitor_module.start_monitor,
-                kwargs=dict(
-                    broker_url=args.broker_url,
-                    session=args.session,
-                    voice=voice_id or "",
-                    voice_mode=args.voice_mode,
-                    camera_index=cam_idx if cam_idx is not None else 0,
-                    mic_index=mic_idx if mic_idx is not None else -1,
-                    speaker_index=spk_idx if spk_idx is not None else -1,
-                    stop_event=monitor_stop,
-                    player=player,
-                    playback_mute=playback_mute,
-                ),
-                daemon=True,
+            kwargs = dict(
+                broker_url=args.broker_url,
+                session=args.session,
+                voice=voice_id or "",
+                voice_mode=args.voice_mode,
+                camera_index=cam_idx if cam_idx is not None else 0,
+                mic_index=mic_idx if mic_idx is not None else -1,
+                speaker_index=spk_idx if spk_idx is not None else -1,
+                stop_event=monitor_stop,
             )
+
+            if not use_process:
+                kwargs.update(dict(player=player, playback_mute=playback_mute))
+
+            target = monitor_module.start_monitor
+            constructor = multiprocessing.Process if use_process else threading.Thread
+            monitor_thread = constructor(target=target, kwargs=kwargs, daemon=True)
             monitor_thread.start()
             print("[monitor] started (press 'q' in its window to quit).")
         except Exception as e:
