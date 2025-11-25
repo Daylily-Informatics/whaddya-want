@@ -126,6 +126,7 @@ _REGISTER_RE = re.compile(
 _EXIT_RE = re.compile(r"\b(exit|quit|stop listening|goodbye|stop now)\b", re.I)
 _WAKE_RE = re.compile(r"\b(?:hey|ok|okay)\s+marvin\b", re.I)
 _MONITOR_RE = re.compile(r"^\s*marvin[, ]+monitor\b", re.I)
+_RESET_RE = re.compile(r"^\s*marvin[, ]+reset\b", re.I)
 _HELP_RE = re.compile(r"^\s*marvin[, ]+help\b", re.I)
 _DEVICE_CMD_RE = re.compile(
     r"""(?xi)
@@ -299,7 +300,7 @@ class SpeakerEmbed:
         return emb.squeeze(0).squeeze(0).cpu().numpy().astype(np.float32)
 
 # ---- CLI loop ----
-async def run():
+async def run() -> bool:
     ap = argparse.ArgumentParser(description="Voice client (unified identity + monitor trigger)")
     ap.add_argument("--broker-url", required=True)
     ap.add_argument("--session", default=str(uuid.uuid4()))
@@ -403,6 +404,7 @@ async def run():
         "While command mode is active, say 'exit' to stop the client.",
         "While command mode is active, say 'switch/change/set/use/select' the camera, microphone, or speaker to a device number.",
         "Say 'marvin monitor' to launch the monitor window.",
+        "Say 'marvin reset' to close the monitor and restart the client.",
         "Say 'register my voice as <name>' or 'call me <name>' to save a voice profile.",
         "Say 'marvin help' to hear this list again.",
     ]
@@ -416,7 +418,23 @@ async def run():
             file=sys.stderr,
         )
 
+    monitor_proc: subprocess.Popen | None = None
+
+    def _stop_monitor():
+        nonlocal monitor_proc
+        if monitor_proc is None:
+            return
+        if monitor_proc.poll() is None:
+            monitor_proc.terminate()
+            try:
+                monitor_proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                monitor_proc.kill()
+        monitor_proc = None
+
     def _launch_monitor():
+        nonlocal monitor_proc
+        _stop_monitor()
         cmd = [
             sys.executable,
             "-m",
@@ -434,7 +452,7 @@ async def run():
             f"--speaker-index={spk_idx if spk_idx is not None else -1}",
         ]
         try:
-            subprocess.Popen(cmd, stdout=None, stderr=None, close_fds=True)
+            monitor_proc = subprocess.Popen(cmd, stdout=None, stderr=None, close_fds=True)
             print("[monitor] started (press 'q' in its window to quit).")
         except Exception as e:
             print(f"[monitor error] {e}", file=sys.stderr)
@@ -455,23 +473,8 @@ async def run():
         barge_monitor=None,
     )
 
-    async def _switch_microphone(new_idx: int) -> bool:
+    def _start_microphone(new_idx: int | None):
         nonlocal mic, mic_task, mic_idx
-        try:
-            sd.check_input_settings(device=new_idx, samplerate=args.rate, channels=args.channels)
-            with sd.InputStream(device=new_idx, channels=args.channels, samplerate=args.rate) as s:
-                s.read(1)
-        except Exception as exc:
-            print(f"[voice] unable to switch microphone: {exc}", file=sys.stderr)
-            return False
-
-        mic_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
-            await mic_task
-        with contextlib.suppress(Exception):
-            await mic.aclose()
-
-        analysis_buf.clear()
         mic = stream_microphone(
             region=args.region,
             language_code=args.language,
@@ -484,6 +487,27 @@ async def run():
         )
         mic_task = asyncio.create_task(mic.__anext__())
         mic_idx = new_idx
+
+    async def _switch_microphone(new_idx: int) -> bool:
+        nonlocal mic, mic_task, mic_idx
+        prev_idx = mic_idx
+        mic_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
+            await mic_task
+        with contextlib.suppress(Exception):
+            await mic.aclose()
+
+        try:
+            sd.check_input_settings(device=new_idx, samplerate=args.rate, channels=args.channels)
+            with sd.InputStream(device=new_idx, channels=args.channels, samplerate=args.rate) as s:
+                s.read(1)
+        except Exception as exc:
+            print(f"[voice] unable to switch microphone: {exc}", file=sys.stderr)
+            _start_microphone(prev_idx)
+            return False
+
+        analysis_buf.clear()
+        _start_microphone(new_idx)
         try:
             sd.default.device = (mic_idx, spk_idx)
         except Exception:
@@ -494,6 +518,9 @@ async def run():
 
     async def _switch_speaker(new_idx: int) -> bool:
         nonlocal spk_idx
+        player.stop()
+        with contextlib.suppress(Exception):
+            sd.stop()
         try:
             sd.check_output_settings(device=new_idx, samplerate=args.rate, channels=1)
         except Exception as exc:
@@ -542,6 +569,8 @@ async def run():
             except (TypeError, ValueError):
                 return
 
+            _stop_monitor()
+
             if kind == "camera":
                 cam_idx = idx
                 _persist_devices(cam_idx, mic_idx, spk_idx)
@@ -579,10 +608,7 @@ async def run():
     threading.Thread(target=_stdin_watcher, daemon=True).start()
 
     # Mic stream
-    mic = stream_microphone(region=args.region, language_code=args.language, sample_rate=args.rate,
-                            channels=args.channels, input_device=mic_idx, analysis_buf=analysis_buf,
-                            mute_event=playback_mute, verbose=verbose)
-    mic_task = asyncio.create_task(mic.__anext__())
+    _start_microphone(mic_idx)
     reset_requested = False
     cmd_window_until = 0.0
     forced_done = False
@@ -599,7 +625,7 @@ async def run():
                 if typed=="__QUIT__":
                     print("[keyboard] quit — shutting down."); stop.set(); break
                 if typed=="__RESET__":
-                    print("[keyboard] reset listener."); analysis_buf.clear(); reset_requested=True; break
+                    print("[keyboard] reset listener."); analysis_buf.clear(); reset_requested=True; _stop_monitor(); stop.set(); break
                 # manual enroll: last ~3s
                 wav_m = take_latest_seconds(analysis_buf, max(args.id_window, 3.0), args.rate)
                 if wav_m is None:
@@ -647,6 +673,14 @@ async def run():
                 _launch_monitor()
                 continue
 
+            if _RESET_RE.search(transcript):
+                print("[voice] reset requested — restarting client.")
+                analysis_buf.clear()
+                _stop_monitor()
+                reset_requested = True
+                stop.set()
+                break
+
             # wake-gated exit
             now = loop.time()
             if _WAKE_RE.search(transcript):
@@ -665,6 +699,7 @@ async def run():
                     print("[voice] device change ignored (say 'hey Marvin' first).")
                     continue
                 kind, idx = device_cmd
+                _stop_monitor()
                 if kind == "camera":
                     cam_idx = idx
                     _persist_devices(cam_idx, mic_idx, spk_idx)
@@ -756,11 +791,19 @@ async def run():
             await mic_task
         with contextlib.suppress(Exception):
             await mic.aclose()
+        _stop_monitor()
     print("Exiting.")
+    return reset_requested
 
 def main():
-    try: asyncio.run(run())
-    except KeyboardInterrupt: pass
+    try:
+        while True:
+            restart = asyncio.run(run())
+            if not restart:
+                break
+            print("[system] reset complete; restarting Marvin client.")
+    except KeyboardInterrupt:
+        pass
 
 if __name__=="__main__":
     main()
