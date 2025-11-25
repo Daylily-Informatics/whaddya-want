@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, asyncio, contextlib, io, json, os, queue, re, signal, subprocess, sys, traceback, threading, uuid, warnings
-from dataclasses import replace
+import argparse, asyncio, contextlib, io, json, os, queue, re, signal, sys, traceback, threading, uuid, warnings
 from collections import deque
+from dataclasses import replace
 from pathlib import Path
-from typing import AsyncGenerator, Optional, Tuple, Dict, Any
+from typing import Any, AsyncGenerator, Dict, Optional, Tuple
 
 import numpy as np
 import sounddevice as sd
@@ -16,16 +16,16 @@ from amazon_transcribe.client import TranscribeStreamingClient
 from amazon_transcribe.handlers import TranscriptResultStreamHandler
 from amazon_transcribe.model import TranscriptResultStream
 
-# Shared identity + audio
 from client import identity
-from client.monitor_controller import MonitorConfig, MonitorController
-from client.shared_audio import AudioPlayer, speak_via_broker, get_shared_audio
+from client.monitor_engine import MonitorConfig as MonCfg, MonitorEngine
+from client.shared_audio import AudioPlayer, get_shared_audio, speak_via_broker
 
 # ---- Speaker embedding (SpeechBrain) ----
 _SPK_READY = False
 try:
     import torch  # noqa: F401
     from speechbrain.pretrained import EncoderClassifier  # type: ignore
+
     _SPK_READY = True
 except Exception as e:
     print("[diag] speechbrain import error:", repr(e), file=sys.stderr)
@@ -37,21 +37,24 @@ _SPK_DIR.mkdir(parents=True, exist_ok=True)
 # ---- Optional face recog for image test ----
 _FACE_OK = False
 try:
-    import face_recognition
+    import face_recognition  # type: ignore
+
     _FACE_OK = True
 except Exception:
     _FACE_OK = False
 
 # ---- Persisted device choices ----
 _STATE_DIR = Path(os.path.expanduser("~/.whaddya"))
-_DEVICES_JSON = _STATE_DIR / "devices.json"
 _STATE_DIR.mkdir(parents=True, exist_ok=True)
+_DEVICES_JSON = _STATE_DIR / "devices.json"
+
 
 # ---- Finals-only handler ----
 class FinalsOnlyHandler(TranscriptResultStreamHandler):
     def __init__(self, stream: TranscriptResultStream, out_q: asyncio.Queue[str]):
         super().__init__(stream)
         self.out_q = out_q
+
     async def handle_transcript_event(self, transcript_event):
         for result in transcript_event.transcript.results:
             if result.is_partial:
@@ -60,6 +63,7 @@ class FinalsOnlyHandler(TranscriptResultStreamHandler):
             if text.strip():
                 await self.out_q.put(text.strip())
 
+
 # ---- Mic → Transcribe ----
 def _bytes_to_float_mono_int16(data: bytes, channels: int) -> np.ndarray:
     arr = np.frombuffer(data, dtype=np.int16)
@@ -67,17 +71,30 @@ def _bytes_to_float_mono_int16(data: bytes, channels: int) -> np.ndarray:
         arr = arr.reshape(-1, channels).mean(axis=1).astype(np.int16)
     return arr.astype(np.float32) / 32768.0
 
-async def stream_microphone(*, region: str, language_code="en-US", sample_rate=16000, channels=1,
-                            blocksize=4096, input_device: int|None=None,
-                            analysis_buf: deque|None=None, mute_event: threading.Event|None=None,
-                            verbose=False) -> AsyncGenerator[str, None]:
+
+async def stream_microphone(
+    *,
+    region: str,
+    language_code: str = "en-US",
+    sample_rate: int = 16000,
+    channels: int = 1,
+    blocksize: int = 4096,
+    input_device: Optional[int] = None,
+    analysis_buf: Optional[deque] = None,
+    mute_event: Optional[threading.Event] = None,
+    verbose: bool = False,
+) -> AsyncGenerator[str, None]:
     client = TranscribeStreamingClient(region=region)
     stream = await client.start_stream_transcription(
-        language_code=language_code, media_sample_rate_hz=sample_rate, media_encoding="pcm",
+        language_code=language_code,
+        media_sample_rate_hz=sample_rate,
+        media_encoding="pcm",
     )
+
     loop = asyncio.get_running_loop()
-    raw_q: queue.Queue[bytes] = queue.Queue(maxsize=100)
-    async_q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=100)
+    raw_q: "queue.Queue[bytes]" = queue.Queue(maxsize=100)
+    async_q: "asyncio.Queue[bytes]" = asyncio.Queue(maxsize=100)
+
     def audio_cb(indata, frames, time_info, status):
         if status and verbose:
             print(status, file=sys.stderr)
@@ -91,13 +108,22 @@ async def stream_microphone(*, region: str, language_code="en-US", sample_rate=1
             raw_q.put_nowait(raw)
         except queue.Full:
             pass
+
     def mic_thread():
-        with sd.RawInputStream(samplerate=sample_rate, blocksize=blocksize, dtype="int16",
-                               channels=channels, device=input_device, callback=audio_cb):
+        with sd.RawInputStream(
+            samplerate=sample_rate,
+            blocksize=blocksize,
+            dtype="int16",
+            channels=channels,
+            device=input_device,
+            callback=audio_cb,
+        ):
             while True:
                 chunk = raw_q.get()
                 loop.call_soon_threadsafe(async_q.put_nowait, chunk)
+
     threading.Thread(target=mic_thread, daemon=True).start()
+
     async def sender():
         try:
             while True:
@@ -105,7 +131,8 @@ async def stream_microphone(*, region: str, language_code="en-US", sample_rate=1
                 await stream.input_stream.send_audio_event(audio_chunk=chunk)
         finally:
             await stream.input_stream.end_stream()
-    finals_q: asyncio.Queue[str] = asyncio.Queue()
+
+    finals_q: "asyncio.Queue[str]" = asyncio.Queue()
     handler = FinalsOnlyHandler(stream.output_stream, finals_q)
     send_task = asyncio.create_task(sender())
     recv_task = asyncio.create_task(handler.handle_events())
@@ -116,6 +143,7 @@ async def stream_microphone(*, region: str, language_code="en-US", sample_rate=1
     finally:
         send_task.cancel()
         recv_task.cancel()
+
 
 # ---- Helpers / commands ----
 _REGISTER_RE = re.compile(
@@ -152,6 +180,7 @@ _NUM_WORDS = {
     "ten": 10,
 }
 
+
 def parse_registration(text: str) -> Optional[str]:
     m = _REGISTER_RE.search(text)
     if not m:
@@ -159,6 +188,7 @@ def parse_registration(text: str) -> Optional[str]:
     name = (m.group(1) or m.group(2) or "").strip()
     name = re.sub(r"\s+", " ", name)
     return name or None
+
 
 def take_latest_seconds(buf: deque, seconds: float, rate: int) -> Optional[np.ndarray]:
     need = int(seconds * rate)
@@ -168,6 +198,7 @@ def take_latest_seconds(buf: deque, seconds: float, rate: int) -> Optional[np.nd
     mx = float(np.max(np.abs(arr))) + 1e-9
     return arr / mx
 
+
 def _camera_device_name(idx: int) -> Optional[str]:
     sysfs_name = Path(f"/sys/class/video4linux/video{idx}/name")
     try:
@@ -175,12 +206,12 @@ def _camera_device_name(idx: int) -> Optional[str]:
     except OSError:
         return None
 
-def _avfoundation_camera_names() -> dict[str, str]:
+
+def _avfoundation_camera_names() -> Dict[str, str]:
     """Return camera names on macOS using ffmpeg/avfoundation, if available."""
     if sys.platform != "darwin":
         return {}
     try:
-        # ffmpeg prints avfoundation devices to stderr
         proc = subprocess.run(
             ["ffmpeg", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
             capture_output=True,
@@ -190,7 +221,7 @@ def _avfoundation_camera_names() -> dict[str, str]:
     except FileNotFoundError:
         return {}
 
-    names: dict[str, str] = {}
+    names: Dict[str, str] = {}
     collecting = False
     for line in (proc.stderr or "").splitlines():
         if "AVFoundation video devices" in line:
@@ -204,15 +235,17 @@ def _avfoundation_camera_names() -> dict[str, str]:
                 break
     return names
 
+
 def _detect_cameras(max_index: int = 10) -> list[dict]:
     import cv2
+
     friendly_names = _avfoundation_camera_names()
-    found=[]
+    found = []
     for idx in range(max_index):
         cap = cv2.VideoCapture(idx)
         ok = cap is not None and cap.isOpened()
         if ok:
-            ret,_ = cap.read()
+            ret, _ = cap.read()
             cap.release()
             if ret:
                 name = friendly_names.get(str(idx)) or _camera_device_name(idx)
@@ -222,6 +255,7 @@ def _detect_cameras(max_index: int = 10) -> list[dict]:
             cap.release()
     return found
 
+
 def _describe_audio_devices():
     try:
         devs = sd.query_devices()
@@ -230,59 +264,82 @@ def _describe_audio_devices():
     hostapis = sd.query_hostapis()
     mics, spk = [], []
     for idx, d in enumerate(devs):
-        ha = hostapis[d["hostapi"]]["name"] if hostapis and 0 <= d.get("hostapi",-1) < len(hostapis) else ""
+        ha = ""
+        try:
+            ha = hostapis[d["hostapi"]]["name"]
+        except Exception:
+            ha = ""
         label = f"{d['name']} ({ha})" if ha else d["name"]
         ent = {"index": str(idx), "label": label}
-        if d.get("max_input_channels",0)>0: mics.append(ent)
-        if d.get("max_output_channels",0)>0: spk.append(ent)
+        if d.get("max_input_channels", 0) > 0:
+            mics.append(ent)
+        if d.get("max_output_channels", 0) > 0:
+            spk.append(ent)
     return mics, spk
+
 
 def _prompt_choice(options, title):
     print(f"[{title}]")
-    for i,opt in enumerate(options, start=1):
+    for i, opt in enumerate(options, start=1):
         print(f"  {i}. {opt['label']} (index {opt['index']})")
-    default_idx=1
+    default_idx = 1
     while True:
-        try: raw=input(f"Select {title.lower()} [default {default_idx}]: ").strip()
-        except EOFError: raw=""
+        try:
+            raw = input(f"Select {title.lower()} [default {default_idx}]: ").strip()
+        except EOFError:
+            raw = ""
         choice = default_idx if not raw else (int(raw) if raw.isdigit() else None)
-        if choice and 1<=choice<=len(options):
-            sel = int(options[choice-1]["index"])
-            print(f"[selected] {options[choice-1]['label']}")
+        if choice and 1 <= choice <= len(options):
+            sel = int(options[choice - 1]["index"])
+            print(f"[selected] {options[choice - 1]['label']}")
             return sel
         print("Invalid selection, try again.")
 
-def device_setup_interactive() -> Tuple[int,int,int]:
+
+def device_setup_interactive() -> Tuple[int, int, int]:
     cams = _detect_cameras()
-    if not cams: raise RuntimeError("No usable cameras detected.")
+    if not cams:
+        raise RuntimeError("No usable cameras detected.")
     cam = _prompt_choice(cams, "Available Cameras")
     mics, sp = _describe_audio_devices()
-    if not mics: raise RuntimeError("No microphones detected.")
+    if not mics:
+        raise RuntimeError("No microphones detected.")
     mic = _prompt_choice(mics, "Available Microphones")
     sd.check_input_settings(device=mic, samplerate=16000, channels=1)
-    with sd.InputStream(device=mic, channels=1, samplerate=16000) as s: s.read(1)
+    with sd.InputStream(device=mic, channels=1, samplerate=16000) as s:
+        s.read(1)
     print("[ok] microphone test passed.")
-    if not sp: raise RuntimeError("No speakers detected.")
+    if not sp:
+        raise RuntimeError("No speakers detected.")
     spk = _prompt_choice(sp, "Available Speakers")
     sd.check_output_settings(device=spk, samplerate=16000, channels=1)
-    import numpy as np
-    dur=0.2; t=np.linspace(0,dur,int(16000*dur),False); tone=0.2*np.sin(2*np.pi*880*t)
-    sd.play(tone, samplerate=16000, device=spk); sd.wait()
+    dur = 0.2
+    t = np.linspace(0, dur, int(16000 * dur), False)
+    tone = 0.2 * np.sin(2 * np.pi * 880 * t)
+    sd.play(tone, samplerate=16000, device=spk)
+    sd.wait()
     print("[ok] speaker test passed.")
-    _DEVICES_JSON.write_text(json.dumps({"camera_index":cam,"mic_index":mic,"speaker_index":spk}, indent=2))
+    _DEVICES_JSON.write_text(
+        json.dumps(
+            {"camera_index": cam, "mic_index": mic, "speaker_index": spk},
+            indent=2,
+        )
+    )
     print(f"[saved] {_DEVICES_JSON}")
     return cam, mic, spk
 
-def load_saved_devices() -> Tuple[int|None,int|None,int|None]:
+
+def load_saved_devices() -> Tuple[Optional[int], Optional[int], Optional[int]]:
     if _DEVICES_JSON.exists():
         try:
-            d=json.loads(_DEVICES_JSON.read_text())
+            d = json.loads(_DEVICES_JSON.read_text())
             return d.get("camera_index"), d.get("mic_index"), d.get("speaker_index")
         except Exception:
-            return None,None,None
-    return None,None,None
+            return None, None, None
+    return None, None, None
 
-def _persist_devices(camera: int | None, mic: int | None, speaker: int | None) -> None:
+
+def _persist_devices(camera: Optional[int], mic: Optional[int], speaker: Optional[int]) -> None:
     try:
         _DEVICES_JSON.write_text(
             json.dumps(
@@ -297,13 +354,14 @@ def _persist_devices(camera: int | None, mic: int | None, speaker: int | None) -
     except Exception:
         pass
 
-def parse_device_command(text: str) -> tuple[str, int] | None:
+
+def parse_device_command(text: str) -> Optional[Tuple[str, int]]:
     m = _DEVICE_CMD_RE.search(text)
     if not m:
         return None
     raw_kind = m.group(1).lower()
     idx_token = (m.group(2) or "").strip().lower()
-    idx: int | None
+    idx: Optional[int]
     if idx_token.isdigit():
         idx = int(idx_token)
     else:
@@ -318,41 +376,59 @@ def parse_device_command(text: str) -> tuple[str, int] | None:
         kind = "speaker"
     return kind, idx
 
+
 # ---- Echo suppression helper ----
 def _norm_text_for_echo(s: str) -> str:
     """Normalize text for simple echo suppression (lowercase, strip punctuation/extra spaces)."""
     return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", s.lower())).strip()
+
 
 # ---- Voice embedding model (for identity) ----
 class SpeakerEmbed:
     def __init__(self):
         self.enabled = _SPK_READY
         self.model = None
+
     def _ensure(self):
-        if not self.enabled: return
+        if not self.enabled:
+            return
         if self.model is None:
             self.model = EncoderClassifier.from_hparams(
                 source="speechbrain/spkrec-ecapa-voxceleb",
-                run_opts={"device":"cpu"},
+                run_opts={"device": "cpu"},
             )
+
     def embed(self, wav16: np.ndarray) -> Optional[np.ndarray]:
-        if not self.enabled: return None
+        if not self.enabled:
+            return None
         self._ensure()
-        if self.model is None: return None
+        if self.model is None:
+            return None
         with torch.no_grad():
             emb = self.model.encode_batch(torch.from_numpy(wav16).unsqueeze(0))
         return emb.squeeze(0).squeeze(0).cpu().numpy().astype(np.float32)
 
+
 # ---- CLI loop ----
 async def run() -> bool:
-    ap = argparse.ArgumentParser(description="Voice client (unified identity + monitor trigger)")
+    ap = argparse.ArgumentParser(
+        description="Voice client (unified identity + monitor trigger)"
+    )
     ap.add_argument("--broker-url", required=True)
     ap.add_argument("--session", default=str(uuid.uuid4()))
-    ap.add_argument("--region", default=os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "us-west-2")
+    ap.add_argument(
+        "--region",
+        default=os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "us-west-2",
+    )
     ap.add_argument("--language", default="en-US")
     ap.add_argument("--input-device", type=int, default=None)
     ap.add_argument("--setup-devices", action="store_true")
-    ap.add_argument("--identify_image", type=str, default=None, help="Optional: identify a face from an image and exit")
+    ap.add_argument(
+        "--identify_image",
+        type=str,
+        default=None,
+        help="Optional: identify a face from an image and exit",
+    )
     ap.add_argument("--rate", type=int, default=16000)
     ap.add_argument("--channels", type=int, default=1)
     ap.add_argument("--id-threshold", type=float, default=0.65)
@@ -365,11 +441,23 @@ async def run() -> bool:
     )
     ap.add_argument("--force-enroll", default=None)
     ap.add_argument("--voice", default=os.getenv("POLLY_VOICE"))
-    ap.add_argument("--voice-mode", choices=["standard","neural","generative"], default="standard")
-    ap.add_argument("--text-only", action="store_true", help="Request text-only responses from the broker")
+    ap.add_argument(
+        "--voice-mode",
+        choices=["standard", "neural", "generative"],
+        default="standard",
+    )
+    ap.add_argument(
+        "--text-only",
+        action="store_true",
+        help="Request text-only responses from the broker",
+    )
     ap.add_argument("--save-audio", action="store_true")
     ap.add_argument("--verbose", action="store_true")
-    ap.add_argument("--auto-start-monitor", action="store_true", help="Launch the monitor automatically after the greeting")
+    ap.add_argument(
+        "--auto-start-monitor",
+        action="store_true",
+        help="Launch the monitor automatically after the greeting",
+    )
     ap.add_argument(
         "--self-voice-name",
         type=str,
@@ -378,12 +466,15 @@ async def run() -> bool:
     )
     args = ap.parse_args()
 
-    # Face ID one-shot (shared memory)
+    # Face ID one-shot
     if args.identify_image:
         if not _FACE_OK:
-            print("[face] face_recognition not available.", file=sys.stderr)
+            print(
+                "[face] face_recognition not available.",
+                file=sys.stderr,
+            )
             sys.exit(2)
-        img = face_recognition.load_image_file(args.identify_image)  # noqa: E999 (dash)
+        img = face_recognition.load_image_file(args.identify_image)
         locs = face_recognition.face_locations(img, model="hog")
         if not locs:
             print("No face found.")
@@ -402,8 +493,9 @@ async def run() -> bool:
     if "--debug-http" in sys.argv:
         try:
             import http.client as _http_client
-            _http_client.HTTPConnection.debuglevel = 1
             import logging
+
+            _http_client.HTTPConnection.debuglevel = 1
             logging.basicConfig()
             logging.getLogger("urllib3").setLevel(logging.DEBUG)
             logging.getLogger("urllib3").propagate = True
@@ -412,9 +504,11 @@ async def run() -> bool:
             pass
 
     def vprint(*vargs, **vkwargs):
-        if verbose: print(*vargs, **vkwargs)
+        if verbose:
+            print(*vargs, **vkwargs)
 
-    if voice_id: vprint(f"[diag] Polly voice → {voice_id}")
+    if voice_id:
+        vprint(f"[diag] Polly voice → {voice_id}")
     vprint(f"[diag] voice mode = {args.voice_mode}")
 
     cam_idx_s, mic_idx_s, spk_idx_s = load_saved_devices()
@@ -431,14 +525,18 @@ async def run() -> bool:
             sd.default.device = (mic_idx, spk_idx)
     except Exception:
         pass
-    print(f"Session {args.session}  region={args.region}  devices: camera={cam_idx} mic={mic_idx} spk={spk_idx}")
+    print(
+        f"Session {args.session}  region={args.region}  devices: camera={cam_idx} mic={mic_idx} spk={spk_idx}"
+    )
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     player, playback_mute = get_shared_audio()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        try: loop.add_signal_handler(sig, lambda s=sig: (player.stop(), stop.set()))
-        except NotImplementedError: pass
+        try:
+            loop.add_signal_handler(sig, lambda s=sig: (player.stop(), stop.set()))
+        except NotImplementedError:
+            pass
 
     analysis_buf = deque(maxlen=int(args.rate * 6))
     spk_embed = SpeakerEmbed()
@@ -463,34 +561,61 @@ async def run() -> bool:
             file=sys.stderr,
         )
 
-    monitor_controller = MonitorController(player, playback_mute)
-    monitor_config = MonitorConfig(
-        broker_url=args.broker_url,
-        session=args.session,
-        voice_id=voice_id,
-        voice_mode=args.voice_mode,
-        camera_index=cam_idx if cam_idx is not None else 0,
-        mic_index=mic_idx,
-        speaker_index=spk_idx,
-    )
-    monitor_controller.configure(monitor_config)
+    # Monitor (in-process) state
+    monitor_engine: Optional[MonitorEngine] = None
+    monitor_task: Optional[asyncio.Task] = None
+    monitor_stop_event = asyncio.Event()
 
-    mic: AsyncGenerator[str, None] | None = None
-    mic_task: asyncio.Task[str] | None = None
-
-    def _update_monitor_config(**changes):
-        nonlocal monitor_config
-        monitor_config = replace(monitor_config, **changes)
-        monitor_controller.configure(monitor_config)
-
-    def _stop_monitor():
-        monitor_controller.stop()
-
-    def _launch_monitor():
+    async def _start_monitor():
+        nonlocal monitor_engine, monitor_task, cam_idx, mic_idx
+        if monitor_task and not monitor_task.done():
+            print("[monitor] already running.")
+            return
+        if cam_idx is None:
+            print("[monitor] no camera index configured.", file=sys.stderr)
+            return
+        cfg = MonCfg(
+            broker_url=args.broker_url,
+            session=args.session,
+            voice_id=voice_id,
+            voice_mode=args.voice_mode,
+            camera_index=cam_idx,
+            mic_index=mic_idx,
+        )
         try:
-            monitor_controller.launch(monitor_config)
+            monitor_engine = MonitorEngine(cfg, player, playback_mute)
         except Exception as e:
-            print(f"[monitor error] {e}", file=sys.stderr)
+            print(f"[monitor] failed to start: {e}", file=sys.stderr)
+            monitor_engine = None
+            return
+
+        monitor_stop_event.clear()
+
+        async def _loop():
+            while (
+                not monitor_stop_event.is_set()
+                and monitor_engine is not None
+                and not monitor_engine.stop_flag
+            ):
+                await monitor_engine.step()
+                await asyncio.sleep(0.03)
+            if monitor_engine is not None:
+                monitor_engine.cleanup()
+
+        monitor_task = asyncio.create_task(_loop())
+        print("[monitor] started; press 'q' in the window to quit.")
+
+    async def _stop_monitor():
+        nonlocal monitor_engine, monitor_task
+        monitor_stop_event.set()
+        if monitor_engine is not None:
+            monitor_engine.stop()
+        if monitor_task is not None:
+            monitor_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await monitor_task
+        monitor_engine = None
+        monitor_task = None
 
     print(f"AI:  {intro_text}")
     await speak_via_broker(
@@ -509,9 +634,12 @@ async def run() -> bool:
     )
     intro_sent = True
     if args.auto_start_monitor:
-        _launch_monitor()
+        await _start_monitor()
 
-    def _start_microphone(new_idx: int | None):
+    mic: Optional[AsyncGenerator[str, None]] = None
+    mic_task: Optional[asyncio.Task] = None
+
+    def _start_microphone(new_idx: Optional[int]):
         nonlocal mic, mic_task, mic_idx
         mic = stream_microphone(
             region=args.region,
@@ -537,7 +665,11 @@ async def run() -> bool:
 
         try:
             sd.check_input_settings(device=new_idx, samplerate=args.rate, channels=args.channels)
-            with sd.InputStream(device=new_idx, channels=args.channels, samplerate=args.rate) as s:
+            with sd.InputStream(
+                device=new_idx,
+                channels=args.channels,
+                samplerate=args.rate,
+            ) as s:
                 s.read(1)
         except Exception as exc:
             print(f"[voice] unable to switch microphone: {exc}", file=sys.stderr)
@@ -551,7 +683,6 @@ async def run() -> bool:
         except Exception:
             pass
         _persist_devices(cam_idx, mic_idx, spk_idx)
-        _update_monitor_config(mic_index=mic_idx)
         print(f"[voice] microphone switched to index {mic_idx}.")
         return True
 
@@ -572,7 +703,6 @@ async def run() -> bool:
         except Exception:
             pass
         _persist_devices(cam_idx, mic_idx, spk_idx)
-        _update_monitor_config(speaker_index=spk_idx)
         print(f"[voice] speaker switched to index {spk_idx}.")
         return True
 
@@ -598,7 +728,7 @@ async def run() -> bool:
             return
 
         if name == "launch_monitor":
-            _launch_monitor()
+            await _start_monitor()
             return
 
         if name == "set_device":
@@ -609,12 +739,11 @@ async def run() -> bool:
             except (TypeError, ValueError):
                 return
 
-            _stop_monitor()
+            await _stop_monitor()
 
             if kind == "camera":
                 cam_idx = idx
                 _persist_devices(cam_idx, mic_idx, spk_idx)
-                _update_monitor_config(camera_index=cam_idx)
                 print(f"[voice] camera switched to index {cam_idx} (via command).")
                 return
             elif kind == "microphone":
@@ -624,21 +753,20 @@ async def run() -> bool:
                 await _switch_speaker(idx)
                 return
 
-            # unknown kind → ignore
-            return
-
     # stdin watcher
-    manual_q: asyncio.Queue[str] = asyncio.Queue()
+    manual_q: "asyncio.Queue[str]" = asyncio.Queue()
+
     def _stdin_watcher():
         try:
             while True:
                 line = sys.stdin.readline()
-                if not line: break
+                if not line:
+                    break
                 s = line.strip()
                 try:
-                    if s.lower() in ("q","quit","exit"):
+                    if s.lower() in ("q", "quit", "exit"):
                         loop.call_soon_threadsafe(manual_q.put_nowait, "__QUIT__")
-                    elif s.lower() in ("r","reset","restart"):
+                    elif s.lower() in ("r", "reset", "restart"):
                         loop.call_soon_threadsafe(manual_q.put_nowait, "__RESET__")
                     else:
                         loop.call_soon_threadsafe(manual_q.put_nowait, s)
@@ -646,33 +774,42 @@ async def run() -> bool:
                     break
         except Exception:
             pass
+
     threading.Thread(target=_stdin_watcher, daemon=True).start()
 
     # Mic stream
     _start_microphone(mic_idx)
     reset_requested = False
     cmd_window_until = 0.0
-    forced_done = False
-    auto_registered_name: str | None = None
+    auto_registered_name: Optional[str] = None
 
     # Echo suppression state
-    last_ai_text_norm: str | None = None
+    last_ai_text_norm: Optional[str] = None
     last_ai_time: float = 0.0
 
     try:
         while not stop.is_set():
-            # manual keys
-            handled_manual=False
+            handled_manual = False
             while True:
-                try: typed = manual_q.get_nowait()
-                except asyncio.QueueEmpty: break
-                handled_manual=True
-                if typed=="__QUIT__":
-                    print("[keyboard] quit — shutting down."); stop.set(); break
-                if typed=="__RESET__":
-                    print("[keyboard] reset listener."); analysis_buf.clear(); reset_requested=True; _stop_monitor(); stop.set(); break
-                # manual enroll: last ~3s
-                wav_m = take_latest_seconds(analysis_buf, max(args.id_window, 3.0), args.rate)
+                try:
+                    typed = manual_q.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                handled_manual = True
+                if typed == "__QUIT__":
+                    print("[keyboard] quit — shutting down.")
+                    stop.set()
+                    break
+                if typed == "__RESET__":
+                    print("[keyboard] reset listener.")
+                    analysis_buf.clear()
+                    await _stop_monitor()
+                    reset_requested = True
+                    stop.set()
+                    break
+                wav_m = take_latest_seconds(
+                    analysis_buf, max(args.id_window, 3.0), args.rate
+                )
                 if wav_m is None:
                     print("[enroll] not enough audio.")
                 else:
@@ -681,20 +818,26 @@ async def run() -> bool:
                         identity.enroll_voice(typed or "Major", vec)
                         print(f"[enrolled voice] {typed or 'Major'}")
                     else:
-                        print("[enroll] speaker embed unavailable.", file=sys.stderr)
-            if stop.is_set() or reset_requested: break
-            if handled_manual: continue
+                        print(
+                            "[enroll] speaker embed unavailable.",
+                            file=sys.stderr,
+                        )
+            if stop.is_set() or reset_requested:
+                break
+            if handled_manual:
+                continue
 
-            # next transcript
             try:
-                transcript = await asyncio.wait_for(asyncio.shield(mic_task), timeout=0.2)
+                transcript = await asyncio.wait_for(
+                    asyncio.shield(mic_task), timeout=0.2
+                )
             except asyncio.TimeoutError:
                 continue
             except StopAsyncIteration:
-                stop.set(); break
+                stop.set()
+                break
             mic_task = asyncio.create_task(mic.__anext__())
 
-            # Echo suppression: ignore transcripts that exactly match last AI reply
             norm_transcript = _norm_text_for_echo(transcript)
             now = loop.time()
             if (
@@ -703,7 +846,9 @@ async def run() -> bool:
                 and (now - last_ai_time) < 5.0
             ):
                 if verbose:
-                    print(f"[echo-suppress] ignoring transcript matching last AI reply: {transcript!r}")
+                    print(
+                        f"[echo-suppress] ignoring transcript matching last AI reply: {transcript!r}"
+                    )
                 continue
 
             print(f"YOU: {transcript}")
@@ -712,7 +857,9 @@ async def run() -> bool:
                 print("[marvin help] Available commands:")
                 for line in help_lines:
                     print(f"  - {line}")
-                help_text = "Here are the Marvin commands: " + " ".join(help_lines)
+                help_text = (
+                    "Here are the Marvin commands: " + " ".join(help_lines)
+                )
                 await speak_via_broker(
                     broker_url=args.broker_url,
                     session_id=args.session,
@@ -729,20 +876,18 @@ async def run() -> bool:
                 )
                 continue
 
-            # monitor trigger
             if _MONITOR_RE.search(transcript):
-                _launch_monitor()
+                await _start_monitor()
                 continue
 
             if _RESET_RE.search(transcript):
                 print("[voice] reset requested — restarting client.")
                 analysis_buf.clear()
-                _stop_monitor()
+                await _stop_monitor()
                 reset_requested = True
                 stop.set()
                 break
 
-            # wake-gated exit
             now = loop.time()
             if _WAKE_RE.search(transcript):
                 cmd_window_until = now + 8.0
@@ -750,21 +895,24 @@ async def run() -> bool:
                 continue
             if _EXIT_RE.search(transcript):
                 if now <= cmd_window_until:
-                    print("[voice] exit requested — shutting down."); stop.set(); break
+                    print("[voice] exit requested — shutting down.")
+                    stop.set()
+                    break
                 else:
                     print("[voice] 'exit' ignored (say 'hey Marvin' first).")
 
             device_cmd = parse_device_command(transcript)
             if device_cmd:
                 if now > cmd_window_until:
-                    print("[voice] device change ignored (say 'hey Marvin' first).")
+                    print(
+                        "[voice] device change ignored (say 'hey Marvin' first)."
+                    )
                     continue
                 kind, idx = device_cmd
-                _stop_monitor()
+                await _stop_monitor()
                 if kind == "camera":
                     cam_idx = idx
                     _persist_devices(cam_idx, mic_idx, spk_idx)
-                    _update_monitor_config(camera_index=cam_idx)
                     print(f"[voice] camera switched to index {cam_idx}.")
                 elif kind == "microphone":
                     await _switch_microphone(idx)
@@ -772,32 +920,43 @@ async def run() -> bool:
                     await _switch_speaker(idx)
                 continue
 
-            # enrollment via phrase
             name = parse_registration(transcript)
             if name:
-                wav = take_latest_seconds(analysis_buf, args.id_window, args.rate)
+                wav = take_latest_seconds(
+                    analysis_buf, args.id_window, args.rate
+                )
                 if wav is not None:
                     vec = spk_embed.embed(wav)
                     if vec is not None:
-                        identity.enroll_voice(name, vec); print(f"[enrolled voice] {name}")
-                # no else: silent
+                        identity.enroll_voice(name, vec)
+                        print(f"[enrolled voice] {name}")
 
-            # build context with voice ID from shared registry
             wav_id = take_latest_seconds(analysis_buf, args.id_window, args.rate)
             context: Dict[str, Any] = {"intro_already_sent": intro_sent}
             is_self_voice = False
             if wav_id is not None:
                 if not spk_embed.enabled:
-                    vprint("[identity] Speaker embedding disabled; skipping voice matching.")
+                    vprint(
+                        "[identity] Speaker embedding disabled; skipping voice matching."
+                    )
                 else:
                     vec = spk_embed.embed(wav_id)
                     if vec is None:
-                        vprint("[identity] Unable to embed current voice sample.")
+                        vprint(
+                            "[identity] Unable to embed current voice sample."
+                        )
                     else:
-                        who = identity.identify_voice(vec, threshold=args.id_threshold)
+                        who = identity.identify_voice(
+                            vec, threshold=args.id_threshold
+                        )
                         if who:
-                            if self_voice and who.strip().lower() == self_voice:
-                                print(f"[voice] Ignoring self voice signature ({who}).")
+                            if (
+                                self_voice
+                                and who.strip().lower() == self_voice
+                            ):
+                                print(
+                                    f"[voice] Ignoring self voice signature ({who})."
+                                )
                                 is_self_voice = True
                             else:
                                 context["speaker_id"] = who
@@ -807,7 +966,9 @@ async def run() -> bool:
                             identity.enroll_voice(new_name, vec)
                             auto_registered_name = new_name
                             context["speaker_id"] = new_name
-                            print(f"[identity] Auto-registered voice as {new_name}.")
+                            print(
+                                f"[identity] Auto-registered voice as {new_name}."
+                            )
 
             if is_self_voice:
                 continue
@@ -816,10 +977,19 @@ async def run() -> bool:
                 need = int(0.3 * args.rate)
                 while playback_mute.is_set() and not stop.is_set():
                     if len(analysis_buf) >= need:
-                        arr = np.array([analysis_buf[i] for i in range(len(analysis_buf) - need, len(analysis_buf))], dtype=np.float32)
+                        arr = np.array(
+                            [
+                                analysis_buf[i]
+                                for i in range(
+                                    len(analysis_buf) - need, len(analysis_buf)
+                                )
+                            ],
+                            dtype=np.float32,
+                        )
                         rms = float(np.sqrt(np.mean(arr * arr)))
                         if rms >= 0.04:
-                            player.stop(); break
+                            player.stop()
+                            break
                     await asyncio.sleep(0.05)
 
             body = await speak_via_broker(
@@ -845,7 +1015,6 @@ async def run() -> bool:
             ai_text = body.get("text", "")
             print(f"AI:  {ai_text}")
 
-            # update echo suppression state
             if ai_text:
                 last_ai_text_norm = _norm_text_for_echo(ai_text)
                 last_ai_time = loop.time()
@@ -862,9 +1031,10 @@ async def run() -> bool:
             await mic_task
         with contextlib.suppress(Exception):
             await mic.aclose()
-        _stop_monitor()
+        await _stop_monitor()
     print("Exiting.")
     return reset_requested
+
 
 def main():
     try:
@@ -876,7 +1046,8 @@ def main():
     except KeyboardInterrupt:
         pass
 
-if __name__=="__main__":
+
+if __name__ == "__main__":
     main()
 
 # Danielle
