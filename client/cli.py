@@ -416,6 +416,29 @@ async def run():
             file=sys.stderr,
         )
 
+    def _launch_monitor():
+        cmd = [
+            sys.executable,
+            "-m",
+            "client.monitor",
+            "--broker-url",
+            args.broker_url,
+            "--session",
+            args.session,
+            "--voice",
+            (voice_id or ""),
+            "--voice-mode",
+            args.voice_mode,
+            f"--camera-index={cam_idx if cam_idx is not None else 0}",
+            f"--mic-index={mic_idx if mic_idx is not None else -1}",
+            f"--speaker-index={spk_idx if spk_idx is not None else -1}",
+        ]
+        try:
+            subprocess.Popen(cmd, stdout=None, stderr=None, close_fds=True)
+            print("[monitor] started (press 'q' in its window to quit).")
+        except Exception as e:
+            print(f"[monitor error] {e}", file=sys.stderr)
+
     print(f"AI:  {intro_text}")
     await speak_via_broker(
         broker_url=args.broker_url,
@@ -485,6 +508,54 @@ async def run():
         _persist_devices(cam_idx, mic_idx, spk_idx)
         print(f"[voice] speaker switched to index {spk_idx}.")
         return True
+
+    async def _handle_command(cmd_spec: Dict[str, Any]) -> None:
+        """
+        Execute a structured command emitted by the broker.
+
+        Expected shape:
+            {"name": "launch_monitor" | "set_device" | "noop",
+             "args": {...}}
+        """
+        nonlocal cam_idx, mic_idx, spk_idx
+
+        if not isinstance(cmd_spec, dict):
+            return
+        name = cmd_spec.get("name")
+        args = cmd_spec.get("args") or {}
+
+        if not isinstance(name, str) or not isinstance(args, dict):
+            return
+
+        if name == "noop":
+            return
+
+        if name == "launch_monitor":
+            _launch_monitor()
+            return
+
+        if name == "set_device":
+            kind = args.get("kind")
+            idx = args.get("index")
+            try:
+                idx = int(idx)
+            except (TypeError, ValueError):
+                return
+
+            if kind == "camera":
+                cam_idx = idx
+                _persist_devices(cam_idx, mic_idx, spk_idx)
+                print(f"[voice] camera switched to index {cam_idx} (via command).")
+                return
+            elif kind == "microphone":
+                await _switch_microphone(idx)
+                return
+            elif kind == "speaker":
+                await _switch_speaker(idx)
+                return
+
+            # unknown kind → ignore
+            return
 
     # stdin watcher
     manual_q: asyncio.Queue[str] = asyncio.Queue()
@@ -573,21 +644,7 @@ async def run():
 
             # monitor trigger
             if _MONITOR_RE.search(transcript):
-                cmd = [
-                    sys.executable, "-m", "client.monitor",
-                    "--broker-url", args.broker_url,
-                    "--session", args.session,
-                    "--voice", (voice_id or ""),
-                    "--voice-mode", args.voice_mode,
-                    f"--camera-index={cam_idx if cam_idx is not None else 0}",
-                    f"--mic-index={mic_idx if mic_idx is not None else -1}",
-                    f"--speaker-index={spk_idx if spk_idx is not None else -1}",
-                ]
-                try:
-                    subprocess.Popen(cmd, stdout=None, stderr=None, close_fds=True)
-                    print("[monitor] started (press 'q' in its window to quit).")
-                except Exception as e:
-                    print(f"[monitor error] {e}", file=sys.stderr)
+                _launch_monitor()
                 continue
 
             # wake-gated exit
@@ -688,6 +745,10 @@ async def run():
 
             ai_text = body.get("text", "")
             print(f"AI:  {ai_text}")
+
+            cmd_spec = body.get("command")
+            if isinstance(cmd_spec, dict):
+                await _handle_command(cmd_spec)
 
     finally:
         mic_task.cancel()
