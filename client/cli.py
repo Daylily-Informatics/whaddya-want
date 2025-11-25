@@ -429,6 +429,8 @@ async def run() -> bool:
         )
 
     monitor_proc: subprocess.Popen | None = None
+    mic: AsyncGenerator[str, None] | None = None
+    mic_task: asyncio.Task[str] | None = None
 
     def _stop_monitor():
         nonlocal monitor_proc
