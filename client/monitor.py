@@ -309,9 +309,13 @@ def run_monitor(
 
     try:
         cv2.namedWindow(window_title, cv2.WINDOW_NORMAL)
-    except cv2.error:
+    except cv2.error as e:
         display_enabled = False
-        print("[monitor] GUI display unavailable; running headless (no preview window).", file=sys.stderr)
+        print(
+            "[monitor] GUI display unavailable; running headless (no preview window). "
+            f"OpenCV error: {e}",
+            file=sys.stderr,
+        )
 
     roi = _parse_roi(args.roi)
     present_frames=0
