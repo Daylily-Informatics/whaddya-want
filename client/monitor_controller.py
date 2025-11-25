@@ -1,5 +1,4 @@
 from __future__ import annotations
-import os
 import subprocess
 import sys
 import threading
@@ -42,14 +41,9 @@ class MonitorController:
         if self._config is None:
             raise RuntimeError("Monitor configuration not set.")
 
-        # Stop any existing monitor first
         self.stop()
 
-        # Default: run in-process so audio mute guard is shared with CLI.
-        # If you *really* need the old macOS subprocess behavior, set:
-        #   WHADDYA_MONITOR_SUBPROCESS=1
-        force_subprocess = os.getenv("WHADDYA_MONITOR_SUBPROCESS") == "1"
-        if force_subprocess:
+        if sys.platform == "darwin":
             self._launch_subprocess()
         else:
             self._launch_thread()
@@ -95,10 +89,9 @@ class MonitorController:
             daemon=True,
         )
         self._thread.start()
-        print("[monitor] started (threaded; press 'q' in its window to quit).")
+        print("[monitor] started (press 'q' in its window to quit).")
 
     def _launch_subprocess(self) -> None:
-        """Legacy macOS path: separate process, no shared mute guard."""
         assert self._config is not None
         monitor_path = Path(__file__).resolve().parent / "monitor.py"
         args = [
@@ -121,5 +114,4 @@ class MonitorController:
             args += ["--speaker-index", str(self._config.speaker_index)]
 
         self._process = subprocess.Popen(args)
-        print(f"[monitor] subprocess started with pid={self._process.pid} (no shared mute guard)")
-#export WHADDYA_MONITOR_SUBPROCESS=1
+        print(f"[monitor] subprocess started with pid={self._process.pid} (macOS main-thread GUI)")

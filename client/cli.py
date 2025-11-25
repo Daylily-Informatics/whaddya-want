@@ -168,14 +168,12 @@ def take_latest_seconds(buf: deque, seconds: float, rate: int) -> Optional[np.nd
     mx = float(np.max(np.abs(arr))) + 1e-9
     return arr / mx
 
-# ---- Device helpers ----
 def _camera_device_name(idx: int) -> Optional[str]:
     sysfs_name = Path(f"/sys/class/video4linux/video{idx}/name")
     try:
         return sysfs_name.read_text().strip()
     except OSError:
         return None
-
 
 def _avfoundation_camera_names() -> dict[str, str]:
     """Return camera names on macOS using ffmpeg/avfoundation, if available."""
@@ -284,7 +282,6 @@ def load_saved_devices() -> Tuple[int|None,int|None,int|None]:
             return None,None,None
     return None,None,None
 
-
 def _persist_devices(camera: int | None, mic: int | None, speaker: int | None) -> None:
     try:
         _DEVICES_JSON.write_text(
@@ -299,7 +296,6 @@ def _persist_devices(camera: int | None, mic: int | None, speaker: int | None) -
         )
     except Exception:
         pass
-
 
 def parse_device_command(text: str) -> tuple[str, int] | None:
     m = _DEVICE_CMD_RE.search(text)
@@ -321,6 +317,11 @@ def parse_device_command(text: str) -> tuple[str, int] | None:
     else:
         kind = "speaker"
     return kind, idx
+
+# ---- Echo suppression helper ----
+def _norm_text_for_echo(s: str) -> str:
+    """Normalize text for simple echo suppression (lowercase, strip punctuation/extra spaces)."""
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", s.lower())).strip()
 
 # ---- Voice embedding model (for identity) ----
 class SpeakerEmbed:
@@ -654,6 +655,10 @@ async def run() -> bool:
     forced_done = False
     auto_registered_name: str | None = None
 
+    # Echo suppression state
+    last_ai_text_norm: str | None = None
+    last_ai_time: float = 0.0
+
     try:
         while not stop.is_set():
             # manual keys
@@ -681,10 +686,26 @@ async def run() -> bool:
             if handled_manual: continue
 
             # next transcript
-            try: transcript = await asyncio.wait_for(asyncio.shield(mic_task), timeout=0.2)
-            except asyncio.TimeoutError: continue
-            except StopAsyncIteration: stop.set(); break
+            try:
+                transcript = await asyncio.wait_for(asyncio.shield(mic_task), timeout=0.2)
+            except asyncio.TimeoutError:
+                continue
+            except StopAsyncIteration:
+                stop.set(); break
             mic_task = asyncio.create_task(mic.__anext__())
+
+            # Echo suppression: ignore transcripts that exactly match last AI reply
+            norm_transcript = _norm_text_for_echo(transcript)
+            now = loop.time()
+            if (
+                last_ai_text_norm
+                and norm_transcript == last_ai_text_norm
+                and (now - last_ai_time) < 5.0
+            ):
+                if verbose:
+                    print(f"[echo-suppress] ignoring transcript matching last AI reply: {transcript!r}")
+                continue
+
             print(f"YOU: {transcript}")
 
             if _HELP_RE.search(transcript):
@@ -823,6 +844,13 @@ async def run() -> bool:
 
             ai_text = body.get("text", "")
             print(f"AI:  {ai_text}")
+
+            # update echo suppression state
+            if ai_text:
+                last_ai_text_norm = _norm_text_for_echo(ai_text)
+                last_ai_time = loop.time()
+            else:
+                last_ai_text_norm = None
 
             cmd_spec = body.get("command")
             if isinstance(cmd_spec, dict):
