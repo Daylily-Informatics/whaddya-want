@@ -68,7 +68,7 @@ def _bytes_to_float_mono_int16(data: bytes, channels: int) -> np.ndarray:
     return arr.astype(np.float32) / 32768.0
 
 async def stream_microphone(*, region: str, language_code="en-US", sample_rate=16000, channels=1,
-                            blocksize=4096, input_device: int|None=None,
+                            blocksize=1024, input_device: int|None=None,
                             analysis_buf: deque|None=None, mute_event: threading.Event|None=None,
                             verbose=False) -> AsyncGenerator[str, None]:
     client = TranscribeStreamingClient(region=region)
@@ -76,8 +76,8 @@ async def stream_microphone(*, region: str, language_code="en-US", sample_rate=1
         language_code=language_code, media_sample_rate_hz=sample_rate, media_encoding="pcm",
     )
     loop = asyncio.get_running_loop()
-    raw_q: queue.Queue[bytes] = queue.Queue(maxsize=100)
-    async_q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=100)
+    raw_q: queue.Queue[bytes] = queue.Queue(maxsize=20)
+    async_q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=20)
     def audio_cb(indata, frames, time_info, status):
         if status and verbose:
             print(status, file=sys.stderr)
@@ -90,10 +90,15 @@ async def stream_microphone(*, region: str, language_code="en-US", sample_rate=1
                 analysis_buf.extend(fmono.tolist())
             raw_q.put_nowait(raw)
         except queue.Full:
-            pass
+            try:
+                _ = raw_q.get_nowait()
+                raw_q.put_nowait(raw)
+            except queue.Empty:
+                pass
     def mic_thread():
         with sd.RawInputStream(samplerate=sample_rate, blocksize=blocksize, dtype="int16",
-                               channels=channels, device=input_device, callback=audio_cb):
+                               channels=channels, device=input_device, callback=audio_cb,
+                               latency="low"):
             while True:
                 chunk = raw_q.get()
                 loop.call_soon_threadsafe(async_q.put_nowait, chunk)
