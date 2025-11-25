@@ -243,14 +243,38 @@ def main():
                     kind, val = events.get_nowait()
                     if kind=="cmd":
                         if val=="exit":
-                            say_via_broker_sync(args.broker_url, args.session, "Exiting monitor.", args.voice, args.voice_mode, player, playback_mute)
+                            say_via_broker_sync(
+                                broker_url=args.broker_url,
+                                session_id=args.session,
+                                text="Exiting monitor.",
+                                voice_id=args.voice,
+                                voice_mode=args.voice_mode,
+                                player=player,
+                                playback_mute=playback_mute,
+                            )
                             return
                         elif val=="pause":
                             state["paused"]=True
-                            say_via_broker_sync(args.broker_url, args.session, "Paused detection.", args.voice, args.voice_mode, player, playback_mute)
+                            say_via_broker_sync(
+                                broker_url=args.broker_url,
+                                session_id=args.session,
+                                text="Paused detection.",
+                                voice_id=args.voice,
+                                voice_mode=args.voice_mode,
+                                player=player,
+                                playback_mute=playback_mute,
+                            )
                         elif val=="resume":
                             state["paused"]=False
-                            say_via_broker_sync(args.broker_url, args.session, "Resumed detection.", args.voice, args.voice_mode, player, playback_mute)
+                            say_via_broker_sync(
+                                broker_url=args.broker_url,
+                                session_id=args.session,
+                                text="Resumed detection.",
+                                voice_id=args.voice,
+                                voice_mode=args.voice_mode,
+                                player=player,
+                                playback_mute=playback_mute,
+                            )
             except queue.Empty:
                 pass
 
@@ -301,10 +325,14 @@ def main():
                         flush=True,
                     )
                     say_via_broker_sync(
-                                            args.broker_url, args.session,
-                                            "Ahoy! I don't know you yet. Please tell me your name.",
-                                            args.voice, args.voice_mode, player, playback_mute
-                                        )
+                        broker_url=args.broker_url,
+                        session_id=args.session,
+                        text="Ahoy! I don't know you yet. Please tell me your name.",
+                        voice_id=args.voice,
+                        voice_mode=args.voice_mode,
+                        player=player,
+                        playback_mute=playback_mute,
+                    )
 
                     if (now_ts - last_entry_ts) >= args.entry_cooldown_s and (not had_any or absent_ok):
                         last_entry_ts=now_ts; had_any=True
@@ -325,9 +353,13 @@ def main():
                                     else:
                                         # Unknown person → ask name, capture, enroll face
                                         say_via_broker_sync(
-                                            args.broker_url, args.session,
-                                            "Ahoy! I don't know you yet. Please tell me your name.",
-                                            args.voice, args.voice_mode, player, playback_mute
+                                            broker_url=args.broker_url,
+                                            session_id=args.session,
+                                            text="Ahoy! I don't know you yet. Please tell me your name.",
+                                            voice_id=args.voice,
+                                            voice_mode=args.voice_mode,
+                                            player=player,
+                                            playback_mute=playback_mute,
                                         )
                                         nm = listen_for_name(mic_idx, timeout_s=7.0)
                                         if nm:
@@ -349,14 +381,30 @@ def main():
                                 names.append(who)
                             else:
                                 prompt = f"Hello {et}. I don't know your name yet. What should I call you?"
-                                say_via_broker_sync(args.broker_url, args.session, prompt, args.voice, args.voice_mode, player, playback_mute)
+                                say_via_broker_sync(
+                                    broker_url=args.broker_url,
+                                    session_id=args.session,
+                                    text=prompt,
+                                    voice_id=args.voice,
+                                    voice_mode=args.voice_mode,
+                                    player=player,
+                                    playback_mute=playback_mute,
+                                )
                                 nm = listen_for_name(mic_idx, timeout_s=7.0)
                                 if nm:
                                     identity.enroll_animal(nm, et, sig)
                                     names.append(nm)
 
                         greet = "Ahoy " + ", ".join(sorted(set(names))) if names else "Ahoy!"
-                        say_via_broker_sync(args.broker_url, args.session, greet, args.voice, args.voice_mode, player, playback_mute)
+                        say_via_broker_sync(
+                            broker_url=args.broker_url,
+                            session_id=args.session,
+                            text=greet,
+                            voice_id=args.voice,
+                            voice_mode=args.voice_mode,
+                            player=player,
+                            playback_mute=playback_mute,
+                        )
 
                 prev_qualified = qualified
 
