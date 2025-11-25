@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, asyncio, contextlib, io, json, os, queue, re, signal, sys, traceback, threading, uuid, warnings
+import argparse, asyncio, contextlib, io, json, os, queue, re, signal, subprocess, sys, traceback, threading, uuid, warnings
 from collections import deque
 from pathlib import Path
 from typing import AsyncGenerator, Optional, Tuple, Dict, Any
@@ -175,8 +175,39 @@ def _camera_device_name(idx: int) -> Optional[str]:
     except OSError:
         return None
 
+
+def _avfoundation_camera_names() -> dict[str, str]:
+    """Return camera names on macOS using ffmpeg/avfoundation, if available."""
+    if sys.platform != "darwin":
+        return {}
+    try:
+        # ffmpeg prints avfoundation devices to stderr
+        proc = subprocess.run(
+            ["ffmpeg", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return {}
+
+    names: dict[str, str] = {}
+    collecting = False
+    for line in (proc.stderr or "").splitlines():
+        if "AVFoundation video devices" in line:
+            collecting = True
+            continue
+        if collecting:
+            m = re.search(r"\[(\d+)\]\s+(.*)", line)
+            if m:
+                names[m.group(1)] = m.group(2).strip()
+            elif line.strip() == "":
+                break
+    return names
+
 def _detect_cameras(max_index: int = 10) -> list[dict]:
     import cv2
+    friendly_names = _avfoundation_camera_names()
     found=[]
     for idx in range(max_index):
         cap = cv2.VideoCapture(idx)
@@ -185,7 +216,7 @@ def _detect_cameras(max_index: int = 10) -> list[dict]:
             ret,_ = cap.read()
             cap.release()
             if ret:
-                name = _camera_device_name(idx)
+                name = friendly_names.get(str(idx)) or _camera_device_name(idx)
                 label = name or f"Camera {idx}"
                 found.append({"index": str(idx), "label": label})
         elif cap is not None:
