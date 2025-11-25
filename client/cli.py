@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 import argparse, asyncio, contextlib, io, json, os, queue, re, signal, subprocess, sys, traceback, threading, uuid, warnings
+from dataclasses import replace
 from collections import deque
 from pathlib import Path
 from typing import AsyncGenerator, Optional, Tuple, Dict, Any
@@ -17,7 +18,7 @@ from amazon_transcribe.model import TranscriptResultStream
 
 # Shared identity + audio
 from client import identity
-from client import monitor as monitor_module
+from client.monitor_controller import MonitorConfig, MonitorController
 from client.shared_audio import AudioPlayer, speak_via_broker, get_shared_audio
 
 # ---- Speaker embedding (SpeechBrain) ----
@@ -367,6 +368,7 @@ async def run() -> bool:
     ap.add_argument("--text-only", action="store_true", help="Request text-only responses from the broker")
     ap.add_argument("--save-audio", action="store_true")
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--auto-start-monitor", action="store_true", help="Launch the monitor automatically after the greeting")
     ap.add_argument(
         "--self-voice-name",
         type=str,
@@ -453,52 +455,40 @@ async def run() -> bool:
     intro_text = (
         "Hello, I'm Marvin. Say 'marvin help' any time to hear the available commands."
     )
+    intro_sent = False
     if not spk_embed.enabled:
         print(
             "[identity] Speaker embedding model unavailable; voice identification and auto-registration are disabled.",
             file=sys.stderr,
         )
 
-    monitor_thread: threading.Thread | None = None
-    monitor_stop: threading.Event | None = None
+    monitor_controller = MonitorController(player, playback_mute)
+    monitor_config = MonitorConfig(
+        broker_url=args.broker_url,
+        session=args.session,
+        voice_id=voice_id,
+        voice_mode=args.voice_mode,
+        camera_index=cam_idx if cam_idx is not None else 0,
+        mic_index=mic_idx,
+        speaker_index=spk_idx,
+    )
+    monitor_controller.configure(monitor_config)
+
     mic: AsyncGenerator[str, None] | None = None
     mic_task: asyncio.Task[str] | None = None
 
+    def _update_monitor_config(**changes):
+        nonlocal monitor_config
+        monitor_config = replace(monitor_config, **changes)
+        monitor_controller.configure(monitor_config)
+
     def _stop_monitor():
-        nonlocal monitor_thread, monitor_stop
-        if monitor_thread is None:
-            return
-        if monitor_stop is not None:
-            monitor_stop.set()
-        monitor_thread.join(timeout=5)
-        monitor_thread = None
-        monitor_stop = None
+        monitor_controller.stop()
 
     def _launch_monitor():
-        nonlocal monitor_thread, monitor_stop
-        _stop_monitor()
-        monitor_stop = threading.Event()
         try:
-            monitor_thread = threading.Thread(
-                target=monitor_module.start_monitor,
-                kwargs=dict(
-                    broker_url=args.broker_url,
-                    session=args.session,
-                    voice=voice_id or "",
-                    voice_mode=args.voice_mode,
-                    camera_index=cam_idx if cam_idx is not None else 0,
-                    mic_index=mic_idx if mic_idx is not None else -1,
-                    speaker_index=spk_idx if spk_idx is not None else -1,
-                    stop_event=monitor_stop,
-                    player=player,
-                    playback_mute=playback_mute,
-                ),
-                daemon=True,
-            )
-            monitor_thread.start()
-            print("[monitor] started (press 'q' in its window to quit).")
+            monitor_controller.launch(monitor_config)
         except Exception as e:
-            monitor_stop = None
             print(f"[monitor error] {e}", file=sys.stderr)
 
     print(f"AI:  {intro_text}")
@@ -516,6 +506,9 @@ async def run() -> bool:
         verbose=verbose,
         barge_monitor=None,
     )
+    intro_sent = True
+    if args.auto_start_monitor:
+        _launch_monitor()
 
     def _start_microphone(new_idx: int | None):
         nonlocal mic, mic_task, mic_idx
@@ -557,6 +550,7 @@ async def run() -> bool:
         except Exception:
             pass
         _persist_devices(cam_idx, mic_idx, spk_idx)
+        _update_monitor_config(mic_index=mic_idx)
         print(f"[voice] microphone switched to index {mic_idx}.")
         return True
 
@@ -577,6 +571,7 @@ async def run() -> bool:
         except Exception:
             pass
         _persist_devices(cam_idx, mic_idx, spk_idx)
+        _update_monitor_config(speaker_index=spk_idx)
         print(f"[voice] speaker switched to index {spk_idx}.")
         return True
 
@@ -618,6 +613,7 @@ async def run() -> bool:
             if kind == "camera":
                 cam_idx = idx
                 _persist_devices(cam_idx, mic_idx, spk_idx)
+                _update_monitor_config(camera_index=cam_idx)
                 print(f"[voice] camera switched to index {cam_idx} (via command).")
                 return
             elif kind == "microphone":
@@ -747,6 +743,7 @@ async def run() -> bool:
                 if kind == "camera":
                     cam_idx = idx
                     _persist_devices(cam_idx, mic_idx, spk_idx)
+                    _update_monitor_config(camera_index=cam_idx)
                     print(f"[voice] camera switched to index {cam_idx}.")
                 elif kind == "microphone":
                     await _switch_microphone(idx)
@@ -766,7 +763,7 @@ async def run() -> bool:
 
             # build context with voice ID from shared registry
             wav_id = take_latest_seconds(analysis_buf, args.id_window, args.rate)
-            context: Dict[str, Any] = {}
+            context: Dict[str, Any] = {"intro_already_sent": intro_sent}
             is_self_voice = False
             if wav_id is not None:
                 if not spk_embed.enabled:
@@ -818,6 +815,8 @@ async def run() -> bool:
                 verbose=verbose,
                 barge_monitor=None if args.text_only else _barge_monitor,
             )
+
+            intro_sent = True
 
             if not body:
                 continue
