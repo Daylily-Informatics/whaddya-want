@@ -166,6 +166,13 @@ def take_latest_seconds(buf: deque, seconds: float, rate: int) -> Optional[np.nd
     return arr / mx
 
 # ---- Device helpers ----
+def _camera_device_name(idx: int) -> Optional[str]:
+    sysfs_name = Path(f"/sys/class/video4linux/video{idx}/name")
+    try:
+        return sysfs_name.read_text().strip()
+    except OSError:
+        return None
+
 def _detect_cameras(max_index: int = 10) -> list[dict]:
     import cv2
     found=[]
@@ -175,7 +182,10 @@ def _detect_cameras(max_index: int = 10) -> list[dict]:
         if ok:
             ret,_ = cap.read()
             cap.release()
-            if ret: found.append({"index": str(idx), "label": f"Camera {idx}"})
+            if ret:
+                name = _camera_device_name(idx)
+                label = name or f"Camera {idx}"
+                found.append({"index": str(idx), "label": label})
         elif cap is not None:
             cap.release()
     return found
