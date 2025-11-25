@@ -143,6 +143,56 @@ def parse_args():
     p.add_argument("--animal-match-thresh", type=float, default=0.22)
     return p.parse_args()
 
+def build_args(*, broker_url: str, session: str, voice: str | None = None,
+               voice_mode: str = "standard", camera_index: int | None = None,
+               mic_index: int | None = None, speaker_index: int | None = None,
+               person_conf: float = 0.40, animal_conf: float = 0.40,
+               min_area_frac: float = 0.005, persist_frames: int = 1,
+               entry_cooldown_s: float = 1.0, roi: str = "0,0,1,1",
+               animal_match_thresh: float = 0.22):
+    return argparse.Namespace(
+        broker_url=broker_url,
+        session=session,
+        voice=voice or os.getenv("POLLY_VOICE") or "Joanna",
+        voice_mode=voice_mode,
+        camera_index=camera_index,
+        mic_index=mic_index,
+        speaker_index=speaker_index,
+        person_conf=person_conf,
+        animal_conf=animal_conf,
+        min_area_frac=min_area_frac,
+        persist_frames=persist_frames,
+        entry_cooldown_s=entry_cooldown_s,
+        roi=roi,
+        animal_match_thresh=animal_match_thresh,
+    )
+
+def start_monitor(*, broker_url: str, session: str, voice: str | None = None,
+                  voice_mode: str = "standard", camera_index: int | None = None,
+                  mic_index: int | None = None, speaker_index: int | None = None,
+                  person_conf: float = 0.40, animal_conf: float = 0.40,
+                  min_area_frac: float = 0.005, persist_frames: int = 1,
+                  entry_cooldown_s: float = 1.0, roi: str = "0,0,1,1",
+                  animal_match_thresh: float = 0.22,
+                  stop_event: threading.Event | None = None):
+    args = build_args(
+        broker_url=broker_url,
+        session=session,
+        voice=voice,
+        voice_mode=voice_mode,
+        camera_index=camera_index,
+        mic_index=mic_index,
+        speaker_index=speaker_index,
+        person_conf=person_conf,
+        animal_conf=animal_conf,
+        min_area_frac=min_area_frac,
+        persist_frames=persist_frames,
+        entry_cooldown_s=entry_cooldown_s,
+        roi=roi,
+        animal_match_thresh=animal_match_thresh,
+    )
+    return run_monitor(args, stop_event=stop_event)
+
 def _parse_roi(s: str):
     try:
         x1,y1,x2,y2=[float(v) for v in s.split(",")]
@@ -196,8 +246,7 @@ def listen_for_name(mic_device: int|None, timeout_s: float=7.0) -> str|None:
     return None
 
 # ---------- Main ----------
-def main():
-    args = parse_args()
+def run_monitor(args, stop_event: threading.Event | None = None):
     cam_s, mic_s, spk_s = load_saved_devices()
     cam_idx = args.camera_index if args.camera_index is not None else (cam_s if cam_s is not None else 0)
     mic_idx = args.mic_index if args.mic_index is not None else mic_s
@@ -208,16 +257,17 @@ def main():
     except Exception:
         pass
 
+    stop_signal = stop_event or threading.Event()
+
     # Audio player (Polly mp3 from broker)
     playback_mute = threading.Event()
     player = AudioPlayer(mute_guard=playback_mute)
 
     # Threads
     events: "queue.Queue[tuple]" = queue.Queue()
-    stop_ev = threading.Event()
     threading.Thread(
         target=asr_listener,
-        args=(events, stop_ev, mic_idx, playback_mute),
+        args=(events, stop_signal, mic_idx, playback_mute),
         daemon=True,
     ).start()
 
@@ -237,6 +287,9 @@ def main():
 
     try:
         while True:
+            if stop_signal.is_set():
+                break
+
             # Commands
             try:
                 while True:
@@ -252,7 +305,8 @@ def main():
                                 player=player,
                                 playback_mute=playback_mute,
                             )
-                            return
+                            stop_signal.set()
+                            break
                         elif val=="pause":
                             state["paused"]=True
                             say_via_broker_sync(
@@ -277,6 +331,9 @@ def main():
                             )
             except queue.Empty:
                 pass
+
+            if stop_signal.is_set():
+                break
 
             ret, frame = cap.read()
             if not ret: print("[monitor] frame grab failed"); break
@@ -409,16 +466,22 @@ def main():
                 prev_qualified = qualified
 
             cv2.imshow("Marvin Monitor (press q to quit)", frame)
-            if (cv2.waitKey(1) & 0xff)==ord('q'): break
+            if (cv2.waitKey(1) & 0xff)==ord('q'):
+                break
 
     finally:
-        stop_ev.set()
+        stop_signal.set()
         try: cap.release()
         except Exception: pass
         try: cv2.destroyAllWindows()
         except Exception: pass
         try: sd.stop()
         except Exception: pass
+
+
+def main():
+    args = parse_args()
+    run_monitor(args)
 
 if __name__=="__main__":
     main()

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, asyncio, contextlib, io, json, os, queue, re, signal, sys, traceback, threading, uuid, warnings, subprocess
+import argparse, asyncio, contextlib, io, json, os, queue, re, signal, sys, traceback, threading, uuid, warnings
 from collections import deque
 from pathlib import Path
 from typing import AsyncGenerator, Optional, Tuple, Dict, Any
@@ -17,6 +17,7 @@ from amazon_transcribe.model import TranscriptResultStream
 
 # Shared identity + audio
 from client import identity
+from client import monitor as monitor_module
 from client.shared_audio import AudioPlayer, speak_via_broker
 
 # ---- Speaker embedding (SpeechBrain) ----
@@ -428,45 +429,44 @@ async def run() -> bool:
             file=sys.stderr,
         )
 
-    monitor_proc: subprocess.Popen | None = None
+    monitor_thread: threading.Thread | None = None
+    monitor_stop: threading.Event | None = None
     mic: AsyncGenerator[str, None] | None = None
     mic_task: asyncio.Task[str] | None = None
 
     def _stop_monitor():
-        nonlocal monitor_proc
-        if monitor_proc is None:
+        nonlocal monitor_thread, monitor_stop
+        if monitor_thread is None:
             return
-        if monitor_proc.poll() is None:
-            monitor_proc.terminate()
-            try:
-                monitor_proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                monitor_proc.kill()
-        monitor_proc = None
+        if monitor_stop is not None:
+            monitor_stop.set()
+        monitor_thread.join(timeout=5)
+        monitor_thread = None
+        monitor_stop = None
 
     def _launch_monitor():
-        nonlocal monitor_proc
+        nonlocal monitor_thread, monitor_stop
         _stop_monitor()
-        cmd = [
-            sys.executable,
-            "-m",
-            "client.monitor",
-            "--broker-url",
-            args.broker_url,
-            "--session",
-            args.session,
-            "--voice",
-            (voice_id or ""),
-            "--voice-mode",
-            args.voice_mode,
-            f"--camera-index={cam_idx if cam_idx is not None else 0}",
-            f"--mic-index={mic_idx if mic_idx is not None else -1}",
-            f"--speaker-index={spk_idx if spk_idx is not None else -1}",
-        ]
+        monitor_stop = threading.Event()
         try:
-            monitor_proc = subprocess.Popen(cmd, stdout=None, stderr=None, close_fds=True)
+            monitor_thread = threading.Thread(
+                target=monitor_module.start_monitor,
+                kwargs=dict(
+                    broker_url=args.broker_url,
+                    session=args.session,
+                    voice=voice_id or "",
+                    voice_mode=args.voice_mode,
+                    camera_index=cam_idx if cam_idx is not None else 0,
+                    mic_index=mic_idx if mic_idx is not None else -1,
+                    speaker_index=spk_idx if spk_idx is not None else -1,
+                    stop_event=monitor_stop,
+                ),
+                daemon=True,
+            )
+            monitor_thread.start()
             print("[monitor] started (press 'q' in its window to quit).")
         except Exception as e:
+            monitor_stop = None
             print(f"[monitor error] {e}", file=sys.stderr)
 
     print(f"AI:  {intro_text}")
