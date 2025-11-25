@@ -167,14 +167,26 @@ def build_args(*, broker_url: str, session: str, voice: str | None = None,
         animal_match_thresh=animal_match_thresh,
     )
 
-def start_monitor(*, broker_url: str, session: str, voice: str | None = None,
-                  voice_mode: str = "standard", camera_index: int | None = None,
-                  mic_index: int | None = None, speaker_index: int | None = None,
-                  person_conf: float = 0.40, animal_conf: float = 0.40,
-                  min_area_frac: float = 0.005, persist_frames: int = 1,
-                  entry_cooldown_s: float = 1.0, roi: str = "0,0,1,1",
-                  animal_match_thresh: float = 0.22,
-                  stop_event: threading.Event | None = None):
+def start_monitor(
+    *,
+    broker_url: str,
+    session: str,
+    voice: str | None = None,
+    voice_mode: str = "standard",
+    camera_index: int | None = None,
+    mic_index: int | None = None,
+    speaker_index: int | None = None,
+    person_conf: float = 0.40,
+    animal_conf: float = 0.40,
+    min_area_frac: float = 0.005,
+    persist_frames: int = 1,
+    entry_cooldown_s: float = 1.0,
+    roi: str = "0,0,1,1",
+    animal_match_thresh: float = 0.22,
+    stop_event: threading.Event | None = None,
+    player: AudioPlayer | None = None,
+    playback_mute: threading.Event | None = None,
+):
     args = build_args(
         broker_url=broker_url,
         session=session,
@@ -191,7 +203,7 @@ def start_monitor(*, broker_url: str, session: str, voice: str | None = None,
         roi=roi,
         animal_match_thresh=animal_match_thresh,
     )
-    return run_monitor(args, stop_event=stop_event)
+    return run_monitor(args, stop_event=stop_event, player=player, playback_mute=playback_mute)
 
 def _parse_roi(s: str):
     try:
@@ -246,7 +258,12 @@ def listen_for_name(mic_device: int|None, timeout_s: float=7.0) -> str|None:
     return None
 
 # ---------- Main ----------
-def run_monitor(args, stop_event: threading.Event | None = None):
+def run_monitor(
+    args,
+    stop_event: threading.Event | None = None,
+    player: AudioPlayer | None = None,
+    playback_mute: threading.Event | None = None,
+):
     cam_s, mic_s, spk_s = load_saved_devices()
     cam_idx = args.camera_index if args.camera_index is not None else (cam_s if cam_s is not None else 0)
     mic_idx = args.mic_index if args.mic_index is not None else mic_s
@@ -260,8 +277,10 @@ def run_monitor(args, stop_event: threading.Event | None = None):
     stop_signal = stop_event or threading.Event()
 
     # Audio player (Polly mp3 from broker)
-    playback_mute = threading.Event()
-    player = AudioPlayer(mute_guard=playback_mute)
+    if playback_mute is None:
+        playback_mute = threading.Event()
+    if player is None:
+        player = AudioPlayer(mute_guard=playback_mute)
 
     # Threads
     events: "queue.Queue[tuple]" = queue.Queue()
@@ -389,15 +408,6 @@ def run_monitor(args, stop_event: threading.Event | None = None):
                          " had any =", had_any, ".... absent_ok =", absent_ok, "....",
                         flush=True,
                     )
-                    say_via_broker_sync(
-                        broker_url=args.broker_url,
-                        session_id=args.session,
-                        text="Ahoy! I don't know you yet. Please tell me your name.",
-                        voice_id=args.voice,
-                        voice_mode=args.voice_mode,
-                        player=player,
-                        playback_mute=playback_mute,
-                    )
 
                     if (now_ts - last_entry_ts) >= args.entry_cooldown_s and (not had_any or absent_ok):
                         last_entry_ts=now_ts; had_any=True
@@ -420,7 +430,7 @@ def run_monitor(args, stop_event: threading.Event | None = None):
                                         say_via_broker_sync(
                                             broker_url=args.broker_url,
                                             session_id=args.session,
-                                            text="Ahoy! I don't know you yet. Please tell me your name.",
+                                            text="I see someone I don't recognize yet. What should I call you?",
                                             voice_id=args.voice,
                                             voice_mode=args.voice_mode,
                                             player=player,

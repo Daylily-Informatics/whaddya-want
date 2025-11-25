@@ -491,6 +491,8 @@ async def run() -> bool:
                     mic_index=mic_idx if mic_idx is not None else -1,
                     speaker_index=spk_idx if spk_idx is not None else -1,
                     stop_event=monitor_stop,
+                    player=player,
+                    playback_mute=playback_mute,
                 ),
                 daemon=True,
             )
