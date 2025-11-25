@@ -5,7 +5,7 @@ if __package__ is None or __package__ == "":
     import sys as _sys, pathlib as _pathlib
     _sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parents[1]))
 
-import argparse, json, os, sys, time, queue, re, threading, base64, asyncio
+import argparse, json, os, sys, time, queue, re, threading, base64, asyncio, hashlib
 from pathlib import Path
 from typing import Tuple
 
@@ -257,6 +257,17 @@ def listen_for_name(mic_device: int|None, timeout_s: float=7.0) -> str|None:
         return _extract_name_freeform(" ".join(got))
     return None
 
+
+def _unknown_key(person: dict) -> str:
+    enc = person.get("encoding") if isinstance(person, dict) else None
+    if enc is None:
+        return "unknown_person_generic"
+    try:
+        data = np.asarray(enc, dtype=np.float32).tobytes()
+    except Exception:
+        return "unknown_person_generic"
+    return hashlib.sha1(data).hexdigest()
+
 # ---------- Main ----------
 def run_monitor(
     args,
@@ -323,6 +334,7 @@ def run_monitor(
     state={"paused": False}
     presence_last_seen: dict[str, float] = {}
     last_spoken: dict[str, float] = {}
+    unknown_prompted: set[str] = set()
 
     def _should_announce(label: str, *, now_mono: float, absent_ok: bool) -> bool:
         """Gate announcements so we only speak on meaningful arrivals."""
@@ -349,6 +361,7 @@ def run_monitor(
                                 text="Exiting monitor.",
                                 voice_id=args.voice,
                                 voice_mode=args.voice_mode,
+                                context={"intro_already_sent": True},
                                 player=player,
                                 playback_mute=playback_mute,
                             )
@@ -362,6 +375,7 @@ def run_monitor(
                                 text="Paused detection.",
                                 voice_id=args.voice,
                                 voice_mode=args.voice_mode,
+                                context={"intro_already_sent": True},
                                 player=player,
                                 playback_mute=playback_mute,
                             )
@@ -373,6 +387,7 @@ def run_monitor(
                                 text="Resumed detection.",
                                 voice_id=args.voice,
                                 voice_mode=args.voice_mode,
+                                context={"intro_already_sent": True},
                                 player=player,
                                 playback_mute=playback_mute,
                             )
@@ -471,24 +486,35 @@ def run_monitor(
                             elif _should_announce("unknown_person", now_mono=now_mono, absent_ok=absent_ok):
                                 unknown_people.append({"encoding": None})
 
-                        if unknown_people and _should_announce("unknown_person", now_mono=now_mono, absent_ok=absent_ok):
-                            last_spoken["unknown_person"] = now_mono
-                            say_via_broker_sync(
-                                broker_url=args.broker_url,
-                                session_id=args.session,
-                                text="I see someone I don't recognize; what should I call you?",
-                                voice_id=args.voice,
-                                voice_mode=args.voice_mode,
-                                player=player,
-                                playback_mute=playback_mute,
-                            )
-                            nm = listen_for_name(mic_idx, timeout_s=7.0)
-                            if nm:
-                                enc = unknown_people[0].get("encoding") if unknown_people else None
-                                if enc is not None:
-                                    identity.enroll_face(nm, enc)
-                                pending_names.append(nm)
-                                presence_last_seen[nm] = now_mono
+                        if unknown_people:
+                            presence_last_seen["unknown_person"] = now_mono
+                            new_unknowns: list[tuple[str, dict]] = []
+                            for person in unknown_people:
+                                key = _unknown_key(person)
+                                if key not in unknown_prompted:
+                                    new_unknowns.append((key, person))
+
+                            if new_unknowns and _should_announce("unknown_person", now_mono=now_mono, absent_ok=absent_ok):
+                                key, first_unknown = new_unknowns[0]
+                                unknown_prompted.add(key)
+                                last_spoken["unknown_person"] = now_mono
+                                say_via_broker_sync(
+                                    broker_url=args.broker_url,
+                                    session_id=args.session,
+                                    text="I see someone I don't recognize; what should I call you?",
+                                    voice_id=args.voice,
+                                    voice_mode=args.voice_mode,
+                                    context={"intro_already_sent": True},
+                                    player=player,
+                                    playback_mute=playback_mute,
+                                )
+                                nm = listen_for_name(mic_idx, timeout_s=7.0)
+                                if nm:
+                                    enc = first_unknown.get("encoding") if first_unknown else None
+                                    if enc is not None:
+                                        identity.enroll_face(nm, enc)
+                                    pending_names.append(nm)
+                                    presence_last_seen[nm] = now_mono
 
                         # Animals
                         for et, (x1, y1, x2, y2) in ents:
@@ -512,6 +538,7 @@ def run_monitor(
                                         text=prompt,
                                         voice_id=args.voice,
                                         voice_mode=args.voice_mode,
+                                        context={"intro_already_sent": True},
                                         player=player,
                                         playback_mute=playback_mute,
                                     )
@@ -531,6 +558,7 @@ def run_monitor(
                                 text=greet,
                                 voice_id=args.voice,
                                 voice_mode=args.voice_mode,
+                                context={"intro_already_sent": True},
                                 player=player,
                                 playback_mute=playback_mute,
                             )
