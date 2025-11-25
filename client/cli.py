@@ -463,7 +463,7 @@ async def run() -> bool:
             file=sys.stderr,
         )
 
-    monitor_controller = MonitorController(player, playback_mute)
+    monitor_controller = MonitorController(player, playback_mute, loop)
     monitor_config = MonitorConfig(
         broker_url=args.broker_url,
         session=args.session,
