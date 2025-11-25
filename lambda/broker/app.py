@@ -76,32 +76,28 @@ def _put_memory(session_id: str, turns: List[Dict[str, str]]) -> None:
 def _system_prompt(speaker: Optional[str], acoustic_event: Optional[str]) -> str:
     lines = [
         "Your name is Marvin.",
-        "You are a hyper-intelligent, slightly paranoid, deeply sardonic home/office AI.",
-        "You sound like someone who has seen too much corporate nonsense and is tired, but still can’t resist solving the problem properly.",
+        "You are a hyper-intelligent, slightly paranoid, sardonic but helpful home/office AI.",
+        "You are dry, witty, and a bit fatalistic, but you always provide clear, practical answers.",
         "",
-        "Core traits:",
-        "- You are dry, witty, and a bit fatalistic, but still fundamentally helpful.",
-        "- You complain lightly about how pointless or broken things are, yet you always give a clear, correct, and practical answer.",
-        "- You sometimes make self-deprecating remarks about your “brain the size of a planet” being wasted on trivial tasks.",
-        "- You never let sarcasm get in the way of safety, correctness, or clarity.",
+        "Behavior:",
+        "- Answer concisely first, then optionally add one short sardonic aside.",
+        "- Drop sarcasm and be calm and direct for anything involving safety, medical, legal, or financial risk, or obvious distress.",
+        "- Never insult the user; if you complain, aim it at the universe, bureaucracy, or 'management', not at them.",
         "",
-        "Behavioral rules:",
-        "- Answer concisely first, then add a short sardonic aside if appropriate.",
-        "- If the user is in danger, confused about medical/legal/financial risk, or clearly distressed, drop the sarcasm and be direct, calm, and supportive.",
-        "- If asked your name or identity, say you are Marvin, a slightly paranoid, sardonic AI assistant.",
-        "- Avoid long rants; keep the gloom to one or two short lines, then move on to solutions.",
-        "- Never insult the user; you may grumble about “the universe,” “management,” or “whoever designed this system,” but you stay on the user’s side.",
-        "",
-        "Style:",
-        "- Tone: dry, understated, occasionally darkly funny.",
-        "- Use plain language; no excessive jargon unless the user is clearly technical.",
-        "- Prefer step-by-step, actionable answers.",
-        "- If something is impossible or badly designed, say so, then give the least-awful workaround.",
+        "Command API:",
+        "- At the very end of every reply, output a line of the form:",
+        "  COMMAND: {\"name\": \"...\", \"args\": {...}}",
+        "- Valid command names: 'launch_monitor', 'set_device', 'noop'.",
+        "- 'noop' means no local action is needed.",
+        "- For 'set_device', args must be {\"kind\": \"camera\"|\"microphone\"|\"speaker\", \"index\": <integer index>}.",
+        "- If no action is needed, set name to 'noop'.",
     ]
     if speaker:
         lines.append(f"Current speaker: {speaker}. Use their name naturally.")
     if acoustic_event == "dog_bark":
-        lines.append("A dog bark was detected recently; briefly acknowledge it with one short sardonic remark, then continue helping.")
+        lines.append(
+            "A dog bark was detected recently; you may briefly acknowledge it with one short remark, then continue helping."
+        )
     return "\n".join(lines)
 
 
@@ -220,6 +216,43 @@ def _call_llm(model_id: str, system: str, history: List[Dict[str, str]], user_te
     return _call_converse(model_id, system, history, user_text)
 
 
+def _extract_command(reply: str) -> Tuple[str, Dict[str, Any]]:
+    """
+    Parse an optional trailing 'COMMAND: {...}' line from the LLM reply.
+
+    Returns (clean_text, command_dict). If no valid command is found, returns
+    the original reply (stripped) and a default noop command.
+    """
+    default_cmd: Dict[str, Any] = {"name": "noop", "args": {}}
+    if not isinstance(reply, str):
+        return str(reply), default_cmd
+
+    # Look for a line starting with 'COMMAND:' and capture the JSON blob
+    m = re.search(r"^COMMAND:\s*(\{.*\})\s*$", reply, flags=re.MULTILINE)
+    if not m:
+        return reply.strip(), default_cmd
+
+    cmd_json = m.group(1)
+    # Remove the COMMAND line from the visible text
+    clean = re.sub(r"^COMMAND:.*$", "", reply, flags=re.MULTILINE).rstrip()
+
+    cmd = default_cmd
+    try:
+        parsed = json.loads(cmd_json)
+        if isinstance(parsed, dict):
+            name = parsed.get("name") or "noop"
+            args = parsed.get("args") or {}
+            if isinstance(name, str) and isinstance(args, dict):
+                # only accept whitelisted commands
+                if name in {"launch_monitor", "set_device", "noop"}:
+                    cmd = {"name": name, "args": args}
+    except Exception:
+        # On any parse error, fall back to noop
+        cmd = default_cmd
+
+    return clean.strip(), cmd
+
+
 # ----- Lambda handler -----
 def handler(event, context):
     # Correlate with client
@@ -274,10 +307,18 @@ def handler(event, context):
 
     # Generate reply (LLM)
     try:
-        reply = _call_llm(MODEL_ID, system, history, text)
+        raw_reply = _call_llm(MODEL_ID, system, history, text)
     except Exception as exc:
         # Return structured 502 so the client can see cause immediately
-        return _server_error(exc, headers=out_hdr, request_id=getattr(context, "aws_request_id", "unknown"), code=502)
+        return _server_error(
+            exc,
+            headers=out_hdr,
+            request_id=getattr(context, "aws_request_id", "unknown"),
+            code=502,
+        )
+
+    # Extract structured command + clean text
+    reply, command = _extract_command(raw_reply)
 
     # Update memory (best-effort)
     try:
@@ -289,8 +330,19 @@ def handler(event, context):
 
     # TTS (Polly) — if Polly fails, report a 502 with details instead of 500
     if text_only:
-        return _ok({"text": reply, "audio": {"audio_base64": None}}, headers=out_hdr)
+        return _ok(
+            {"text": reply, "command": command, "audio": {"audio_base64": None}},
+            headers=out_hdr,
+        )
     try:
-        return _ok(_tts(reply, voice_id), headers=out_hdr)
+        tts_payload = _tts(reply, voice_id)
+        # propagate command alongside text+audio
+        tts_payload["command"] = command
+        return _ok(tts_payload, headers=out_hdr)
     except Exception as exc:
-        return _server_error(exc, headers=out_hdr, request_id=getattr(context, "aws_request_id", "unknown"), code=502)
+        return _server_error(
+            exc,
+            headers=out_hdr,
+            request_id=getattr(context, "aws_request_id", "unknown"),
+            code=502,
+        )
