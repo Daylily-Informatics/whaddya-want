@@ -126,6 +126,7 @@ _ENROLL_RE = re.compile(
 _EXIT_RE = re.compile(r"\b(exit|quit|stop listening|goodbye|stop now)\b", re.I)
 _WAKE_RE = re.compile(r"\b(?:hey|ok|okay)\s+marvin\b", re.I)
 _MONITOR_RE = re.compile(r"^\s*marvin[, ]+monitor\b", re.I)
+_HELP_RE = re.compile(r"^\s*marvin[, ]+help\b", re.I)
 _DEVICE_CMD_RE = re.compile(
     r"""(?xi)
     \b(?:switch|change|set|use|select)\s+(?:the\s+)?
@@ -390,6 +391,14 @@ async def run():
 
     analysis_buf = deque(maxlen=int(args.rate * 6))
     spk_embed = SpeakerEmbed()
+    help_lines = [
+        "Say 'hey Marvin' or 'ok Marvin' to enable command mode for 8 seconds.",
+        "While command mode is active, say 'exit' to stop the client.",
+        "While command mode is active, say 'switch/change/set/use/select' the camera, microphone, or speaker to a device number.",
+        "Say 'marvin monitor' to launch the monitor window.",
+        "Say 'register/enroll my voice as <name>' or 'call me <name>' to save a voice profile.",
+        "Say 'marvin help' to hear this list again.",
+    ]
 
     async def _switch_microphone(new_idx: int) -> bool:
         nonlocal mic, mic_task, mic_idx
@@ -507,6 +516,27 @@ async def run():
             except StopAsyncIteration: stop.set(); break
             mic_task = asyncio.create_task(mic.__anext__())
             print(f"YOU: {transcript}")
+
+            if _HELP_RE.search(transcript):
+                print("[marvin help] Available commands:")
+                for line in help_lines:
+                    print(f"  - {line}")
+                help_text = "Here are the Marvin commands: " + " ".join(help_lines)
+                await speak_via_broker(
+                    broker_url=args.broker_url,
+                    session_id=args.session,
+                    text=help_text,
+                    voice_id=voice_id,
+                    voice_mode=args.voice_mode,
+                    player=player,
+                    playback_mute=playback_mute,
+                    context=None,
+                    text_only=args.text_only,
+                    timeout=30,
+                    verbose=verbose,
+                    barge_monitor=None,
+                )
+                continue
 
             # monitor trigger
             if _MONITOR_RE.search(transcript):
