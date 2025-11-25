@@ -158,6 +158,7 @@ _WAKE_RE = re.compile(r"\b(?:hey|ok|okay)\s+marvin\b", re.I)
 _MONITOR_RE = re.compile(r"^\s*marvin[, ]+monitor\b", re.I)
 _RESET_RE = re.compile(r"^\s*marvin[, ]+reset\b", re.I)
 _HELP_RE = re.compile(r"^\s*marvin[, ]+help\b", re.I)
+_WHOAMI_RE = re.compile(r"^\s*marvin[, ]+whoami\b", re.I)
 _DEVICE_CMD_RE = re.compile(
     r"""(?xi)
     \b(?:switch|change|set|use|select)\s+(?:the\s+)?
@@ -549,8 +550,12 @@ async def run() -> bool:
         "Say 'marvin reset' to close the monitor and restart the client.",
         "Say 'register my voice as <name>' or 'call me <name>' to save a voice profile.",
         "Say 'marvin help' to hear this list again.",
+        "Say 'marvin whoami' to have me guess your identity by voice and face.",
     ]
 
+    intro_text = (
+        "Hello, I'm Marvin. Say 'marvin help' any time to hear the available commands."
+    )
     intro_sent = False
     if not spk_embed.enabled:
         print(
@@ -614,6 +619,22 @@ async def run() -> bool:
         monitor_engine = None
         monitor_task = None
 
+    print(f"AI:  {intro_text}")
+    await speak_via_broker(
+        broker_url=args.broker_url,
+        session_id=args.session,
+        text=intro_text,
+        voice_id=voice_id,
+        voice_mode=args.voice_mode,
+        player=player,
+        playback_mute=playback_mute,
+        context=None,
+        text_only=args.text_only,
+        timeout=30,
+        verbose=verbose,
+        barge_monitor=None,
+    )
+    intro_sent = True
     if args.auto_start_monitor:
         await _start_monitor()
 
@@ -867,6 +888,55 @@ async def run() -> bool:
                 stop.set()
                 break
 
+            if _WHOAMI_RE.search(transcript):
+                # voice-based guess
+                voice_name = None
+                wav = take_latest_seconds(analysis_buf, args.id_window, args.rate)
+                if wav is not None and spk_embed.enabled:
+                    vec = spk_embed.embed(wav)
+                    if vec is not None:
+                        voice_name = identity.identify_voice(
+                            vec, threshold=args.id_threshold
+                        )
+
+                # face-based guess
+                face_name = None
+                if monitor_engine is not None:
+                    face_name = monitor_engine.identify_current_face_name()
+
+                print(
+                    f"[whoami] voice={voice_name or 'unknown'} "
+                    f"face={face_name or 'unknown'}"
+                )
+
+                if voice_name or face_name:
+                    vt = voice_name or "unknown"
+                    ft = face_name or "unknown"
+                    who_text = (
+                        f"By voice, I think you're {vt}. "
+                        f"By face, I think you're {ft}."
+                    )
+                else:
+                    who_text = (
+                        "I can't confidently identify you yet by voice or face."
+                    )
+
+                await speak_via_broker(
+                    broker_url=args.broker_url,
+                    session_id=args.session,
+                    text=who_text,
+                    voice_id=voice_id,
+                    voice_mode=args.voice_mode,
+                    player=player,
+                    playback_mute=playback_mute,
+                    context=None,
+                    text_only=args.text_only,
+                    timeout=30,
+                    verbose=verbose,
+                    barge_monitor=None,
+                )
+                continue
+
             now = loop.time()
             if _WAKE_RE.search(transcript):
                 cmd_window_until = now + 8.0
@@ -913,6 +983,11 @@ async def run() -> bool:
                 if monitor_engine is not None:
                     if monitor_engine.enroll_pending_face(name):
                         print(f"[enrolled face] {name}")
+                    else:
+                        print(
+                            "[enrolled face] no pending face to enroll "
+                            f"when registering {name}"
+                        )
 
             wav_id = take_latest_seconds(analysis_buf, args.id_window, args.rate)
             context: Dict[str, Any] = {"intro_already_sent": intro_sent}

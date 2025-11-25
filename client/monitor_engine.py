@@ -133,11 +133,12 @@ class MonitorConfig:
     voice_mode: str
     camera_index: int
     mic_index: Optional[int]
+    # detection thresholds
     person_conf: float = 0.55
-    animal_conf: float = 0.55
-    min_area_frac: float = 0.05
-    # require multiple frames with person before entry fires to reduce blur
-    persist_frames: int = 6
+    animal_conf: float = 0.50
+    min_area_frac: float = 0.005
+    # require a few frames with a person before firing entry
+    persist_frames: int = 3
     entry_cooldown_s: float = 5.0
     roi: str = "0,0,1,1"
     animal_match_thresh: float = 0.22
@@ -182,7 +183,7 @@ class MonitorEngine:
         self.display_id_labels: Dict[str, str] = {}
         self.stop_flag = False
 
-        # pending unknown face encoding waiting for a name from the user
+        # pending unknown face encoding waiting for a name
         self.pending_face_enc: Optional[np.ndarray] = None
 
     def _parse_roi(self, s: str) -> Tuple[float, float, float, float]:
@@ -225,12 +226,39 @@ class MonitorEngine:
         Called by the CLI when it successfully parses 'call me <name>' etc.
         """
         if self.pending_face_enc is None:
+            print("[monitor] enroll_pending_face: no pending face.")
             return False
         try:
             identity.enroll_face(name, self.pending_face_enc)
+            print(f"[monitor] enrolled pending face as {name}")
         finally:
             self.pending_face_enc = None
         return True
+
+    def identify_current_face_name(self) -> Optional[str]:
+        """
+        Try to identify the most prominent face in the recent frames.
+        Returns the name if recognized, or None.
+        """
+        if not _FACE_OK:
+            return None
+        id_frame_info: Optional[Dict[str, Any]] = None
+        for item in self.frame_buffer:
+            item_ents = item.get("ents") or []
+            if any(e == "person" for e, _ in item_ents):
+                if id_frame_info is None or item["sharpness"] > id_frame_info["sharpness"]:
+                    id_frame_info = item
+        if id_frame_info is None:
+            return None
+        frame = id_frame_info.get("frame")
+        if frame is None:
+            return None
+        faces = analyze_faces(frame)
+        for f in faces:
+            nm = f.get("name")
+            if nm:
+                return nm
+        return None
 
     async def step(self) -> None:
         if self.stop_flag:
@@ -404,12 +432,12 @@ class MonitorEngine:
                 detected_labels.add("unknown_person")
                 unknown_people.append({"encoding": None})
 
-        # stash first unknown face encoding so CLI can enroll it when it learns a name
-        if unknown_people and self.pending_face_enc is None:
+        if unknown_people:
             first = unknown_people[0]
             enc = first.get("encoding")
             if enc is not None:
                 self.pending_face_enc = np.asarray(enc, dtype=np.float32)
+                print("[monitor] stored pending unknown face encoding for enrollment")
 
         # Animals
         for et, (x1, y1, x2, y2) in id_ents:
