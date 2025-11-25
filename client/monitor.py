@@ -17,7 +17,7 @@ from vosk import Model, KaldiRecognizer
 import requests
 
 from client import identity
-from client.shared_audio import AudioPlayer, say_via_broker_sync
+from client.shared_audio import AudioPlayer, say_via_broker_sync, get_shared_audio
 
 # Paths & state
 STATE_DIR = Path(os.path.expanduser("~/.whaddya"))
@@ -276,11 +276,9 @@ def run_monitor(
 
     stop_signal = stop_event or threading.Event()
 
-    # Audio player (Polly mp3 from broker)
-    if playback_mute is None:
-        playback_mute = threading.Event()
-    if player is None:
-        player = AudioPlayer(mute_guard=playback_mute)
+    # Audio player (Polly mp3 from broker) — shared across the process
+    if playback_mute is None or player is None:
+        player, playback_mute = get_shared_audio()
 
     # Threads
     events: "queue.Queue[tuple]" = queue.Queue()
@@ -311,6 +309,16 @@ def run_monitor(
     last_entry_ts=0.0
     had_any=False
     state={"paused": False}
+    presence_last_seen: dict[str, float] = {}
+    last_spoken: dict[str, float] = {}
+
+    def _should_announce(label: str, *, now_mono: float, absent_ok: bool) -> bool:
+        """Gate announcements so we only speak on meaningful arrivals."""
+
+        last_seen = presence_last_seen.get(label)
+        recently_spoken = (now_mono - last_spoken.get(label, 0.0)) < args.entry_cooldown_s
+        recently_seen = last_seen is not None and (now_mono - last_seen) < REENTRY_ABSENCE_SEC
+        return not recently_spoken and (not recently_seen or absent_ok)
 
     try:
         while True:
@@ -389,6 +397,16 @@ def run_monitor(
                 qualified = present_frames >= args.persist_frames
                 absent_ok = (time.monotonic() - absence_start) >= REENTRY_ABSENCE_SEC
 
+                if ents:
+                    now_mono = time.monotonic()
+                    for et, _ in ents:
+                        presence_last_seen[et] = now_mono
+                else:
+                    # Clear presence cache after a brief absence so re-entries can trigger.
+                    stale = [k for k, v in presence_last_seen.items() if (time.monotonic() - v) >= REENTRY_ABSENCE_SEC]
+                    for k in stale:
+                        presence_last_seen.pop(k, None)
+
                 if qualified and not prev_qualified:
                     # DEBUG: did we ever actually fire an entry event?
                     print(
@@ -399,87 +417,111 @@ def run_monitor(
                         flush=True,
                     )
 
-                    now_ts=time.time()
+                    now_ts = time.time()
+                    now_mono = time.monotonic()
                     print(
                         "                    [monitor] ",
                         now_ts - last_entry_ts,
                         "s since last entry); ents =",
-                         args.entry_cooldown_s,
-                         " had any =", had_any, ".... absent_ok =", absent_ok, "....",
+                        args.entry_cooldown_s,
+                        " had any =",
+                        had_any,
+                        ".... absent_ok =",
+                        absent_ok,
+                        "....",
                         flush=True,
                     )
 
                     if (now_ts - last_entry_ts) >= args.entry_cooldown_s and (not had_any or absent_ok):
-                        last_entry_ts=now_ts; had_any=True
+                        last_entry_ts = now_ts
+                        had_any = True
                         # snapshot
                         try:
                             cv2.imwrite(str(IMAGES_DIR / f"entry_{time.strftime('%Y%m%d_%H%M%S')}.jpg"), frame)
                         except Exception:
                             pass
 
-                        # Identify persons
-                        names=[]
-                        if any(e=="person" for e,_ in ents):
-                            faces=analyze_faces(frame)
+                        pending_names: list[str] = []
+                        unknown_people: list[dict] = []
+
+                        # Identify persons (shared assistant session)
+                        if any(e == "person" for e, _ in ents):
+                            faces = analyze_faces(frame)
                             if faces:
                                 for f in faces:
-                                    if f["name"]:
-                                        names.append(f["name"])
-                                    else:
-                                        # Unknown person → ask name, capture, enroll face
-                                        say_via_broker_sync(
-                                            broker_url=args.broker_url,
-                                            session_id=args.session,
-                                            text="I see someone I don't recognize yet. What should I call you?",
-                                            voice_id=args.voice,
-                                            voice_mode=args.voice_mode,
-                                            player=player,
-                                            playback_mute=playback_mute,
-                                        )
-                                        nm = listen_for_name(mic_idx, timeout_s=7.0)
-                                        if nm:
-                                            identity.enroll_face(nm, f["encoding"])
-                                            names.append(nm)
-                                        else:
-                                            names.append("Friend")
-                            else:
-                                # No face encoding; generic
-                                names.append("Friend")
+                                    label = f["name"] or "unknown_person"
+                                    presence_last_seen[label] = now_mono
+                                    if f["name"] and _should_announce(label, now_mono=now_mono, absent_ok=absent_ok):
+                                        pending_names.append(f["name"])
+                                        last_spoken[label] = now_mono
+                                    elif not f["name"]:
+                                        unknown_people.append(f)
+                            elif _should_announce("unknown_person", now_mono=now_mono, absent_ok=absent_ok):
+                                unknown_people.append({"encoding": None})
+
+                        if unknown_people and _should_announce("unknown_person", now_mono=now_mono, absent_ok=absent_ok):
+                            last_spoken["unknown_person"] = now_mono
+                            say_via_broker_sync(
+                                broker_url=args.broker_url,
+                                session_id=args.session,
+                                text="I see someone I don't recognize; what should I call you?",
+                                voice_id=args.voice,
+                                voice_mode=args.voice_mode,
+                                player=player,
+                                playback_mute=playback_mute,
+                            )
+                            nm = listen_for_name(mic_idx, timeout_s=7.0)
+                            if nm:
+                                enc = unknown_people[0].get("encoding") if unknown_people else None
+                                if enc is not None:
+                                    identity.enroll_face(nm, enc)
+                                pending_names.append(nm)
+                                presence_last_seen[nm] = now_mono
 
                         # Animals
-                        for et,(x1,y1,x2,y2) in ents:
-                            if et=="person": continue
-                            roi_img = frame[max(0,y1):min(H,y2), max(0,x1):min(W,x2)]
+                        for et, (x1, y1, x2, y2) in ents:
+                            if et == "person":
+                                continue
+                            roi_img = frame[max(0, y1):min(H, y2), max(0, x1):min(W, x2)]
                             sig = compute_animal_signature(roi_img)
+                            label = f"unknown_{et}"
                             who = identity.identify_animal(et, sig, max_dist=args.animal_match_thresh)
                             if who:
-                                names.append(who)
+                                label = who
+                                if _should_announce(label, now_mono=now_mono, absent_ok=absent_ok):
+                                    pending_names.append(who)
+                                    last_spoken[label] = now_mono
                             else:
-                                prompt = f"Hello {et}. I don't know your name yet. What should I call you?"
-                                say_via_broker_sync(
-                                    broker_url=args.broker_url,
-                                    session_id=args.session,
-                                    text=prompt,
-                                    voice_id=args.voice,
-                                    voice_mode=args.voice_mode,
-                                    player=player,
-                                    playback_mute=playback_mute,
-                                )
-                                nm = listen_for_name(mic_idx, timeout_s=7.0)
-                                if nm:
-                                    identity.enroll_animal(nm, et, sig)
-                                    names.append(nm)
+                                if _should_announce(label, now_mono=now_mono, absent_ok=absent_ok):
+                                    prompt = f"I see a {et} I don't know yet. What should I call you?"
+                                    say_via_broker_sync(
+                                        broker_url=args.broker_url,
+                                        session_id=args.session,
+                                        text=prompt,
+                                        voice_id=args.voice,
+                                        voice_mode=args.voice_mode,
+                                        player=player,
+                                        playback_mute=playback_mute,
+                                    )
+                                    nm = listen_for_name(mic_idx, timeout_s=7.0)
+                                    if nm:
+                                        identity.enroll_animal(nm, et, sig)
+                                        pending_names.append(nm)
+                                        label = nm
+                                    last_spoken[label] = now_mono
+                            presence_last_seen[label] = now_mono
 
-                        greet = "Ahoy " + ", ".join(sorted(set(names))) if names else "Ahoy!"
-                        say_via_broker_sync(
-                            broker_url=args.broker_url,
-                            session_id=args.session,
-                            text=greet,
-                            voice_id=args.voice,
-                            voice_mode=args.voice_mode,
-                            player=player,
-                            playback_mute=playback_mute,
-                        )
+                        if pending_names:
+                            greet = "Ahoy " + ", ".join(sorted(set(pending_names)))
+                            say_via_broker_sync(
+                                broker_url=args.broker_url,
+                                session_id=args.session,
+                                text=greet,
+                                voice_id=args.voice,
+                                voice_mode=args.voice_mode,
+                                player=player,
+                                playback_mute=playback_mute,
+                            )
 
                 prev_qualified = qualified
 
