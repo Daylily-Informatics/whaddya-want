@@ -154,6 +154,7 @@ def handler(event, context):
 
     if vision_scene is not None:
         context_in["vision_scene"] = vision_scene
+        context_in["vision_debug"] = f"VISION_SCENE_DEBUG={json.dumps(vision_scene)[:400]}"
 
     # Identity fast-path: cheap and deterministic; text-only on purpose.
     if speaker and re.search(r"\b(who am i|what'?s my name|who'?s speaking)\b", text.lower()):
