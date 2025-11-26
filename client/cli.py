@@ -2,7 +2,9 @@
 from __future__ import annotations
 import argparse
 import asyncio
+import base64
 import contextlib
+import importlib.util
 import io
 import json
 import logging
@@ -88,6 +90,32 @@ def _bytes_to_float_mono_int16(data: bytes, channels: int) -> np.ndarray:
     if channels > 1:
         arr = arr.reshape(-1, channels).mean(axis=1).astype(np.int16)
     return arr.astype(np.float32) / 32768.0
+
+
+def _mp3_b64_to_mono_16k(audio_b64: str) -> Optional[np.ndarray]:
+    if not audio_b64:
+        return None
+    if importlib.util.find_spec("pydub") is None:
+        print("[enroll] pydub is required for AI voice enrollment.", file=sys.stderr)
+        return None
+
+    from pydub import AudioSegment
+
+    try:
+        data = base64.b64decode(audio_b64)
+        seg = AudioSegment.from_file(io.BytesIO(data), format="mp3")
+        seg = seg.set_channels(1).set_frame_rate(16000)
+    except Exception as exc:  # pragma: no cover - external dependency
+        print(f"[enroll] unable to decode AI voice audio: {exc}", file=sys.stderr)
+        return None
+
+    samples = np.array(seg.get_array_of_samples(), dtype=np.float32)
+    if seg.channels > 1:
+        samples = samples.reshape((-1, seg.channels)).mean(axis=1)
+    scale = float(1 << (8 * seg.sample_width - 1))
+    if scale:
+        samples /= scale
+    return samples.astype(np.float32)
 
 
 async def stream_microphone(
@@ -522,6 +550,15 @@ async def run() -> bool:
         help="Launch the monitor automatically after the greeting",
     )
     ap.add_argument(
+        "--enroll-ai-voice",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enroll the AI's own voice before listening so it can ignore itself "
+            "while speaking."
+        ),
+    )
+    ap.add_argument(
         "--self-voice-name",
         type=str,
         default=_cfg("self_voice_name", os.getenv("SELF_VOICE_NAME")),
@@ -548,7 +585,13 @@ async def run() -> bool:
         sys.exit(0)
 
     voice_id = (args.voice or "").strip() or None
-    self_voice = (args.self_voice_name or "").strip().lower() or None
+    ai_voice_name = (args.self_voice_name or voice_id or "ai-voice").strip()
+    self_voice = (
+        (ai_voice_name if args.enroll_ai_voice else (args.self_voice_name or ""))
+        .strip()
+        .lower()
+        or None
+    )
     verbosity = int(args.verbose or 0)
     debug_logging = verbosity > 1
     verbose = verbosity > 0
@@ -638,6 +681,62 @@ async def run() -> bool:
         "Say 'marvin whoami' to have me guess your identity by voice and face.",
         "Available commands: " + ", ".join(available_commands),
     ]
+
+    async def _enroll_ai_voice_prelisten(enroll_name: str) -> None:
+        nonlocal self_voice
+
+        if not args.enroll_ai_voice:
+            return
+        if not enroll_name:
+            print("[enroll] AI voice name is empty; skipping enrollment.", file=sys.stderr)
+            return
+        if not spk_embed.enabled:
+            print("[enroll] Speaker embedding unavailable; skipping AI voice enrollment.", file=sys.stderr)
+            return
+
+        prompts = [
+            "I'm speaking now so I can enroll my voice before we start listening.",
+            "This sample helps me ignore my own responses while I talk to you.",
+        ]
+        clips = []
+        for line in prompts:
+            body = await speak_via_broker(
+                broker_url=args.broker_url,
+                session_id=args.session,
+                text=line,
+                voice_id=voice_id,
+                voice_mode=args.voice_mode,
+                player=player,
+                playback_mute=playback_mute,
+                context=None,
+                text_only=False,
+                timeout=30,
+                verbose=verbose,
+                barge_monitor=None,
+            )
+            if not body:
+                continue
+            audio_b64 = (body.get("audio") or {}).get("audio_base64")
+            wav = _mp3_b64_to_mono_16k(audio_b64 or "")
+            if wav is not None:
+                clips.append(wav)
+
+        if not clips:
+            print(
+                "[enroll] Unable to gather AI audio for self-voice enrollment.",
+                file=sys.stderr,
+            )
+            return
+
+        combined = np.concatenate(clips)
+        vec = spk_embed.embed(combined)
+        if vec is None:
+            print("[enroll] Speaker embed failed for AI voice enrollment.", file=sys.stderr)
+            return
+
+        identity.enroll_voice(enroll_name, vec)
+        self_voice = self_voice or enroll_name.strip().lower()
+        print(f"[voice] enrolled AI voice as {enroll_name}")
 
     intro_sent = False
     if not spk_embed.enabled:
@@ -852,6 +951,9 @@ async def run() -> bool:
             pass
 
     threading.Thread(target=_stdin_watcher, daemon=True).start()
+
+    if args.enroll_ai_voice:
+        await _enroll_ai_voice_prelisten(ai_voice_name)
 
     _start_microphone(mic_idx)
     reset_requested = False
