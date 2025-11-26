@@ -544,15 +544,30 @@ async def run() -> bool:
     analysis_buf = deque(maxlen=int(args.rate * 6))
     spk_embed = SpeakerEmbedder()
     auto_register_name = (args.auto_register_name or args.force_enroll or "").strip()
+    available_commands = [
+        "monitor",
+        "whoami",
+        "delete face <USERNAME>",
+        "delete voice <USERNAME>",
+        "delete animal <NAME>",
+        "reset",
+        "what time is it",
+        "whats up <timeperiod>",
+        "uptime",
+        "change voice <POLLY voicename, first letter capitalized>",
+        "kill monitor",
+        "pause",
+        "resume",
+        "number threads",
+        "exit",
+    ]
     help_lines = [
-        "Say 'hey Marvin' or 'ok Marvin' to enable command mode for 8 seconds.",
+        "Say 'hey Marvin' to enable command mode for 8 seconds. I'll reply 'what can I do for you?'",
         "While command mode is active, say 'exit' to stop the client.",
         "While command mode is active, say 'switch/change/set/use/select' the camera, microphone, or speaker to a device number.",
-        "Say 'marvin monitor' to launch the monitor window.",
-        "Say 'marvin reset' to close the monitor and restart the client.",
-        "Say 'register my voice as <name>' or 'call me <name>' to save a voice profile.",
         "Say 'marvin help' to hear this list again.",
         "Say 'marvin whoami' to have me guess your identity by voice and face.",
+        "Available commands: " + ", ".join(available_commands),
     ]
 
     intro_sent = False
@@ -980,6 +995,26 @@ async def run() -> bool:
             if _WAKE_RE.search(transcript):
                 cmd_window_until = now + 8.0
                 print("[marvin] command mode enabled (8s).")
+                print("[marvin] Available commands:")
+                for cmd in available_commands:
+                    print(f"  - {cmd}")
+                prompt_text = "What can I do for you?"
+                await speak_via_broker(
+                    broker_url=args.broker_url,
+                    session_id=args.session,
+                    text=prompt_text,
+                    voice_id=voice_id,
+                    voice_mode=args.voice_mode,
+                    player=player,
+                    playback_mute=playback_mute,
+                    context=None,
+                    text_only=args.text_only,
+                    timeout=10,
+                    verbose=verbose,
+                    barge_monitor=None,
+                )
+                last_ai_text_norm = _norm_text_for_echo(prompt_text)
+                last_ai_time = loop.time()
                 continue
             if _EXIT_RE.search(transcript):
                 if now <= cmd_window_until:
