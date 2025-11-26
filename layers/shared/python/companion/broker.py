@@ -9,7 +9,7 @@ from typing import Any, Dict, Tuple
 from .config import RuntimeConfig
 from .prompts import load_personality_prompt
 from .llm import LLMClient
-from .memory import ConversationStore, ConversationTurn
+from .memory import AISLongTermMemoryStore, ConversationStore, ConversationTurn
 from .speech import SpeechSynthesizer
 
 
@@ -34,6 +34,13 @@ class ConversationBroker:
             region_name=config.region_name,
         )
         self._system_prompt = load_personality_prompt(config.prompts_path)
+        self._long_term_memory: AISLongTermMemoryStore | None = None
+        if config.ais_memory_table:
+            self._long_term_memory = AISLongTermMemoryStore(
+                table_name=config.ais_memory_table,
+                region_name=config.region_name,
+                ttl_days=config.ais_memory_ttl_days,
+            )
 
     def handle(
         self,
@@ -99,6 +106,24 @@ class ConversationBroker:
         if text_only and isinstance(audio_payload, dict):
             audio_payload = dict(audio_payload)
             audio_payload["audio_base64"] = None
+
+        if self._long_term_memory:
+            metadata = {
+                "vision_scene": (context or {}).get("vision_scene"),
+                "command": command,
+                "tool_calls": llm_response.tool_calls,
+                "assistant_visible_text": reply_text,
+            }
+            try:
+                self._long_term_memory.record_exchange(
+                    session_id=session_id,
+                    timestamp=timestamp,
+                    user_text=user_text,
+                    assistant_text=llm_response.message,
+                    metadata=metadata,
+                )
+            except Exception as exc:  # pragma: no cover - non-critical telemetry
+                print(f"Warning: failed to persist AIS long-term memory: {exc}")
 
         return {
             "text": reply_text,
