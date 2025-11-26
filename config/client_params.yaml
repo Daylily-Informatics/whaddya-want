@@ -1,0 +1,22 @@
+{
+  "broker_url": "http://localhost:9000/broker",
+  "session": null,
+  "region": "us-west-2",
+  "language": "en-US",
+  "input_device": null,
+  "setup_devices": false,
+  "identify_image": null,
+  "rate": 16000,
+  "channels": 1,
+  "id_threshold": 0.65,
+  "id_window": 2.0,
+  "auto_register_name": null,
+  "force_enroll": null,
+  "voice": null,
+  "voice_mode": "standard",
+  "text_only": false,
+  "save_audio": false,
+  "verbose": false,
+  "auto_start_monitor": false,
+  "self_voice_name": null
+}

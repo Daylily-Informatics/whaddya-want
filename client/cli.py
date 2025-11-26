@@ -17,6 +17,7 @@ from amazon_transcribe.handlers import TranscriptResultStreamHandler
 from amazon_transcribe.model import TranscriptResultStream
 
 from client import identity
+from client.config_loader import load_client_params
 from client.monitor_engine import FaceProbeResult, MonitorConfig as MonCfg, MonitorEngine
 from client.shared_audio import AudioPlayer, get_shared_audio, speak_via_broker
 
@@ -412,57 +413,86 @@ class SpeakerEmbed:
 
 # ---- CLI loop ----
 async def run() -> bool:
+    params = load_client_params()
+
+    def _cfg(key: str, fallback):
+        val = params.get(key)
+        return fallback if val is None else val
+
+    def _cfg_bool(key: str, fallback: bool = False) -> bool:
+        val = params.get(key)
+        if val is None:
+            return fallback
+        return bool(val)
+
     ap = argparse.ArgumentParser(
         description="Voice client (unified identity + monitor trigger)"
     )
-    ap.add_argument("--broker-url", required=True)
-    ap.add_argument("--session", default=str(uuid.uuid4()))
+    ap.add_argument("--broker-url", default=params.get("broker_url"), required=params.get("broker_url") is None)
+    ap.add_argument("--session", default=_cfg("session", str(uuid.uuid4())))
     ap.add_argument(
         "--region",
-        default=os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "us-west-2",
+        default=_cfg(
+            "region",
+            os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "us-west-2",
+        ),
     )
-    ap.add_argument("--language", default="en-US")
-    ap.add_argument("--input-device", type=int, default=None)
-    ap.add_argument("--setup-devices", action="store_true")
+    ap.add_argument("--language", default=_cfg("language", "en-US"))
+    ap.add_argument("--input-device", type=int, default=_cfg("input_device", None))
+    ap.add_argument(
+        "--setup-devices",
+        action=argparse.BooleanOptionalAction,
+        default=_cfg_bool("setup_devices", False),
+    )
     ap.add_argument(
         "--identify_image",
         type=str,
-        default=None,
+        default=_cfg("identify_image", None),
         help="Optional: identify a face from an image and exit",
     )
-    ap.add_argument("--rate", type=int, default=16000)
-    ap.add_argument("--channels", type=int, default=1)
-    ap.add_argument("--id-threshold", type=float, default=0.65)
-    ap.add_argument("--id-window", type=float, default=2.0)
+    ap.add_argument("--rate", type=int, default=int(_cfg("rate", 16000)))
+    ap.add_argument("--channels", type=int, default=int(_cfg("channels", 1)))
+    ap.add_argument("--id-threshold", type=float, default=float(_cfg("id_threshold", 0.65)))
+    ap.add_argument("--id-window", type=float, default=float(_cfg("id_window", 2.0)))
     ap.add_argument(
         "--auto-register-name",
         type=str,
-        default=None,
+        default=_cfg("auto_register_name", None),
         help="If set, automatically register an unknown speaker with this name.",
     )
-    ap.add_argument("--force-enroll", default=None)
-    ap.add_argument("--voice", default=os.getenv("POLLY_VOICE"))
+    ap.add_argument("--force-enroll", default=_cfg("force_enroll", None))
+    ap.add_argument("--voice", default=_cfg("voice", os.getenv("POLLY_VOICE")))
     ap.add_argument(
         "--voice-mode",
         choices=["standard", "neural", "generative"],
-        default="standard",
+        default=_cfg("voice_mode", "standard"),
     )
     ap.add_argument(
         "--text-only",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=_cfg_bool("text_only", False),
         help="Request text-only responses from the broker",
     )
-    ap.add_argument("--save-audio", action="store_true")
-    ap.add_argument("--verbose", action="store_true")
+    ap.add_argument(
+        "--save-audio",
+        action=argparse.BooleanOptionalAction,
+        default=_cfg_bool("save_audio", False),
+    )
+    ap.add_argument(
+        "--verbose",
+        action=argparse.BooleanOptionalAction,
+        default=_cfg_bool("verbose", False),
+    )
     ap.add_argument(
         "--auto-start-monitor",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=_cfg_bool("auto_start_monitor", False),
         help="Launch the monitor automatically after the greeting",
     )
     ap.add_argument(
         "--self-voice-name",
         type=str,
-        default=os.getenv("SELF_VOICE_NAME"),
+        default=_cfg("self_voice_name", os.getenv("SELF_VOICE_NAME")),
         help="If set, ignore transcripts whose speaker ID matches this enrolled voice (self-talk suppression).",
     )
     args = ap.parse_args()
