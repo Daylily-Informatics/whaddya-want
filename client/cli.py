@@ -482,7 +482,7 @@ async def run() -> bool:
     ap.add_argument(
         "--id-window",
         type=float,
-        default=float(_cfg("id_window", 2.0)),
+        default=float(_cfg("id_window", 4.0)),
     )
     ap.add_argument(
         "--auto-register-name",
@@ -882,7 +882,7 @@ async def run() -> bool:
                     stop.set()
                     break
                 wav_m = take_latest_seconds(
-                    analysis_buf, max(args.id_window, 3.0), args.rate
+                    analysis_buf, max(args.id_window, 4.0), args.rate
                 )
                 if wav_m is None:
                     print("[enroll] not enough audio.")
