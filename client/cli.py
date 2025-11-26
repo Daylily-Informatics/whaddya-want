@@ -9,7 +9,6 @@ import logging
 import os
 import queue
 import re
-import select
 import signal
 import subprocess
 import sys
@@ -323,42 +322,14 @@ def _describe_audio_devices():
     return mics, spk
 
 
-def _timed_input(prompt: str, timeout: float) -> Optional[str]:
-    try:
-        ready, _, _ = select.select([sys.stdin], [], [], timeout)
-        if ready:
-            return sys.stdin.readline()
-        return None
-    except Exception:
-        return input(prompt)
-
-
-def _prompt_quit(title: str) -> None:
-    while True:
-        resp = input(f"No response while selecting {title.lower()}. Quit? [y/N]: ").strip().lower()
-        if resp in {"y", "yes", "q", "quit"}:
-            raise SystemExit("User chose to quit during device selection.")
-        if resp in {"", "n", "no"}:
-            return
-
-
-def _prompt_choice(options, title, *, hang_timeout: Optional[float] = None):
+def _prompt_choice(options, title):
     print(f"[{title}]")
     for i, opt in enumerate(options, start=1):
         print(f"  {i}. {opt['label']} (index {opt['index']})")
     default_idx = 1
     while True:
         try:
-            if hang_timeout:
-                raw_val = _timed_input(
-                    f"Select {title.lower()} [default {default_idx}]: ", hang_timeout
-                )
-                if raw_val is None:
-                    _prompt_quit(title)
-                    continue
-                raw = raw_val.strip()
-            else:
-                raw = input(f"Select {title.lower()} [default {default_idx}]: ").strip()
+            raw = input(f"Select {title.lower()} [default {default_idx}]: ").strip()
         except EOFError:
             raw = ""
         choice = default_idx if not raw else (int(raw) if raw.isdigit() else None)
@@ -377,7 +348,7 @@ def device_setup_interactive() -> Tuple[int, int, int]:
     mics, sp = _describe_audio_devices()
     if not mics:
         raise RuntimeError("No microphones detected.")
-    mic = _prompt_choice(mics, "Available Microphones", hang_timeout=6.0)
+    mic = _prompt_choice(mics, "Available Microphones")
     sd.check_input_settings(device=mic, samplerate=16000, channels=1)
     with sd.InputStream(device=mic, channels=1, samplerate=16000) as s:
         s.read(1)
