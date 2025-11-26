@@ -880,11 +880,19 @@ async def run() -> bool:
                 )
                 continue
 
-            if _MONITOR_RE.search(transcript):
+            if _MONITOR_RE.search(transcript) or (
+                in_cmd_window and cmd_text.startswith("monitor")
+            ):
                 await _start_monitor()
                 continue
 
-            if _RESET_RE.search(transcript):
+            if in_cmd_window and cmd_text.startswith("kill monitor"):
+                await _stop_monitor()
+                continue
+
+            if _RESET_RE.search(transcript) or (
+                in_cmd_window and cmd_text.startswith("reset")
+            ):
                 print("[voice] reset requested — restarting client.")
                 analysis_buf.clear()
                 await _stop_monitor()
@@ -892,7 +900,9 @@ async def run() -> bool:
                 stop.set()
                 break
 
-            if _WHOAMI_RE.search(transcript):
+            if _WHOAMI_RE.search(transcript) or (
+                in_cmd_window and cmd_text in ("whoami", "who am i")
+            ):
                 await speak_via_broker(
                     broker_url=args.broker_url,
                     session_id=args.session,
@@ -992,8 +1002,12 @@ async def run() -> bool:
                 continue
 
             now = loop.time()
-            if _WAKE_RE.search(transcript):
+            in_cmd_window = now <= cmd_window_until
+
+            wake_match = _WAKE_RE.search(transcript)
+            if wake_match:
                 cmd_window_until = now + 8.0
+                in_cmd_window = True
                 print("[marvin] command mode enabled (8s).")
                 print("[marvin] Available commands:")
                 for cmd in available_commands:
@@ -1015,9 +1029,18 @@ async def run() -> bool:
                 )
                 last_ai_text_norm = _norm_text_for_echo(prompt_text)
                 last_ai_time = loop.time()
-                continue
+
+                remainder = transcript[wake_match.end() :].lstrip(" ,.;:-")
+                if remainder:
+                    transcript = remainder
+                    norm_transcript = _norm_text_for_echo(transcript)
+                else:
+                    continue
+
+            cmd_text = transcript.strip().lower()
+
             if _EXIT_RE.search(transcript):
-                if now <= cmd_window_until:
+                if in_cmd_window:
                     print("[voice] exit requested — shutting down.")
                     stop.set()
                     break
@@ -1026,7 +1049,7 @@ async def run() -> bool:
 
             device_cmd = parse_device_command(transcript)
             if device_cmd:
-                if now > cmd_window_until:
+                if not in_cmd_window:
                     print(
                         "[voice] device change ignored (say 'hey Marvin' first)."
                     )
