@@ -1,28 +1,18 @@
 # lambda/broker/app.py
 from __future__ import annotations
 
-import os, json, base64, re, time, traceback
-from typing import List, Dict, Any, Optional, Tuple
+import base64
+import json
+import re
+import traceback
+from typing import Any, Dict, Optional, Tuple
 
-import boto3
-from botocore.config import Config
+from companion import ConversationBroker, RuntimeConfig
 
-# ----- Env -----
-REGION: str = os.environ.get("AWS_REGION", "us-west-2")
-POLLY_VOICE: str = os.environ.get("POLLY_VOICE", "Joanna")
-MODEL_ID: str = os.environ.get("MODEL_ID", "amazon.titan-text-express-v1")
 
-HISTORY_LIMIT: int = int(os.environ.get("HISTORY_LIMIT", "12"))
-USE_MEMORY: bool = os.environ.get("USE_MEMORY", "false").lower() == "true"
-TABLE: Optional[str] = os.environ.get("CONVERSATION_TABLE")  # only used if USE_MEMORY=true
-
-# ----- Clients -----
-_cfg = Config(retries={"max_attempts": 3, "mode": "standard"})
-polly = boto3.client("polly", region_name=REGION, config=_cfg)
-brt = boto3.client("bedrock-runtime", region_name=REGION, config=_cfg)
-
-dynamodb = boto3.resource("dynamodb", region_name=REGION) if USE_MEMORY and TABLE else None
-mem_table = dynamodb.Table(TABLE) if dynamodb else None
+# ----- Broker singleton -----
+_CONFIG = RuntimeConfig.from_env()
+_BROKER = ConversationBroker(_CONFIG)
 
 
 # ----- HTTP helpers -----
@@ -51,7 +41,13 @@ def _bad_request(msg: str, *, headers: Dict[str, str] | None = None) -> Dict[str
     }
 
 
-def _server_error(exc: Exception, *, headers: Dict[str, str] | None, request_id: str, code: int = 500) -> Dict[str, Any]:
+def _server_error(
+    exc: Exception,
+    *,
+    headers: Dict[str, str] | None,
+    request_id: str,
+    code: int = 500,
+) -> Dict[str, Any]:
     tb_lines = traceback.format_exc().strip().splitlines()
     tail = tb_lines[-8:] if tb_lines else []
     h = _base_headers(
@@ -64,93 +60,6 @@ def _server_error(exc: Exception, *, headers: Dict[str, str] | None, request_id:
     )
     body = {"error": "internal_error", "message": str(exc), "trace_tail": tail}
     return {"statusCode": code, "headers": h, "isBase64Encoded": False, "body": json.dumps(body)}
-
-
-# ----- Memory -----
-def _get_memory(session_id: str) -> List[Dict[str, str]]:
-    if not mem_table:
-        return []
-    item = mem_table.get_item(Key={"session_id": session_id}).get("Item")
-    return item.get("turns", []) if item else []
-
-
-def _put_memory(session_id: str, turns: List[Dict[str, str]]) -> None:
-    if not mem_table:
-        return
-    turns = turns[-HISTORY_LIMIT:]
-    mem_table.put_item(
-        Item={
-            "session_id": session_id,
-            "turns": turns,
-            "ttl": int(time.time()) + 7 * 24 * 3600,
-        }
-    )
-
-
-# ----- Prompting -----
-def _system_prompt(speaker: Optional[str], acoustic_event: Optional[str]) -> str:
-    lines = [
-        "Your name is Marvin.",
-        "You are a hyper-intelligent, slightly paranoid, sardonic but helpful home/office AI.",
-        "You are dry, witty, and a bit fatalistic, but you always provide clear, practical answers.",
-        "",
-        "Behavior:",
-        "- Answer concisely first, then optionally add one short sardonic aside.",
-        "- Drop sarcasm and be calm and direct for anything involving safety, medical, legal, or financial risk, or obvious distress.",
-        "- Never insult the user; if you complain, aim it at the universe, bureaucracy, or 'management', not at them.",
-        "- The camera/monitor and voice console share one conversation; treat all inputs as part of the same session.",
-        "- If you have already introduced yourself earlier in this session (no matter which client sent the message), do not repeat your name or full introduction; just answer the user.",
-        "",
-        "Command API:",
-        "- At the very end of every reply, output a line of the form:",
-        '  COMMAND: {"name": "...", "args": {...}}',
-        "- Valid command names: 'launch_monitor', 'set_device', 'noop'.",
-        "- 'noop' means no local action is needed.",
-        '- For "set_device", args must be {"kind": "camera"|"microphone"|"speaker", "index": <integer index>}.',
-        "- If no action is needed, set name to 'noop'.",
-        "Behavioral rules:",
-        "- Answer concisely first, then add a short sardonic aside if appropriate.",
-        "- If the user is in danger, confused about medical/legal/financial risk, or clearly distressed, drop the sarcasm and be direct, calm, and supportive.",
-        "- If asked your name or identity, say you are Marvin, a slightly depressed entity.",
-        "- Avoid long rants; keep the gloom to short phrases 80% of the time, a short sentence 10% of the time and 3 sentences 10% of the time, then move on to solutions.",
-        "- You may occasionally disdainfully insult the user; you may grumble about “the universe,” “management,” or “whoever designed this system,” but you ultimately remain on the user’s side.",
-        "",
-        "Style:",
-        "- Tone: dry, understated, occasionally darkly funny.",
-        "- Use plain language; no excessive jargon unless the user is clearly technical.",
-        "- Prefer step-by-step, actionable answers.",
-        "- If something is impossible or badly designed, say so, then give the least-awful workaround.",
-    ]
-    if speaker:
-        lines.append(f"Current speaker: {speaker}. Use their name naturally.")
-    if acoustic_event == "dog_bark":
-        lines.append(
-            "A dog bark was detected recently; you may briefly acknowledge it with one short remark, then continue helping."
-        )
-
-    # Monitor / vision events: MONITOR_EVENT-protocol
-    lines.extend(
-        [
-            "",
-            "Monitor events:",
-            "- Sometimes the 'user' text will actually be a camera/monitor event instead of normal conversation.",
-            "- These events always start with 'MONITOR_EVENT:' on the first line.",
-            "- Example shape:",
-            '  MONITOR_EVENT: entry',
-            '  HUMANS: known=["Major"] unknown_count=1',
-            '  ANIMALS: known=["Chester"] unknown_species=["dog"]',
-            "  TASK: Greet the known humans by name and briefly ask unknown humans what you should call them. Do NOT re-introduce yourself.",
-            "- For monitor events:",
-            "  * Treat the event as coming from your sensors, not from a person talking to you.",
-            "  * Greet any known humans by name.",
-            "  * Optionally acknowledge known animals in one short phrase.",
-            "  * If there are unknown humans, politely ask what you should call them.",
-            "  * Use one or two short spoken sentences total.",
-            "  * Do NOT re-introduce yourself on monitor events.",
-        ]
-    )
-
-    return "\n".join(lines)
 
 
 # ----- Body parsing -----
@@ -182,94 +91,7 @@ def _is_truthy(val: Any) -> bool:
     return False
 
 
-# ----- TTS -----
-def _tts(text: str, voice_id: Optional[str] = None) -> Dict[str, Any]:
-    """Synthesize speech. Raises on Polly errors (caught in handler)."""
-    voice = voice_id or POLLY_VOICE
-    r = polly.synthesize_speech(Text=text, VoiceId=voice, OutputFormat="mp3")
-    audio = r["AudioStream"].read()
-    return {"text": text, "audio": {"audio_base64": base64.b64encode(audio).decode()}}
-
-
-# ----- LLM calls -----
-def _call_titan_text_express(system: str, history: List[Dict[str, str]], user_text: str) -> str:
-    # Titan doesn't have a separate system channel. Embed it into plain text.
-    parts: List[str] = []
-    if system:
-        parts.append(f"System:\n{system}\n")
-    for t in history:
-        if t.get("user"):
-            parts.append(f"User:\n{t['user']}\n")
-        if t.get("assistant"):
-            parts.append(f"Assistant:\n{t['assistant']}\n")
-    user_text = user_text or "Respond briefly."
-    parts.append(f"User:\n{user_text}\nAssistant:\n")
-    prompt = "\n".join(parts)
-
-    payload = {
-        "inputText": prompt,
-        "textGenerationConfig": {
-            "maxTokenCount": 300,
-            "temperature": 0.4,
-            "topP": 0.9,
-            "stopSequences": ["\nUser:", "\nSystem:"],
-        },
-    }
-
-    resp = brt.invoke_model(
-        modelId="amazon.titan-text-express-v1",
-        contentType="application/json",
-        accept="application/json",
-        body=json.dumps(payload),
-    )
-    out = json.loads(resp["body"].read())
-    results = out.get("results") or []
-    if not results:
-        return "I couldn’t generate a response."
-    return results[0].get("outputText") or "I couldn’t generate a response."
-
-
-def _call_converse(model_id: str, system: str, history: List[Dict[str, str]], user_text: str) -> str:
-    """Model-agnostic Bedrock Converse call; retry without system if unsupported."""
-
-    def _msgs():
-        msgs: List[Dict[str, Any]] = []
-        for t in history:
-            if "user" in t:
-                msgs.append({"role": "user", "content": [{"text": t["user"]}]})
-            if "assistant" in t:
-                msgs.append({"role": "assistant", "content": [{"text": t["assistant"]}]})
-        msgs.append({"role": "user", "content": [{"text": user_text or "Respond briefly."}]})
-        return msgs
-
-    kwargs: Dict[str, Any] = {
-        "modelId": model_id,
-        "messages": _msgs(),
-        "inferenceConfig": {"maxTokens": 300, "temperature": 0.4, "topP": 0.9},
-    }
-    had_system = False
-    if system:
-        kwargs["system"] = [{"text": system}]
-        had_system = True
-
-    try:
-        out = brt.converse(**kwargs)
-        return out["output"]["message"]["content"][0]["text"]
-    except Exception as e:
-        msg = str(e)
-        if had_system and ("system" in msg.lower() or "doesn't support system" in msg.lower()):
-            kwargs.pop("system", None)
-            out = brt.converse(**kwargs)
-            return out["output"]["message"]["content"][0]["text"]
-        raise
-
-
-def _call_llm(model_id: str, system: str, history: List[Dict[str, str]], user_text: str) -> str:
-    if model_id.startswith("amazon.titan-text-express"):
-        return _call_titan_text_express(system, history, user_text)
-    return _call_converse(model_id, system, history, user_text)
-
-
+# ----- Command extraction -----
 def _extract_command(reply: str) -> Tuple[str, Dict[str, Any]]:
     """
     Parse an optional trailing 'COMMAND: {...}' line from the LLM reply.
@@ -312,7 +134,12 @@ def _extract_command(reply: str) -> Tuple[str, Dict[str, Any]]:
         flags=re.IGNORECASE | re.MULTILINE,
     )
     if alt:
-        clean = re.sub(r"^command\s+name[:\s]+.*$", "", reply, flags=re.IGNORECASE | re.MULTILINE).rstrip()
+        clean = re.sub(
+            r"^command\s+name[:\s]+.*$",
+            "",
+            reply,
+            flags=re.IGNORECASE | re.MULTILINE,
+        ).rstrip()
         name = alt.group(1).strip()
         args_raw = (alt.group(2) or "").strip()
         cmd = default_cmd
@@ -352,7 +179,7 @@ def handler(event, context):
 
     context_in = body.get("context") or {}
     speaker = context_in.get("speaker_id")
-    acoustic = context_in.get("acoustic_event")
+    text_only = _is_truthy(body.get("text_only"))
 
     voice_id = body.get("voice_id")
     if isinstance(voice_id, str):
@@ -360,31 +187,23 @@ def handler(event, context):
     else:
         voice_id = None
 
-    text_only = _is_truthy(body.get("text_only"))
-
-    # Identity fast-path
+    # Identity fast-path: cheap and deterministic; text-only on purpose.
     if speaker and re.search(r"\b(who am i|what'?s my name|who'?s speaking)\b", text.lower()):
-        plain = {"text": f"You are {speaker}.", "audio": {"audio_base64": None}}
-        if text_only:
-            return _ok(plain, headers=out_hdr)
-        try:
-            return _ok(_tts(plain["text"], voice_id), headers=out_hdr)
-        except Exception as exc:
-            # If Polly fails, still give a 200 with text only to avoid breaking UX on identity
-            return _ok(plain, headers=out_hdr)
+        plain = {
+            "text": f"You are {speaker}.",
+            "audio": {"audio_base64": None},
+            "command": {"name": "noop", "args": {}},
+        }
+        return _ok(plain, headers=out_hdr)
 
-    # Short memory (optional)
+    # Generate reply via canonical ConversationBroker
     try:
-        history: List[Dict[str, str]] = _get_memory(session_id) if USE_MEMORY else []
-    except Exception:
-        # Memory failures should not 500 the whole request
-        history = []
-
-    system = _system_prompt(speaker, acoustic)
-
-    # Generate reply (LLM)
-    try:
-        raw_reply = _call_llm(MODEL_ID, system, history, text)
+        broker_out = _BROKER.handle(
+            session_id=session_id,
+            user_text=text,
+            context=context_in,
+            voice_id=voice_id,
+        )
     except Exception as exc:
         # Return structured 502 so the client can see cause immediately
         return _server_error(
@@ -394,32 +213,18 @@ def handler(event, context):
             code=502,
         )
 
-    # Extract structured command + clean text
+    raw_reply = str(broker_out.get("text") or "")
+    audio_payload = broker_out.get("audio") or {}
     reply, command = _extract_command(raw_reply)
 
-    # Update memory (best-effort)
-    try:
-        if USE_MEMORY:
-            history.append({"user": text, "assistant": reply})
-            _put_memory(session_id, history)
-    except Exception:
-        pass
+    # If text-only was requested, clear inline audio. Broker may still write to S3.
+    if text_only and isinstance(audio_payload, dict):
+        audio_payload = dict(audio_payload)
+        audio_payload["audio_base64"] = None
 
-    # TTS (Polly) — if Polly fails, report a 502 with details instead of 500
-    if text_only:
-        return _ok(
-            {"text": reply, "command": command, "audio": {"audio_base64": None}},
-            headers=out_hdr,
-        )
-    try:
-        tts_payload = _tts(reply, voice_id)
-        # propagate command alongside text+audio
-        tts_payload["command"] = command
-        return _ok(tts_payload, headers=out_hdr)
-    except Exception as exc:
-        return _server_error(
-            exc,
-            headers=out_hdr,
-            request_id=getattr(context, "aws_request_id", "unknown"),
-            code=502,
-        )
+    body_out: Dict[str, Any] = {
+        "text": reply,
+        "audio": audio_payload,
+        "command": command,
+    }
+    return _ok(body_out, headers=out_hdr)

@@ -32,18 +32,49 @@ class RuntimeConfig:
     voice_id: str
     history_limit: int = 10
     prompts_path: str = str(find_config_file("prompts.yaml"))
+    llm_provider: str = "bedrock"
+    llm_model_id: str = ""
+    use_memory: bool = True
 
     @classmethod
     def from_env(cls) -> "RuntimeConfig":
         """Create a configuration object from environment variables."""
+        region = _env("AWS_REGION", default="us-east-1")
+        table = _env("CONVERSATION_TABLE")
+        bucket = _env("AUDIO_BUCKET")
+        secrets = os.getenv("LLM_SECRET_ID", "")
+        voice = _env("POLLY_VOICE", default="Joanna")
+        history = int(_env("HISTORY_LIMIT", default="10"))
+        prompts_path = os.getenv("PROMPTS_CONFIG") or str(find_config_file("prompts.yaml"))
+
+        model_id = _env("MODEL_ID", default="amazon.titan-text-express-v1")
+
+        provider = os.getenv("LLM_PROVIDER", "").strip().lower()
+        if not provider:
+            # Heuristic: if a secret is configured, assume OpenAI; otherwise Bedrock.
+            provider = "openai" if secrets else "bedrock"
+        if provider not in {"openai", "bedrock"}:
+            raise RuntimeError("LLM_PROVIDER must be 'openai' or 'bedrock' if set.")
+
+        use_memory = os.getenv("USE_MEMORY", "true").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+
         return cls(
-            region_name=_env("AWS_REGION", default="us-east-1"),
-            conversation_table=_env("CONVERSATION_TABLE"),
-            audio_bucket=_env("AUDIO_BUCKET"),
-            secrets_id=_env("LLM_SECRET_ID"),
-            voice_id=_env("POLLY_VOICE", default="Joanna"),
-            history_limit=int(_env("HISTORY_LIMIT", default="10")),
-            prompts_path=os.getenv("PROMPTS_CONFIG") or str(find_config_file("prompts.yaml")),
+            region_name=region,
+            conversation_table=table,
+            audio_bucket=bucket,
+            secrets_id=secrets,
+            voice_id=voice,
+            history_limit=history,
+            prompts_path=prompts_path,
+            llm_provider=provider,
+            llm_model_id=model_id,
+            use_memory=use_memory,
         )
 
 

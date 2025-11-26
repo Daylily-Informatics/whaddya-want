@@ -21,8 +21,10 @@ class ConversationBroker:
             region_name=config.region_name,
         )
         self._llm = LLMClient(
-            secret_id=config.secrets_id,
+            provider="openai" if config.llm_provider == "openai" else "bedrock",
+            model=config.llm_model_id,
             region_name=config.region_name,
+            secret_id=config.secrets_id or None,
         )
         self._speech = SpeechSynthesizer(
             bucket=config.audio_bucket,
@@ -31,15 +33,42 @@ class ConversationBroker:
         )
         self._system_prompt = load_personality_prompt(config.prompts_path)
 
-    def handle(self, session_id: str, user_text: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
-        history = self._memory.fetch_history(session_id=session_id, limit=self._config.history_limit)
+    def handle(
+        self,
+        session_id: str,
+        user_text: str,
+        context: dict[str, Any] | None = None,
+        voice_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Process a single user turn and return text + audio payload.
+
+        Returns a mapping:
+
+            {
+              "text": "...",
+              "audio": {...},              # see SpeechSynthesizer.synthesize
+              "tool_calls": [...],         # if the provider supports tools
+            }
+        """
+        if self._config.use_memory:
+            history = self._memory.fetch_history(
+                session_id=session_id,
+                limit=self._config.history_limit,
+            )
+        else:
+            history = []
+
         messages = [
-            {"role": "system", "content": self._system_prompt},
+            {
+                "role": "system",
+                "content": self._system_prompt,
+            },
             *({"role": turn.role, "content": turn.content} for turn in history),
             {"role": "user", "content": user_text},
         ]
         if context:
             messages.append({"role": "system", "content": f"Context: {context}"})
+
         llm_response = self._llm.chat(messages=messages)
 
         timestamp = datetime.now(timezone.utc)
@@ -47,12 +76,18 @@ class ConversationBroker:
             ConversationTurn(role="user", content=user_text, timestamp=timestamp),
             ConversationTurn(role="assistant", content=llm_response.message, timestamp=timestamp),
         ]
-        self._memory.append_turns(session_id=session_id, turns=turns)
+        if self._config.use_memory:
+            self._memory.append_turns(
+                session_id=session_id,
+                turns=turns,
+                limit=self._config.history_limit,
+            )
 
         audio_payload = self._speech.synthesize(
             text=llm_response.message,
             session_id=session_id,
             response_id=str(int(timestamp.timestamp())),
+            voice_id=voice_id,
         )
 
         return {
