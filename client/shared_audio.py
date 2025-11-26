@@ -42,6 +42,35 @@ class AudioPlayer:
         self._mute_guard = mute_guard
         self._abort_evt = asyncio.Event()
 
+    def _resample(self, audio: np.ndarray, src_rate: int) -> tuple[np.ndarray, int]:
+        """Resample to the output device's preferred rate to avoid crackle."""
+
+        try:
+            target_rate = int(sd.query_devices(kind="output")["default_samplerate"])
+        except Exception:
+            target_rate = src_rate
+
+        if target_rate <= 0 or target_rate == src_rate:
+            return audio, src_rate
+
+        frames = audio.shape[0]
+        new_frames = int(round(frames * float(target_rate) / float(src_rate)))
+        if new_frames <= 0:
+            return audio, src_rate
+
+        # Linear interpolation resample keeps dependencies light and works for mono/stereo.
+        x_old = np.linspace(0.0, 1.0, frames, endpoint=False, dtype=np.float64)
+        x_new = np.linspace(0.0, 1.0, new_frames, endpoint=False, dtype=np.float64)
+        if audio.ndim == 1 or audio.shape[1] == 1:
+            resampled = np.interp(x_new, x_old, audio.reshape(-1)).astype(np.float32)
+            resampled = resampled.reshape(-1, 1)
+        else:
+            resampled = np.stack(
+                [np.interp(x_new, x_old, audio[:, ch]) for ch in range(audio.shape[1])],
+                axis=1,
+            ).astype(np.float32)
+        return resampled, target_rate
+
     def _decode(self, data: bytes):
         if not self.enabled:
             return (None, None)
@@ -59,7 +88,7 @@ class AudioPlayer:
             samples = samples.reshape((-1, 1))
         scale = float(1 << (8 * seg.sample_width - 1))
         audio = samples.astype(np.float32) / scale
-        return audio, int(seg.frame_rate)
+        return self._resample(audio, int(seg.frame_rate))
 
     async def play(self, data: bytes) -> bool:
         if not self.enabled:
