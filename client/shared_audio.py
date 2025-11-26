@@ -13,8 +13,9 @@ from typing import Any, Dict, Optional, Callable, Awaitable, Tuple
 import numpy as np
 import requests
 
-# Global audio event loop
-_audio_loop = asyncio.new_event_loop()
+_audio_loop: asyncio.AbstractEventLoop | None = None
+_audio_thread: threading.Thread | None = None
+_audio_lock = threading.Lock()
 
 
 def _run_audio_loop(loop):
@@ -22,8 +23,18 @@ def _run_audio_loop(loop):
     loop.run_forever()
 
 
-_audio_thread = threading.Thread(target=_run_audio_loop, args=(_audio_loop,), daemon=True)
-_audio_thread.start()
+def _ensure_audio_loop() -> asyncio.AbstractEventLoop:
+    global _audio_loop, _audio_thread
+    if _audio_loop is None:
+        with _audio_lock:
+            if _audio_loop is None:
+                loop = asyncio.new_event_loop()
+                thread = threading.Thread(target=_run_audio_loop, args=(loop,), daemon=True)
+                thread.start()
+                _audio_loop = loop
+                _audio_thread = thread
+    assert _audio_loop is not None
+    return _audio_loop
 
 _MP3_READY = False
 try:
@@ -131,7 +142,7 @@ class AudioPlayer:
 
 async def _play_on_audio_loop(player: "AudioPlayer", data: bytes) -> bool:
     """Run player.play on the dedicated audio loop and await completion."""
-    fut = asyncio.run_coroutine_threadsafe(player.play(data), _audio_loop)
+    fut = asyncio.run_coroutine_threadsafe(player.play(data), _ensure_audio_loop())
     return await asyncio.wrap_future(fut)
 
 
