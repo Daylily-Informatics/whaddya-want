@@ -281,30 +281,53 @@ def _extract_command(reply: str) -> Tuple[str, Dict[str, Any]]:
     if not isinstance(reply, str):
         return str(reply), default_cmd
 
+    allowed_names = {"launch_monitor", "set_device", "noop"}
+
     # Look for a line starting with 'COMMAND:' and capture the JSON blob
     m = re.search(r"^COMMAND:\s*(\{.*\})\s*$", reply, flags=re.MULTILINE)
-    if not m:
-        return reply.strip(), default_cmd
+    if m:
+        cmd_json = m.group(1)
+        # Remove the COMMAND line from the visible text
+        clean = re.sub(r"^COMMAND:.*$", "", reply, flags=re.MULTILINE).rstrip()
 
-    cmd_json = m.group(1)
-    # Remove the COMMAND line from the visible text
-    clean = re.sub(r"^COMMAND:.*$", "", reply, flags=re.MULTILINE).rstrip()
-
-    cmd = default_cmd
-    try:
-        parsed = json.loads(cmd_json)
-        if isinstance(parsed, dict):
-            name = parsed.get("name") or "noop"
-            args = parsed.get("args") or {}
-            if isinstance(name, str) and isinstance(args, dict):
-                # only accept whitelisted commands
-                if name in {"launch_monitor", "set_device", "noop"}:
-                    cmd = {"name": name, "args": args}
-    except Exception:
-        # On any parse error, fall back to noop
         cmd = default_cmd
+        try:
+            parsed = json.loads(cmd_json)
+            if isinstance(parsed, dict):
+                name = parsed.get("name") or "noop"
+                args = parsed.get("args") or {}
+                if isinstance(name, str) and isinstance(args, dict):
+                    if name in allowed_names:
+                        cmd = {"name": name, "args": args}
+        except Exception:
+            # On any parse error, fall back to noop but keep the cleaned text
+            cmd = default_cmd
 
-    return clean.strip(), cmd
+        return clean.strip(), cmd
+
+    # Fallback: handle looser phrasing like "command name: noop args: {}"
+    alt = re.search(
+        r"^command\s+name[:\s]+([\w-]+)\s+args[:\s]+(.*)$",
+        reply,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    if alt:
+        clean = re.sub(r"^command\s+name[:\s]+.*$", "", reply, flags=re.IGNORECASE | re.MULTILINE).rstrip()
+        name = alt.group(1).strip()
+        args_raw = (alt.group(2) or "").strip()
+        cmd = default_cmd
+        args: Dict[str, Any] = {}
+        try:
+            args = json.loads(args_raw) if args_raw else {}
+        except Exception:
+            args = {}
+
+        if name in allowed_names and isinstance(args, dict):
+            cmd = {"name": name, "args": args}
+
+        return clean.strip(), cmd
+
+    return reply.strip(), default_cmd
 
 
 # ----- Lambda handler -----
