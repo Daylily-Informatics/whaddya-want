@@ -260,7 +260,23 @@ def parse_registration(text: str) -> Optional[str]:
     name = (m.group(1) or m.group(2) or "").strip()
     name = re.sub(r"\s+", " ", name)
     return name or None
+# --- Environment question detection (for camera-aware answers) ---
 
+_ENV_QUESTION_PATTERNS = (
+    "what do you see",
+    "what can you see",
+    "what are you seeing",
+    "what does it look like",
+    "what can you tell me about",
+    "what can you say about",
+    "who is here",
+    "who is in the room",
+    "who do you see",
+)
+
+def _is_env_question(text: str) -> bool:
+    t = text.lower().strip()
+    return any(pat in t for pat in _ENV_QUESTION_PATTERNS)
 
 def take_latest_seconds(buf: deque, seconds: float, rate: int) -> Optional[np.ndarray]:
     need = int(seconds * rate)
@@ -1276,6 +1292,23 @@ async def run() -> bool:
                 monitor_ctx = getattr(monitor_engine, "last_context_for_voice", None)
             if monitor_ctx:
                 context.update(dict(monitor_ctx))
+                
+            
+            # NEW: attach a frame for environment questions
+            image_jpeg: Optional[bytes] = None
+            if monitor_engine is not None and _is_env_question(transcript):
+                try:
+                    import cv2
+                    frame = monitor_engine.get_best_recent_frame()
+                    if frame is not None:
+                        ok, buf = cv2.imencode(
+                            ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+                        )
+                        if ok:
+                            image_jpeg = buf.tobytes()
+                except Exception as exc:
+                    vprint(f"[env] failed to capture frame for env question: {exc}")
+                    
             is_self_voice = False
             if wav_id is not None:
                 if not spk_embed.enabled:
@@ -1349,6 +1382,7 @@ async def run() -> bool:
                 timeout=60,
                 verbose=verbose,
                 barge_monitor=None if args.text_only else _barge_monitor,
+                image_jpeg=image_jpeg,         
             )
 
             intro_sent = True

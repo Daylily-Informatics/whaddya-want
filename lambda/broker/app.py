@@ -26,7 +26,7 @@ if _CONFIG.vision_model_id:
 # This lets us reuse the latest vision_scene for follow-up questions like
 # "what color are the curtains?" without forcing every request to carry an image.
 _LAST_VISION_BY_SESSION: Dict[str, Dict[str, Any]] = {}
-VISION_MAX_AGE_SEC = 5.0
+VISION_MAX_AGE_SEC = 12.0
 
 
 # ----- HTTP helpers -----

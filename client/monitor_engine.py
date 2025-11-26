@@ -556,7 +556,23 @@ class MonitorEngine:
             if nm:
                 return nm
         return None
+    
+    def get_best_recent_frame(self) -> Optional[np.ndarray]:
+        """
+        Return the sharpest recent frame from the buffer, if any.
 
+        Used by the CLI when the user asks questions like
+        'what do you see' or 'what can you tell me about the dog'.
+        """
+        if not self.frame_buffer:
+            return None
+        best = max(self.frame_buffer, key=lambda e: float(e.get("sharpness", 0.0)))
+        frame = best.get("frame")
+        if frame is None:
+            return None
+        return frame.copy()
+
+    
     async def step(self) -> None:
         if self.stop_flag:
             return
