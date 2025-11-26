@@ -17,8 +17,9 @@ Globals:
         # --- Resources wired at deploy ---
         CONVERSATION_TABLE: !Ref ConversationTable
         AUDIO_BUCKET: !Ref AudioBucket
-        # --- LLM / TTS ---
+        # --- LLM / TTS / VISION ---
         MODEL_ID: !Ref ModelId
+        VISION_MODEL_ID: !Ref VisionModelId
         POLLY_VOICE: !Ref PollyVoice
         AI_NAME: Marvin
         # Optional: external LLM secret ARN (pass empty to skip)
@@ -28,6 +29,10 @@ Parameters:
     Type: String
     Default: meta.llama3-1-8b-instruct-v1:0
     Description: Bedrock model ID (or inference profile ARN). Titan text uses amazon.titan-text-express-v1.
+  VisionModelId:
+    Type: String
+    Default: anthropic.claude-3-sonnet-20240229-v1:0
+    Description: Bedrock multimodal model ID for vision (Claude 3.x Sonnet with image support).
   PollyVoice:
     Type: String
     Default: Joanna

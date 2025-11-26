@@ -8,11 +8,18 @@ import traceback
 from typing import Any, Dict, Optional, Tuple
 
 from companion import ConversationBroker, RuntimeConfig
+from companion.vision import VisionClient, VisionConfig
 
 
 # ----- Broker singleton -----
 _CONFIG = RuntimeConfig.from_env()
 _BROKER = ConversationBroker(_CONFIG)
+
+_VISION: Optional[VisionClient] = None
+if _CONFIG.vision_model_id:
+    _VISION = VisionClient(
+        VisionConfig(region_name=_CONFIG.region_name, model_id=_CONFIG.vision_model_id)
+    )
 
 
 # ----- HTTP helpers -----
@@ -111,7 +118,12 @@ def handler(event, context):
     if not text:
         return _bad_request("missing or invalid 'text'", headers=out_hdr)
 
-    context_in = body.get("context") or {}
+    context_raw = body.get("context")
+    if isinstance(context_raw, dict):
+        context_in: Dict[str, Any] = dict(context_raw)
+    else:
+        context_in = {}
+
     speaker = context_in.get("speaker_id")
     text_only = _is_truthy(body.get("text_only"))
 
@@ -120,6 +132,28 @@ def handler(event, context):
         voice_id = voice_id.strip() or None
     else:
         voice_id = None
+
+    # Optional: run a vision pass if an inline image was provided
+    image_b64 = body.get("image_base64")
+    vision_scene: Optional[Dict[str, Any]] = None
+    if _VISION is not None and isinstance(image_b64, str):
+        payload = image_b64.strip()
+        if payload:
+            try:
+                img_bytes = base64.b64decode(payload, validate=True)
+            except Exception:
+                img_bytes = None
+            if img_bytes:
+                try:
+                    hint_val = context_in.get("vision_hint")
+                    hint = hint_val if isinstance(hint_val, str) and hint_val.strip() else None
+                    vision_scene = _VISION.describe_scene(img_bytes, hint=hint)
+                except Exception as exc:
+                    # Don't kill the whole request if vision fails; just surface the error.
+                    vision_scene = {"error": str(exc)}
+
+    if vision_scene is not None:
+        context_in["vision_scene"] = vision_scene
 
     # Identity fast-path: cheap and deterministic; text-only on purpose.
     if speaker and re.search(r"\b(who am i|what'?s my name|who'?s speaking)\b", text.lower()):

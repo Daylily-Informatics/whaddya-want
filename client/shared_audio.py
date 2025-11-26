@@ -180,6 +180,7 @@ async def speak_via_broker(
     timeout: int = 60,
     verbose: bool = False,
     barge_monitor: Optional[Callable[[], Awaitable[None]]] = None,
+    image_jpeg: Optional[bytes] = None,
 ) -> Optional[Dict[str, Any]]:
     """Shared broker interaction: POST text and optionally play returned audio.
 
@@ -196,9 +197,12 @@ async def speak_via_broker(
     if voice_id:
         payload["voice_id"] = voice_id
     if context:
-        payload["context"] = context
+        # copy to avoid mutating caller-owned dicts
+        payload["context"] = dict(context)
     if text_only:
         payload["text_only"] = True
+    if image_jpeg is not None:
+        payload["image_base64"] = base64.b64encode(image_jpeg).decode("ascii")
 
     if verbose:
         print(f"[diag] POST {broker_url}")
@@ -279,7 +283,9 @@ def say_via_broker_sync(
     timeout: int = 60,
     verbose: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    """Synchronous wrapper around speak_via_broker for threading callers."""
+    """
+    Synchronous wrapper around speak_via_broker for threading callers.
+    """
 
     return asyncio.run(
         speak_via_broker(
