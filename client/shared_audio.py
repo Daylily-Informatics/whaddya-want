@@ -40,7 +40,11 @@ class AudioPlayer:
         self.enabled = _MP3_READY
         self._warned = False
         self._mute_guard = mute_guard
-        self._abort_evt = asyncio.Event()
+        self._loop = _audio_loop
+        self._abort_evt = asyncio.run_coroutine_threadsafe(self._create_event(), self._loop).result()
+
+    async def _create_event(self) -> asyncio.Event:
+        return asyncio.Event()
 
     def _resample(self, audio: np.ndarray, src_rate: int) -> tuple[np.ndarray, int]:
         """Resample to the output device's preferred rate to avoid crackle."""
@@ -119,7 +123,7 @@ class AudioPlayer:
 
     def stop(self) -> None:
         try:
-            self._abort_evt.set()
+            self._loop.call_soon_threadsafe(self._abort_evt.set)
         except Exception:
             pass
 

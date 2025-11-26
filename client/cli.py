@@ -83,6 +83,7 @@ async def stream_microphone(
     input_device: Optional[int] = None,
     analysis_buf: Optional[deque] = None,
     mute_event: Optional[threading.Event] = None,
+    stop_signal: Optional[threading.Event] = None,
     verbose: bool = False,
 ) -> AsyncGenerator[str, None]:
     client = TranscribeStreamingClient(region=region)
@@ -94,7 +95,8 @@ async def stream_microphone(
 
     loop = asyncio.get_running_loop()
     raw_q: "queue.Queue[bytes]" = queue.Queue(maxsize=100)
-    async_q: "asyncio.Queue[bytes]" = asyncio.Queue(maxsize=100)
+    async_q: "asyncio.Queue[Optional[bytes]]" = asyncio.Queue(maxsize=100)
+    stop_evt = stop_signal or threading.Event()
 
     def audio_cb(indata, frames, time_info, status):
         if status and verbose:
@@ -119,16 +121,23 @@ async def stream_microphone(
             device=input_device,
             callback=audio_cb,
         ):
-            while True:
-                chunk = raw_q.get()
+            while not stop_evt.is_set():
+                try:
+                    chunk = raw_q.get(timeout=0.25)
+                except queue.Empty:
+                    continue
                 loop.call_soon_threadsafe(async_q.put_nowait, chunk)
+        loop.call_soon_threadsafe(async_q.put_nowait, None)
 
-    threading.Thread(target=mic_thread, daemon=True).start()
+    mic_thr = threading.Thread(target=mic_thread, daemon=True)
+    mic_thr.start()
 
     async def sender():
         try:
             while True:
                 chunk = await async_q.get()
+                if chunk is None:
+                    break
                 await stream.input_stream.send_audio_event(audio_chunk=chunk)
         finally:
             await stream.input_stream.end_stream()
@@ -144,6 +153,10 @@ async def stream_microphone(
     finally:
         send_task.cancel()
         recv_task.cancel()
+        stop_evt.set()
+        with contextlib.suppress(queue.Full):
+            raw_q.put_nowait(b"")
+        mic_thr.join(timeout=2)
 
 
 # ---- Helpers / commands ----
@@ -560,7 +573,7 @@ async def run() -> bool:
         f"Session {args.session}  region={args.region}  devices: camera={cam_idx} mic={mic_idx} spk={spk_idx}"
     )
 
-    stop = asyncio.Event()
+    stop = threading.Event()
     loop = asyncio.get_running_loop()
     player, playback_mute = get_shared_audio()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -651,9 +664,13 @@ async def run() -> bool:
 
     mic: Optional[AsyncGenerator[str, None]] = None
     mic_task: Optional[asyncio.Task] = None
+    mic_stop_signal: Optional[threading.Event] = None
 
     def _start_microphone(new_idx: Optional[int]):
-        nonlocal mic, mic_task, mic_idx
+        nonlocal mic, mic_task, mic_idx, mic_stop_signal
+        if mic_stop_signal is not None:
+            mic_stop_signal.set()
+        mic_stop_signal = threading.Event()
         mic = stream_microphone(
             region=args.region,
             language_code=args.language,
@@ -662,19 +679,22 @@ async def run() -> bool:
             input_device=new_idx,
             analysis_buf=analysis_buf,
             mute_event=playback_mute,
+            stop_signal=mic_stop_signal,
             verbose=verbose,
         )
         mic_task = asyncio.create_task(mic.__anext__())
         mic_idx = new_idx
 
     async def _switch_microphone(new_idx: int) -> bool:
-        nonlocal mic, mic_task, mic_idx
+        nonlocal mic, mic_task, mic_idx, mic_stop_signal
         prev_idx = mic_idx
         mic_task.cancel()
         with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
             await mic_task
         with contextlib.suppress(Exception):
             await mic.aclose()
+        if mic_stop_signal is not None:
+            mic_stop_signal.set()
 
         try:
             sd.check_input_settings(device=new_idx, samplerate=args.rate, channels=args.channels)
@@ -1145,6 +1165,8 @@ async def run() -> bool:
                 await _handle_command(cmd_spec)
 
     finally:
+        if mic_stop_signal is not None:
+            mic_stop_signal.set()
         mic_task.cancel()
         with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
             await mic_task

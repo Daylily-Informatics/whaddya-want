@@ -1,4 +1,4 @@
-"""Wrapper around the OpenAI API for conversational responses."""
+"""Wrapper around Bedrock/OpenAI APIs for conversational responses."""
 from __future__ import annotations
 
 import json
@@ -16,16 +16,19 @@ class LLMResponse:
 
 
 class LLMClient:
-    """Small helper around the OpenAI Chat Completions API."""
+    """Helper around OpenAI Chat Completions and Bedrock Converse APIs."""
 
     def __init__(self, secret_id: str, region_name: str, model: str = "gpt-4o-mini") -> None:
         self._secrets = boto3.client("secretsmanager", region_name=region_name)
         self._secret_id = secret_id
         self._model = model
         self._client: OpenAI | None = None
+        self._bedrock = boto3.client("bedrock-runtime", region_name=region_name)
+        bedrock_prefixes = ("amazon.", "anthropic.", "meta.", "cohere.", "mistral.")
+        self._provider = "bedrock" if model.startswith(bedrock_prefixes) else "openai"
 
     def _ensure_credentials(self) -> None:
-        if self._client:
+        if self._provider != "openai" or self._client:
             return
         secret = self._secrets.get_secret_value(SecretId=self._secret_id)
         payload = secret.get("SecretString")
@@ -39,7 +42,7 @@ class LLMClient:
             )
         self._client = OpenAI(api_key=api_key)
 
-    def chat(self, messages: list[dict[str, str]], tools: list[dict[str, Any]] | None = None) -> LLMResponse:
+    def _chat_openai(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None) -> LLMResponse:
         self._ensure_credentials()
         assert self._client  # narrow type
         response = self._client.chat.completions.create(
@@ -50,6 +53,29 @@ class LLMClient:
         choice = response.choices[0].message
         tool_calls = [call.model_dump() for call in choice.tool_calls or []]
         return LLMResponse(message=choice.content or "", tool_calls=tool_calls)
+
+    def _chat_bedrock(self, messages: list[dict[str, Any]]) -> LLMResponse:
+        sys_msgs = [{"text": m["content"]} for m in messages if m.get("role") == "system"]
+        chat_msgs = [
+            {"role": m["role"], "content": [{"text": m["content"]}]}
+            for m in messages
+            if m.get("role") != "system"
+        ]
+        kwargs: dict[str, Any] = {
+            "modelId": self._model,
+            "messages": chat_msgs,
+            "inferenceConfig": {"maxTokens": 300, "temperature": 0.4, "topP": 0.9},
+        }
+        if sys_msgs:
+            kwargs["system"] = sys_msgs
+        response = self._bedrock.converse(**kwargs)
+        msg = response["output"]["message"]["content"][0]["text"]
+        return LLMResponse(message=msg, tool_calls=[])
+
+    def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> LLMResponse:
+        if self._provider == "bedrock":
+            return self._chat_bedrock(messages)
+        return self._chat_openai(messages, tools)
 
 
 __all__ = ["LLMClient", "LLMResponse"]

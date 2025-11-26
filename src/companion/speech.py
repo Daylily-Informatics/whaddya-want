@@ -14,10 +14,12 @@ class SpeechSynthesizer:
         self._bucket = bucket
         self._voice = voice_id
 
-    def synthesize(self, text: str, session_id: str, response_id: str) -> dict[str, str]:
+    def synthesize(
+        self, text: str, session_id: str, response_id: str, *, voice_id: str | None = None
+    ) -> dict[str, str]:
         ssml_text = f'<speak><prosody rate="slow" pitch="-6%">{escape(text)}</prosody></speak>'
         polly = self._polly.synthesize_speech(
-            Text=ssml_text, TextType="ssml", VoiceId=self._voice, OutputFormat="mp3"
+            Text=ssml_text, TextType="ssml", VoiceId=voice_id or self._voice, OutputFormat="mp3"
         )
         stream_body = polly["AudioStream"]
         try:

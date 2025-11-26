@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+from xml.sax.saxutils import escape
 
 import boto3
 
@@ -13,8 +14,13 @@ class SpeechSynthesizer:
         self._bucket = bucket
         self._voice = voice_id
 
-    def synthesize(self, text: str, session_id: str, response_id: str) -> dict[str, str]:
-        polly = self._polly.synthesize_speech(Text=text, VoiceId=self._voice, OutputFormat="mp3")
+    def synthesize(
+        self, text: str, session_id: str, response_id: str, *, voice_id: str | None = None
+    ) -> dict[str, str]:
+        ssml_text = f'<speak><prosody rate="slow" pitch="-6%">{escape(text)}</prosody></speak>'
+        polly = self._polly.synthesize_speech(
+            Text=ssml_text, TextType="ssml", VoiceId=voice_id or self._voice, OutputFormat="mp3"
+        )
         stream_body = polly["AudioStream"]
         try:
             audio_stream = stream_body.read()
