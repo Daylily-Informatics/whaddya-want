@@ -31,7 +31,7 @@ Parameters:
     Description: Bedrock model ID (or inference profile ARN). Titan text uses amazon.titan-text-express-v1.
   VisionModelId:
     Type: String
-    Default: anthropic.claude-3-sonnet-20240229-v1:0
+    Default: anthropic.claude-3-opus-20240229-v1:0
     Description: Bedrock multimodal model ID for vision (Claude 3.x Sonnet with image support).
   PollyVoice:
     Type: String
