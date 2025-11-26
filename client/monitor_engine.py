@@ -151,6 +151,13 @@ class MonitorConfig:
     entry_cooldown_s: float = 5.0
     roi: str = "0,0,1,1"
     animal_match_thresh: float = 0.22
+    # vision / VLM integration
+    #   "off"          → never send frames
+    #   "entry_only"   → send one frame on entry events
+    #   "entry_and_window" → send on entry + periodic snapshots during a short motion window
+    vision_mode: str = "entry_and_window"
+    vision_sample_interval_s: float = 5.0
+    vision_motion_window_s: float = 15.0
 
 
 class MonitorEngine:
@@ -195,6 +202,11 @@ class MonitorEngine:
         # pending unknown face encoding waiting for a name
         self.pending_face_enc: Optional[np.ndarray] = None
 
+        # vision / VLM sampling state
+        self.vision_last_sample: float = 0.0
+        self.vision_active_until: float = 0.0
+        self.vision_busy: bool = False
+
     async def _speak(self, text: str, *, timeout: float = 30.0) -> None:
         await speak_via_broker(
             broker_url=self.cfg.broker_url,
@@ -210,6 +222,61 @@ class MonitorEngine:
             verbose=False,
             barge_monitor=None,
         )
+
+    async def _send_vision_snapshot(
+        self,
+        frame: np.ndarray,
+        *,
+        mode: str,
+        context_extra: Optional[Dict[str, Any]] = None,
+        text: Optional[str] = None,
+    ) -> None:
+        """
+        Compress the current frame to JPEG and send it to the broker alongside a brief
+        MONITOR_EVENT text. For `mode="entry"` this usually speaks; for `mode="update"`
+        it defaults to text_only so Marvin doesn't chatter constantly.
+        """
+        if self.cfg.vision_mode == "off":
+            return
+        if self.vision_busy:
+            return
+        self.vision_busy = True
+        try:
+            ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+            if not ok:
+                return
+            jpeg_bytes = buf.tobytes()
+
+            ctx: Dict[str, Any] = {"intro_already_sent": True}
+            if context_extra:
+                ctx.update(context_extra)
+
+            if not text:
+                if mode == "entry":
+                    message_text = "MONITOR_EVENT: entry"
+                else:
+                    message_text = "MONITOR_EVENT: scene_update"
+            else:
+                message_text = text
+
+            await speak_via_broker(
+                broker_url=self.cfg.broker_url,
+                session_id=self.cfg.session,
+                text=message_text,
+                voice_id=self.cfg.voice_id,
+                voice_mode=self.cfg.voice_mode,
+                player=self.player,
+                playback_mute=self.playback_mute,
+                context=ctx,
+                text_only=(mode != "entry"),
+                timeout=30,
+                verbose=False,
+                barge_monitor=None,
+                image_jpeg=jpeg_bytes,
+            )
+        finally:
+            self.vision_busy = False
+            self.vision_last_sample = time.monotonic()
 
     def _record_frame(
         self,
@@ -371,7 +438,7 @@ class MonitorEngine:
             cv2.destroyWindow(self.window_title)
         except Exception:
             pass
-    
+
     def enroll_pending_face(self, name: str) -> bool:
         """
         Enroll a face for `name`.
@@ -437,7 +504,6 @@ class MonitorEngine:
         print(f"[monitor] enrolled face as {name}")
         return True
 
-   
     def identify_current_face_name(self) -> Optional[str]:
         """
         Try to identify the most prominent face in the recent frames.
@@ -555,6 +621,8 @@ class MonitorEngine:
                 ):
                     self.last_entry_ts = now_ts
                     self.had_any = True
+                    if self.cfg.vision_mode == "entry_and_window":
+                        self.vision_active_until = time.monotonic() + self.cfg.vision_motion_window_s
                     try:
                         cv2.imwrite(
                             str(
@@ -566,6 +634,23 @@ class MonitorEngine:
                     except Exception:
                         pass
                     await self._handle_entry_event(ents, now_mono, absent_ok)
+
+            # Opportunistic scene snapshots while motion is ongoing / Marvin is talking
+            if self.cfg.vision_mode == "entry_and_window":
+                now = time.monotonic()
+                should_sample = False
+                if now < self.vision_active_until:
+                    should_sample = True
+                if self.playback_mute.is_set() and any(et == "person" for et, _ in ents):
+                    should_sample = True
+
+                if should_sample and (now - self.vision_last_sample) >= self.cfg.vision_sample_interval_s:
+                    await self._send_vision_snapshot(
+                        frame,
+                        mode="update",
+                        context_extra={"monitor_event": "update"},
+                        text="MONITOR_EVENT: scene_update",
+                    )
 
             self.prev_qualified = qualified
 
@@ -588,7 +673,7 @@ class MonitorEngine:
         for item in self.frame_buffer:
             item_ents = item.get("ents") or []
             if any(e == "person" for e, _ in item_ents):
-                if id_frame_info is None or item["sharpness"] > id_frame_info["sharpness"]:
+                if id_frame_info is None or item["sharpness"] > item.get("sharpness", 0.0):
                     id_frame_info = item
         if id_frame_info is None:
             id_frame_info = (
@@ -597,7 +682,7 @@ class MonitorEngine:
                 else {"frame": None, "sharpness": 0.0, "ents": ents}
             )
 
-        id_frame = id_frame_info["frame"]
+        id_frame = id_frame_info.get("frame")
         id_ents = id_frame_info.get("ents") or ents
         if id_frame is None:
             return
@@ -654,7 +739,7 @@ class MonitorEngine:
         for et, (x1, y1, x2, y2) in id_ents:
             if et == "person":
                 continue
-            roi_img = id_frame[max(0, y1) : min(H_id, y2), max(0, x1) : min(W_id, x2)]
+            roi_img = id_frame[max(0, y1): min(H_id, y2), max(0, x1): min(W_id, x2)]
             sig = compute_animal_signature(roi_img)
             label = f"unknown_{et}"
             who = identity.identify_animal(et, sig, max_dist=self.cfg.animal_match_thresh)
@@ -669,12 +754,11 @@ class MonitorEngine:
                     self.last_spoken[label] = now_mono
             detected_labels.add(label)
 
+        # Build compact human/animal summaries for the text side
         humans_parts: List[str] = []
         if known_humans:
             humans_parts.append(
-                "known=["
-                + ", ".join(sorted(repr(h) for h in set(known_humans)))
-                + "]"
+                "known=" + ", ".join(sorted(set(known_humans)))
             )
         if unknown_people:
             humans_parts.append(f"unknown_count={len(unknown_people)}")
@@ -682,6 +766,7 @@ class MonitorEngine:
             humans_parts.append(f"label={fallback_label}")
         if not humans_parts:
             humans_parts.append("none")
+        humans_summary = "; ".join(humans_parts)
 
         animals_parts: List[str] = []
         all_known_animals: List[str] = []
@@ -689,58 +774,50 @@ class MonitorEngine:
             all_known_animals.extend(names)
         if all_known_animals:
             animals_parts.append(
-                "known=["
-                + ", ".join(sorted(repr(a) for a in set(all_known_animals)))
-                + "]"
+                "known=" + ", ".join(sorted(set(all_known_animals)))
             )
         all_unknown_species: List[str] = []
         for et, count in unknown_animals_by_type.items():
             all_unknown_species.extend([et] * count)
         if all_unknown_species:
             animals_parts.append(
-                "unknown_species=["
-                + ", ".join(sorted(repr(a) for a in set(all_unknown_species)))
-                + "]"
+                "unknown_species=" + ", ".join(sorted(set(all_unknown_species)))
             )
         if not animals_parts:
             animals_parts.append("none")
+        animals_summary = "; ".join(animals_parts)
 
-        task_bits: List[str] = []
-        if known_humans:
-            task_bits.append("Greet the known humans by name.")
-        if unknown_people:
-            task_bits.append(
-                "Ask the unknown human(s), briefly and politely, what you should call them."
-            )
-        if all_known_animals or all_unknown_species:
-            task_bits.append(
-                "Optionally acknowledge animals in one short remark, then focus back on helping humans."
-            )
-        task_bits.append("Do NOT re-introduce yourself on monitor events.")
-
-        lines = [
-            "MONITOR_EVENT: entry",
-            "HUMANS: " + " ".join(humans_parts),
-            "ANIMALS: " + " ".join(animals_parts),
-            "TASK: " + " ".join(task_bits),
-        ]
-        monitor_event_text = "\n".join(lines)
-
-        await speak_via_broker(
-            broker_url=self.cfg.broker_url,
-            session_id=self.cfg.session,
-            text=monitor_event_text,
-            voice_id=self.cfg.voice_id,
-            voice_mode=self.cfg.voice_mode,
-            player=self.player,
-            playback_mute=self.playback_mute,
-            context={"intro_already_sent": True},
-            text_only=False,
-            timeout=30,
-            verbose=False,
-            barge_monitor=None,
+        monitor_event_text = (
+            "MONITOR_EVENT: entry\n"
+            f"HUMANS: {humans_summary}\n"
+            f"ANIMALS: {animals_summary}"
         )
 
+        entry_ctx: Dict[str, Any] = {
+            "intro_already_sent": True,
+            "monitor_event": "entry",
+            "known_humans": sorted(set(known_humans)),
+            "unknown_human_count": len(unknown_people),
+            "known_animals": sorted(set(all_known_animals)),
+            "unknown_animals": sorted(set(all_unknown_species)),
+            "fallback_label": fallback_label,
+            "vision_hint": (
+                f"Detected humans: known={sorted(set(known_humans))} "
+                f"unknown_count={len(unknown_people)}; "
+                f"animals: known={sorted(set(all_known_animals))} "
+                f"unknown_species={sorted(set(all_unknown_species))}"
+            ),
+        }
+
+        # Send initial entry snapshot to the broker's VLM if enabled
+        await self._send_vision_snapshot(
+            id_frame,
+            mode="entry",
+            context_extra=entry_ctx,
+            text=monitor_event_text,
+        )
+
+        # Update overlay labels
         self.display_id_labels.clear()
         if known_humans:
             self.display_id_labels["person"] = ", ".join(sorted(set(known_humans)))

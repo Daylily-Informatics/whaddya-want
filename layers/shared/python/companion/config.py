@@ -35,6 +35,7 @@ class RuntimeConfig:
     llm_provider: str = "bedrock"
     llm_model_id: str = ""
     use_memory: bool = True
+    vision_model_id: str = ""  # Bedrock multimodal model for vision (optional)
 
     @classmethod
     def from_env(cls) -> "RuntimeConfig":
@@ -48,6 +49,7 @@ class RuntimeConfig:
         prompts_path = os.getenv("PROMPTS_CONFIG") or str(find_config_file("prompts.yaml"))
 
         model_id = _env("MODEL_ID", default="amazon.titan-text-express-v1")
+        vision_model_id = os.getenv("VISION_MODEL_ID", "").strip()
 
         provider = os.getenv("LLM_PROVIDER", "").strip().lower()
         if not provider:
@@ -75,6 +77,7 @@ class RuntimeConfig:
             llm_provider=provider,
             llm_model_id=model_id,
             use_memory=use_memory,
+            vision_model_id=vision_model_id,
         )
 
 
