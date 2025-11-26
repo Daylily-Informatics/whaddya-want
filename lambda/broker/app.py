@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+import time
 import traceback
 from typing import Any, Dict, Optional, Tuple
 
@@ -20,6 +21,12 @@ if _CONFIG.vision_model_id:
     _VISION = VisionClient(
         VisionConfig(region_name=_CONFIG.region_name, model_id=_CONFIG.vision_model_id)
     )
+
+# ----- Short-lived vision cache (per process, per session) -----
+# This lets us reuse the latest vision_scene for follow-up questions like
+# "what color are the curtains?" without forcing every request to carry an image.
+_LAST_VISION_BY_SESSION: Dict[str, Dict[str, Any]] = {}
+VISION_MAX_AGE_SEC = 5.0
 
 
 # ----- HTTP helpers -----
@@ -152,9 +159,25 @@ def handler(event, context):
                     # Don't kill the whole request if vision fails; just surface the error.
                     vision_scene = {"error": str(exc)}
 
+    # Attach fresh scene for this call and update cache
     if vision_scene is not None:
         context_in["vision_scene"] = vision_scene
-        context_in["vision_debug"] = f"VISION_SCENE_DEBUG={json.dumps(vision_scene)[:400]}"
+        _LAST_VISION_BY_SESSION[session_id] = {
+            "scene": vision_scene,
+            "ts": time.time(),
+        }
+    else:
+        # No inline image this time; if we have a recent cached scene for this
+        # session, attach it so follow-up environment questions can see it.
+        cached = _LAST_VISION_BY_SESSION.get(session_id)
+        if cached and "vision_scene" not in context_in:
+            try:
+                ts = float(cached.get("ts", 0.0))
+            except (TypeError, ValueError):
+                ts = 0.0
+            age = time.time() - ts
+            if age <= VISION_MAX_AGE_SEC:
+                context_in["vision_scene"] = cached["scene"]
 
     # Identity fast-path: cheap and deterministic; text-only on purpose.
     if speaker and re.search(r"\b(who am i|what'?s my name|who'?s speaking)\b", text.lower()):
