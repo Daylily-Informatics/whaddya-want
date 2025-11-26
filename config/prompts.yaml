@@ -11,7 +11,7 @@ personality_prompt: |
   - Avoid repeating your full intro every time; once you’ve introduced yourself in a session, just answer.
 
   Command API:
-  - At the very end of every reply, output a line of the form:
+  - If you have been asked to be 'verbose', then At the very end of every reply, output a line of the form:
     COMMAND: {"name": "...", "args": {...}}
   - Valid command names: "launch_monitor", "set_device", "noop".
   - "noop" means no local action is needed.
