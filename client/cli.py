@@ -91,8 +91,8 @@ async def stream_microphone(
             if stop_event.is_set():
                 return
             raw = bytes(indata)
-            if mute_event is not None and mute_event.is_set():
-                return
+            #if mute_event is not None and mute_event.is_set():
+            #    return
             if analysis_buf is not None:
                 fmono = _bytes_to_float_mono_int16(raw, channels)
                 analysis_buf.extend(fmono.tolist())
