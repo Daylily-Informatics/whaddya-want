@@ -28,23 +28,22 @@ _audio_thread.start()
 _MP3_READY = False
 try:
     from pydub import AudioSegment  # type: ignore
+
     _MP3_READY = True
 except Exception as e:
     print("[diag] pydub import failed:", repr(e), file=sys.stderr)
     _MP3_READY = False
 
-import sounddevice as sd
+import sounddevice as sd  # noqa: E402
+
 
 class AudioPlayer:
     def __init__(self, mute_guard=None) -> None:
         self.enabled = _MP3_READY
         self._warned = False
         self._mute_guard = mute_guard
-        self._loop = _audio_loop
-        self._abort_evt = asyncio.run_coroutine_threadsafe(self._create_event(), self._loop).result()
-
-    async def _create_event(self) -> asyncio.Event:
-        return asyncio.Event()
+        # Thread-safe abort flag signalled from any thread
+        self._abort_flag = threading.Event()
 
     def _resample(self, audio: np.ndarray, src_rate: int) -> tuple[np.ndarray, int]:
         """Resample to the output device's preferred rate to avoid crackle."""
@@ -82,7 +81,11 @@ class AudioPlayer:
             seg = AudioSegment.from_file(io.BytesIO(data), format="mp3")
         except Exception as exc:
             if not self._warned:
-                print("[diag] unable to decode mp3 — install ffmpeg/libav for pydub:", exc, file=sys.stderr)
+                print(
+                    "[diag] unable to decode mp3 — install ffmpeg/libav for pydub:",
+                    exc,
+                    file=sys.stderr,
+                )
                 self._warned = True
             return (None, None)
         samples = np.array(seg.get_array_of_samples())
@@ -100,21 +103,21 @@ class AudioPlayer:
         if self._mute_guard is not None:
             self._mute_guard.set()
         loop = asyncio.get_running_loop()
-        self._abort_evt.clear()
+        self._abort_flag.clear()
         try:
             audio, rate = await loop.run_in_executor(None, self._decode, data)
             if audio is None or rate is None:
                 return False
             sd.play(audio, rate)
             duration = float(audio.shape[0]) / float(rate)
-            try:
-                await asyncio.wait_for(self._abort_evt.wait(), timeout=duration + 0.25)
-            except asyncio.TimeoutError:
-                pass
-            finally:
-                sd.stop()
+            # Poll the abort flag without touching asyncio primitives across threads.
+            end_time = loop.time() + duration + 0.25
+            while loop.time() < end_time and not self._abort_flag.is_set():
                 await asyncio.sleep(0.05)
+            sd.stop()
+            await asyncio.sleep(0.05)
             if self._mute_guard is not None:
+                # Give a small grace period where the mic capture thread ignores audio.
                 await asyncio.sleep(0.15)
         finally:
             if self._mute_guard is not None:
@@ -122,10 +125,9 @@ class AudioPlayer:
         return True
 
     def stop(self) -> None:
-        try:
-            self._loop.call_soon_threadsafe(self._abort_evt.set)
-        except Exception:
-            pass
+        # Can be called safely from any thread
+        self._abort_flag.set()
+
 
 async def _play_on_audio_loop(player: "AudioPlayer", data: bytes) -> bool:
     """Run player.play on the dedicated audio loop and await completion."""
@@ -206,7 +208,11 @@ async def speak_via_broker(
     if not r.ok:
         rid = r.headers.get("x-amzn-RequestId") or r.headers.get("x-amz-apigw-id") or "?"
         print(f"[broker error] HTTP {r.status_code} {r.reason}  request-id={rid}", file=sys.stderr)
-        h_subset = {k: r.headers.get(k) for k in ["x-amzn-RequestId", "x-amz-apigw-id", "content-type", "date"] if r.headers.get(k)}
+        h_subset = {
+            k: r.headers.get(k)
+            for k in ["x-amzn-RequestId", "x-amz-apigw-id", "content-type", "date"]
+            if r.headers.get(k)
+        }
         if h_subset:
             print(f"[broker headers] {h_subset}", file=sys.stderr)
         try:
@@ -215,7 +221,11 @@ async def speak_via_broker(
         except Exception:
             bt = (r.text or "").strip()
             if bt:
-                print("[broker body.text]", bt[:4000] + ("…(truncated)…" if len(bt) > 4000 else ""), file=sys.stderr)
+                print(
+                    "[broker body.text]",
+                    bt[:4000] + ("…(truncated)…" if len(bt) > 4000 else ""),
+                    file=sys.stderr,
+                )
         return None
 
     try:

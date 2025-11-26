@@ -7,12 +7,12 @@ import re
 import traceback
 from typing import Any, Dict, Optional, Tuple
 
-from companion.broker import ConversationBroker
-from companion.config import RuntimeConfig
+from companion import ConversationBroker, RuntimeConfig
 
-# Instantiate shared broker components once per container
-CONFIG = RuntimeConfig.from_env()
-BROKER = ConversationBroker(CONFIG)
+
+# ----- Broker singleton -----
+_CONFIG = RuntimeConfig.from_env()
+_BROKER = ConversationBroker(_CONFIG)
 
 
 # ----- HTTP helpers -----
@@ -41,7 +41,13 @@ def _bad_request(msg: str, *, headers: Dict[str, str] | None = None) -> Dict[str
     }
 
 
-def _server_error(exc: Exception, *, headers: Dict[str, str] | None, request_id: str, code: int = 500) -> Dict[str, Any]:
+def _server_error(
+    exc: Exception,
+    *,
+    headers: Dict[str, str] | None,
+    request_id: str,
+    code: int = 500,
+) -> Dict[str, Any]:
     tb_lines = traceback.format_exc().strip().splitlines()
     tail = tb_lines[-8:] if tb_lines else []
     h = _base_headers(
@@ -85,16 +91,85 @@ def _is_truthy(val: Any) -> bool:
     return False
 
 
+# ----- Command extraction -----
+def _extract_command(reply: str) -> Tuple[str, Dict[str, Any]]:
+    """
+    Parse an optional trailing 'COMMAND: {...}' line from the LLM reply.
+
+    Returns (clean_text, command_dict). If no valid command is found, returns
+    the original reply (stripped) and a default noop command.
+    """
+    default_cmd: Dict[str, Any] = {"name": "noop", "args": {}}
+    if not isinstance(reply, str):
+        return str(reply), default_cmd
+
+    allowed_names = {"launch_monitor", "set_device", "noop"}
+
+    # Look for a line starting with 'COMMAND:' and capture the JSON blob
+    m = re.search(r"^COMMAND:\s*(\{.*\})\s*$", reply, flags=re.MULTILINE)
+    if m:
+        cmd_json = m.group(1)
+        # Remove the COMMAND line from the visible text
+        clean = re.sub(r"^COMMAND:.*$", "", reply, flags=re.MULTILINE).rstrip()
+
+        cmd = default_cmd
+        try:
+            parsed = json.loads(cmd_json)
+            if isinstance(parsed, dict):
+                name = parsed.get("name") or "noop"
+                args = parsed.get("args") or {}
+                if isinstance(name, str) and isinstance(args, dict):
+                    if name in allowed_names:
+                        cmd = {"name": name, "args": args}
+        except Exception:
+            # On any parse error, fall back to noop but keep the cleaned text
+            cmd = default_cmd
+
+        return clean.strip(), cmd
+
+    # Fallback: handle looser phrasing like "command name: noop args: {}"
+    alt = re.search(
+        r"^command\s+name[:\s]+([\w-]+)\s+args[:\s]+(.*)$",
+        reply,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    if alt:
+        clean = re.sub(
+            r"^command\s+name[:\s]+.*$",
+            "",
+            reply,
+            flags=re.IGNORECASE | re.MULTILINE,
+        ).rstrip()
+        name = alt.group(1).strip()
+        args_raw = (alt.group(2) or "").strip()
+        cmd = default_cmd
+        args: Dict[str, Any] = {}
+        try:
+            args = json.loads(args_raw) if args_raw else {}
+        except Exception:
+            args = {}
+
+        if name in allowed_names and isinstance(args, dict):
+            cmd = {"name": name, "args": args}
+
+        return clean.strip(), cmd
+
+    return reply.strip(), default_cmd
+
+
 # ----- Lambda handler -----
 def handler(event, context):
+    # Correlate with client
     hdr_in = event.get("headers") or {}
     client_session = hdr_in.get("x-client-session") or hdr_in.get("X-Client-Session") or ""
     out_hdr = {"x-client-session": client_session} if client_session else {}
 
+    # Parse body
     body, berr = _parse_body(event)
     if berr:
         return _bad_request(berr, headers=out_hdr)
 
+    # Validate inputs early → clear 4xx instead of mystery 500s
     session_id = (body.get("session_id") or "").strip()
     text = (body.get("text") or "").strip()
     if not session_id:
@@ -103,51 +178,53 @@ def handler(event, context):
         return _bad_request("missing or invalid 'text'", headers=out_hdr)
 
     context_in = body.get("context") or {}
+    speaker = context_in.get("speaker_id")
+    text_only = _is_truthy(body.get("text_only"))
+
     voice_id = body.get("voice_id")
     if isinstance(voice_id, str):
         voice_id = voice_id.strip() or None
     else:
         voice_id = None
-    text_only = _is_truthy(body.get("text_only"))
 
-    # Identity fast-path
-    speaker = context_in.get("speaker_id") if isinstance(context_in, dict) else None
+    # Identity fast-path: cheap and deterministic; text-only on purpose.
     if speaker and re.search(r"\b(who am i|what'?s my name|who'?s speaking)\b", text.lower()):
-        reply_text = f"You are {speaker}."
-        payload = {"text": reply_text, "command": {"name": "noop", "args": {}}, "audio": {"audio_base64": None}}
-        if text_only:
-            return _ok(payload, headers=out_hdr)
-        try:
-            audio = BROKER._speech.synthesize(  # type: ignore[attr-defined]
-                text=reply_text,
-                session_id=session_id,
-                response_id=str(getattr(context, "aws_request_id", "0")),
-                voice_id=voice_id,
-            )
-            payload["audio"] = audio
-        except Exception:
-            pass
-        return _ok(payload, headers=out_hdr)
+        plain = {
+            "text": f"You are {speaker}.",
+            "audio": {"audio_base64": None},
+            "command": {"name": "noop", "args": {}},
+        }
+        return _ok(plain, headers=out_hdr)
 
+    # Generate reply via canonical ConversationBroker
     try:
-        broker_resp = BROKER.handle(
+        broker_out = _BROKER.handle(
             session_id=session_id,
             user_text=text,
-            context=context_in if isinstance(context_in, dict) else {},
-            text_only=text_only,
+            context=context_in,
             voice_id=voice_id,
         )
     except Exception as exc:
-        return _server_error(exc, headers=out_hdr, request_id=getattr(context, "aws_request_id", "unknown"), code=502)
+        # Return structured 502 so the client can see cause immediately
+        return _server_error(
+            exc,
+            headers=out_hdr,
+            request_id=getattr(context, "aws_request_id", "unknown"),
+            code=502,
+        )
 
-    audio_payload = broker_resp.get("audio") or {"audio_base64": None}
+    raw_reply = str(broker_out.get("text") or "")
+    audio_payload = broker_out.get("audio") or {}
+    reply, command = _extract_command(raw_reply)
+
+    # If text-only was requested, clear inline audio. Broker may still write to S3.
     if text_only and isinstance(audio_payload, dict):
+        audio_payload = dict(audio_payload)
         audio_payload["audio_base64"] = None
-    return _ok(
-        {
-            "text": broker_resp.get("text", ""),
-            "command": broker_resp.get("command") or {"name": "noop", "args": {}},
-            "audio": audio_payload,
-        },
-        headers=out_hdr,
-    )
+
+    body_out: Dict[str, Any] = {
+        "text": reply,
+        "audio": audio_payload,
+        "command": command,
+    }
+    return _ok(body_out, headers=out_hdr)
