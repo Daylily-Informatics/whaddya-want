@@ -221,6 +221,9 @@ class MonitorEngine:
         self.vision_active_until: float = 0.0
         self.vision_busy: bool = False
 
+        # Most recent monitor context to share with voice turns
+        self.last_context_for_voice: Optional[Dict[str, Any]] = None
+
     async def _speak(self, text: str, *, timeout: float = 30.0) -> None:
         await speak_via_broker(
             broker_url=self.cfg.broker_url,
@@ -273,6 +276,16 @@ class MonitorEngine:
                     message_text = "MONITOR_EVENT: scene_update"
             else:
                 message_text = text
+
+            ctx_for_voice = dict(ctx)
+            ctx_for_voice.update(
+                {
+                    "monitor_text": message_text,
+                    "monitor_snapshot_mode": mode,
+                    "monitor_snapshot_ts": time.time(),
+                }
+            )
+            self.last_context_for_voice = ctx_for_voice
 
             await speak_via_broker(
                 broker_url=self.cfg.broker_url,
