@@ -2,6 +2,7 @@
 from __future__ import annotations
 import time
 import threading
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -36,6 +37,14 @@ DETECT_CLASSES = [COCO_PERSON, COCO_CAT, COCO_DOG, COCO_HORSE]
 
 REENTRY_ABSENCE_SEC = 2.0
 FRAME_BUFFER_SIZE = 5
+
+
+@dataclass
+class FaceProbeResult:
+    detected: bool
+    recognized_name: Optional[str]
+    captured_unknown: bool
+    fallback_label: Optional[str]
 
 
 def compute_sharpness(bgr: np.ndarray) -> float:
@@ -185,6 +194,149 @@ class MonitorEngine:
 
         # pending unknown face encoding waiting for a name
         self.pending_face_enc: Optional[np.ndarray] = None
+
+    async def _speak(self, text: str, *, timeout: float = 30.0) -> None:
+        await speak_via_broker(
+            broker_url=self.cfg.broker_url,
+            session_id=self.cfg.session,
+            text=text,
+            voice_id=self.cfg.voice_id,
+            voice_mode=self.cfg.voice_mode,
+            player=self.player,
+            playback_mute=self.playback_mute,
+            context={"intro_already_sent": True},
+            text_only=False,
+            timeout=timeout,
+            verbose=False,
+            barge_monitor=None,
+        )
+
+    def _record_frame(
+        self,
+        frame: np.ndarray,
+        ents: List[Tuple[str, Tuple[int, int, int, int]]],
+        sharpness: float,
+    ) -> None:
+        self.frame_buffer.append({"frame": frame.copy(), "sharpness": sharpness, "ents": ents})
+        if len(self.frame_buffer) > FRAME_BUFFER_SIZE:
+            self.frame_buffer.pop(0)
+
+    def _capture_entities(
+        self,
+    ) -> Tuple[Optional[np.ndarray], List[Tuple[str, Tuple[int, int, int, int]]], float]:
+        ret, frame = self.cap.read()
+        if not ret:
+            return None, [], 0.0
+        results = self.model.predict(
+            source=frame,
+            verbose=False,
+            classes=DETECT_CLASSES,
+            conf=0.35,
+        )
+        ents = yolo_entities_strict(
+            results,
+            frame.shape,
+            self.roi,
+            self.cfg.person_conf,
+            self.cfg.animal_conf,
+            self.cfg.min_area_frac,
+        )
+        sharpness = compute_sharpness(frame)
+        self._record_frame(frame, ents, sharpness)
+        return frame, ents, sharpness
+
+    def _make_snotty_name(
+        self, ents: List[Tuple[str, Tuple[int, int, int, int]]], frame_shape: Tuple[int, int, int]
+    ) -> str:
+        H, W = frame_shape[:2]
+        person_boxes = [b for et, b in ents if et == "person"]
+        if not person_boxes or H == 0 or W == 0:
+            return "wiggly mystery blob"
+        areas = []
+        for x1, y1, x2, y2 in person_boxes:
+            frac = max(0.0, (x2 - x1) * (y2 - y1)) / max(1.0, float(W * H))
+            areas.append(frac)
+        max_area = max(areas)
+        if max_area > 0.25:
+            return "restless close-up blur"
+        if max_area > 0.1:
+            return "wiggly silhouette"
+        if max_area > 0.03:
+            return "distant jitter shadow"
+        return "tiny wandering speck"
+
+    async def _collect_faces_with_retries(
+        self,
+        frame: np.ndarray,
+        ents: List[Tuple[str, Tuple[int, int, int, int]]],
+        *,
+        retries: int = 2,
+        wait_seconds: float = 2.0,
+        hold_prompt: str = "Hold still so I can capture your face clearly.",
+    ) -> Tuple[List[Dict[str, Any]], np.ndarray, List[Tuple[str, Tuple[int, int, int, int]]], Optional[str]]:
+        faces = analyze_faces(frame)
+        fallback_label: Optional[str] = None
+        attempts = 0
+        has_person = any(et == "person" for et, _ in ents)
+        while not faces and has_person and attempts < retries:
+            await self._speak(hold_prompt)
+            await asyncio.sleep(wait_seconds)
+            new_frame, new_ents, _ = self._capture_entities()
+            if new_frame is None:
+                break
+            frame = new_frame
+            ents = new_ents
+            has_person = any(et == "person" for et, _ in ents)
+            faces = analyze_faces(frame)
+            attempts += 1
+
+        if not faces and has_person:
+            fallback_label = self._make_snotty_name(ents, frame.shape)
+
+        return faces, frame, ents, fallback_label
+
+    async def probe_face_identity(
+        self,
+        *,
+        retries: int = 2,
+        wait_seconds: float = 2.0,
+    ) -> FaceProbeResult:
+        was_paused = self.paused
+        self.paused = True
+        try:
+            frame, ents, _ = self._capture_entities()
+            if frame is None or not ents:
+                return FaceProbeResult(False, None, False, None)
+
+            faces, frame, ents, fallback_label = await self._collect_faces_with_retries(
+                frame,
+                ents,
+                retries=retries,
+                wait_seconds=wait_seconds,
+            )
+
+            recognized_name: Optional[str] = None
+            captured_unknown = False
+            for f in faces:
+                nm = f.get("name")
+                if nm:
+                    recognized_name = nm
+                    break
+            if recognized_name:
+                self.display_id_labels["person"] = recognized_name
+                self._mark_seen(recognized_name, time.monotonic())
+            elif faces:
+                captured_unknown = True
+                enc = faces[0].get("encoding")
+                if enc is not None:
+                    self.pending_face_enc = np.asarray(enc, dtype=np.float32)
+            elif fallback_label:
+                self.display_id_labels["person"] = fallback_label
+                self._mark_seen(fallback_label, time.monotonic())
+
+            return FaceProbeResult(True, recognized_name, captured_unknown, fallback_label)
+        finally:
+            self.paused = was_paused
 
     def _parse_roi(self, s: str) -> Tuple[float, float, float, float]:
         try:
@@ -348,11 +500,7 @@ class MonitorEngine:
             )
 
             sharpness = compute_sharpness(frame)
-            self.frame_buffer.append(
-                {"frame": frame.copy(), "sharpness": sharpness, "ents": ents}
-            )
-            if len(self.frame_buffer) > FRAME_BUFFER_SIZE:
-                self.frame_buffer.pop(0)
+            self._record_frame(frame, ents, sharpness)
 
             for et, (x1, y1, x2, y2) in ents:
                 if et == "person":
@@ -462,9 +610,15 @@ class MonitorEngine:
         unknown_animals_by_type: Dict[str, int] = {}
         detected_labels: set[str] = set()
 
+        fallback_label: Optional[str] = None
+
         # Humans: identify faces, collect unknowns, stash encoding for enrollment
         if any(e == "person" for e, _ in id_ents):
-            faces = analyze_faces(id_frame)
+            faces, id_frame, id_ents, fallback_label = await self._collect_faces_with_retries(
+                id_frame,
+                id_ents,
+                hold_prompt="Hold still for a moment so I can see your face.",
+            )
             if faces:
                 for f in faces:
                     label = f["name"] or "unknown_person"
@@ -477,6 +631,12 @@ class MonitorEngine:
                             self.last_spoken[label] = now_mono
                     else:
                         unknown_people.append(f)
+            elif fallback_label:
+                detected_labels.add(fallback_label)
+                if self._should_announce(
+                    fallback_label, now_mono=now_mono, absent_ok=absent_ok
+                ):
+                    self.last_spoken[fallback_label] = now_mono
             elif self._should_announce(
                 "unknown_person", now_mono=now_mono, absent_ok=absent_ok
             ):
@@ -518,6 +678,8 @@ class MonitorEngine:
             )
         if unknown_people:
             humans_parts.append(f"unknown_count={len(unknown_people)}")
+        elif fallback_label:
+            humans_parts.append(f"label={fallback_label}")
         if not humans_parts:
             humans_parts.append("none")
 
@@ -584,6 +746,8 @@ class MonitorEngine:
             self.display_id_labels["person"] = ", ".join(sorted(set(known_humans)))
         elif unknown_people:
             self.display_id_labels["person"] = "unknown"
+        elif fallback_label:
+            self.display_id_labels["person"] = fallback_label
         for et, names in known_animals_by_type.items():
             self.display_id_labels[et] = ", ".join(sorted(set(names)))
         for et in unknown_animals_by_type.keys():

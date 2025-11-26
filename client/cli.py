@@ -17,7 +17,7 @@ from amazon_transcribe.handlers import TranscriptResultStreamHandler
 from amazon_transcribe.model import TranscriptResultStream
 
 from client import identity
-from client.monitor_engine import MonitorConfig as MonCfg, MonitorEngine
+from client.monitor_engine import FaceProbeResult, MonitorConfig as MonCfg, MonitorEngine
 from client.shared_audio import AudioPlayer, get_shared_audio, speak_via_broker
 
 # ---- Speaker embedding (SpeechBrain) ----
@@ -870,6 +870,21 @@ async def run() -> bool:
                 break
 
             if _WHOAMI_RE.search(transcript):
+                await speak_via_broker(
+                    broker_url=args.broker_url,
+                    session_id=args.session,
+                    text="Hold still so I can get a clear look at you for face recognition.",
+                    voice_id=voice_id,
+                    voice_mode=args.voice_mode,
+                    player=player,
+                    playback_mute=playback_mute,
+                    context=None,
+                    text_only=args.text_only,
+                    timeout=30,
+                    verbose=verbose,
+                    barge_monitor=None,
+                )
+
                 # voice-based guess
                 voice_name = None
                 wav = take_latest_seconds(analysis_buf, args.id_window, args.rate)
@@ -881,16 +896,51 @@ async def run() -> bool:
                         )
 
                 # face-based guess
-                face_name = None
+                face_probe: Optional[FaceProbeResult] = None
                 if monitor_engine is not None:
+                    face_probe = await monitor_engine.probe_face_identity()
+
+                face_name = None
+                if face_probe and face_probe.detected:
+                    face_name = face_probe.recognized_name
+                elif monitor_engine is not None and face_probe is None:
                     face_name = monitor_engine.identify_current_face_name()
 
                 print(
                     f"[whoami] voice={voice_name or 'unknown'} "
-                    f"face={face_name or 'unknown'}"
+                    f"face={face_name or face_probe and face_probe.fallback_label or 'unknown'}"
                 )
 
-                if voice_name or face_name:
+                voice_hint = (
+                    f"By voice, I think you're {voice_name}. " if voice_name else ""
+                )
+
+                if face_probe is not None:
+                    if not face_probe.detected:
+                        who_text = (
+                            voice_hint
+                            + "I don't see anyone on camera. Please get someone in frame."
+                        )
+                    elif face_probe.recognized_name:
+                        who_text = (
+                            voice_hint
+                            + f"Hi {face_probe.recognized_name}! I matched your face."
+                        )
+                    elif face_probe.captured_unknown:
+                        who_text = (
+                            voice_hint
+                            + "I can see you, but I don't recognize your face yet. "
+                            "Want me to enroll it? Say 'register my voice as <name>'."
+                        )
+                    elif face_probe.fallback_label:
+                        who_text = (
+                            voice_hint
+                            + "I couldn't get a clean face. "
+                            + f"I'm going to call you {face_probe.fallback_label} for now."
+                        )
+                    else:
+                        who_text = voice_hint + "I couldn't get a clean read on your face."
+                elif voice_name or face_name:
                     vt = voice_name or "unknown"
                     ft = face_name or "unknown"
                     who_text = (
