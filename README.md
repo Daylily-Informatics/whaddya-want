@@ -34,6 +34,8 @@ pip install sounddevice numpy requests
 pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
 pip install speechbrain                 
 pip install tensorflow==2.20.0 tensorflow_hub tensorflow-io
+pip install PyYAML -t layers/shared/python
+
 ```
 
 After the script completes activate the environment that was created and export
