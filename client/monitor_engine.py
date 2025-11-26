@@ -137,6 +137,7 @@ def yolo_entities_strict(
 @dataclass
 class MonitorConfig:
     broker_url: str
+    api_key: Optional[str]
     session: str
     voice_id: Optional[str]
     voice_mode: str
@@ -198,6 +199,7 @@ class MonitorEngine:
     async def _speak(self, text: str, *, timeout: float = 30.0) -> None:
         await speak_via_broker(
             broker_url=self.cfg.broker_url,
+            api_key=self.cfg.api_key,
             session_id=self.cfg.session,
             text=text,
             voice_id=self.cfg.voice_id,
@@ -728,6 +730,7 @@ class MonitorEngine:
 
         await speak_via_broker(
             broker_url=self.cfg.broker_url,
+            api_key=self.cfg.api_key,
             session_id=self.cfg.session,
             text=monitor_event_text,
             voice_id=self.cfg.voice_id,

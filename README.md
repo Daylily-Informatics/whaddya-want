@@ -248,6 +248,10 @@ at it:
 export AWS_REGION=us-west-2
 export AWS_DEFAULT_REGION=us-west-2
 
+# If you set BROKER_API_KEY on the Lambda, export the same value so the client
+# sends it in the x-api-key header.
+# export BROKER_API_KEY=super-secret
+
 #python client/cli.py --broker-url https://xxxx.execute-api.us-east-1.amazonaws.com/ingest/audio
 
  PYTHONPATH=. python -m client.cli --broker-url  https://dqetkdpsj6.execute-api.us-west-2.amazonaws.com/ingest/audio --setup-devices --voice Joanna --voice-mode neural --verbose

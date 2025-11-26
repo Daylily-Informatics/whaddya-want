@@ -180,6 +180,7 @@ async def speak_via_broker(
     timeout: int = 60,
     verbose: bool = False,
     barge_monitor: Optional[Callable[[], Awaitable[None]]] = None,
+    api_key: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Shared broker interaction: POST text and optionally play returned audio.
 
@@ -204,13 +205,17 @@ async def speak_via_broker(
         print(f"[diag] POST {broker_url}")
         print("[diag] payload=", json.dumps(payload, indent=2))
 
+    headers = {"X-Client-Session": session_id}
+    if api_key:
+        headers["x-api-key"] = api_key
+
     try:
         r = await asyncio.to_thread(
             requests.post,
             broker_url,
             json=payload,
             timeout=timeout,
-            headers={"X-Client-Session": session_id},
+            headers=headers,
         )
     except requests.RequestException as e:
         print(f"[broker error] request failed: {getattr(e,'args',[repr(e)])[0]}", file=sys.stderr)
@@ -278,6 +283,7 @@ def say_via_broker_sync(
     text_only: bool = False,
     timeout: int = 60,
     verbose: bool = False,
+    api_key: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Synchronous wrapper around speak_via_broker for threading callers."""
 
@@ -294,5 +300,6 @@ def say_via_broker_sync(
             text_only=text_only,
             timeout=timeout,
             verbose=verbose,
+            api_key=api_key,
         )
     )

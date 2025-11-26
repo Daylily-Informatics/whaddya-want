@@ -401,6 +401,7 @@ async def run() -> bool:
         description="Voice client (unified identity + monitor trigger)"
     )
     ap.add_argument("--broker-url", default=params.get("broker_url"), required=params.get("broker_url") is None)
+    ap.add_argument("--broker-api-key", default=_cfg("broker_api_key", os.getenv("BROKER_API_KEY")))
     ap.add_argument("--session", default=_cfg("session", str(uuid.uuid4())))
     ap.add_argument(
         "--region",
@@ -583,6 +584,7 @@ async def run() -> bool:
             return
         cfg = MonCfg(
             broker_url=args.broker_url,
+            api_key=args.broker_api_key,
             session=args.session,
             voice_id=voice_id,
             voice_mode=args.voice_mode,
@@ -851,6 +853,7 @@ async def run() -> bool:
                 )
                 await speak_via_broker(
                     broker_url=args.broker_url,
+                    api_key=args.broker_api_key,
                     session_id=args.session,
                     text=help_text,
                     voice_id=voice_id,
@@ -880,6 +883,7 @@ async def run() -> bool:
             if _WHOAMI_RE.search(transcript):
                 await speak_via_broker(
                     broker_url=args.broker_url,
+                    api_key=args.broker_api_key,
                     session_id=args.session,
                     text="Hold still so I can get a clear look at you for face recognition.",
                     voice_id=voice_id,
@@ -962,6 +966,7 @@ async def run() -> bool:
 
                 await speak_via_broker(
                     broker_url=args.broker_url,
+                    api_key=args.broker_api_key,
                     session_id=args.session,
                     text=who_text,
                     voice_id=voice_id,
@@ -1091,6 +1096,7 @@ async def run() -> bool:
 
             body = await speak_via_broker(
                 broker_url=args.broker_url,
+                api_key=args.broker_api_key,
                 session_id=args.session,
                 text=transcript,
                 voice_id=voice_id,

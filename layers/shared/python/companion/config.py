@@ -35,6 +35,7 @@ class RuntimeConfig:
     llm_provider: str = "bedrock"
     llm_model_id: str = ""
     use_memory: bool = True
+    broker_api_key: str = ""
 
     @classmethod
     def from_env(cls) -> "RuntimeConfig":
@@ -64,6 +65,8 @@ class RuntimeConfig:
             "on",
         }
 
+        broker_api_key = os.getenv("BROKER_API_KEY", "")
+
         return cls(
             region_name=region,
             conversation_table=table,
@@ -75,6 +78,7 @@ class RuntimeConfig:
             llm_provider=provider,
             llm_model_id=model_id,
             use_memory=use_memory,
+            broker_api_key=broker_api_key,
         )
 
 

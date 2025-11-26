@@ -98,6 +98,22 @@ def handler(event, context):
     client_session = hdr_in.get("x-client-session") or hdr_in.get("X-Client-Session") or ""
     out_hdr = {"x-client-session": client_session} if client_session else {}
 
+    # Optional API key guard: enforce before doing any expensive work
+    api_key_required = (_CONFIG.broker_api_key or "").strip()
+    if api_key_required:
+        provided = ""
+        for k, v in hdr_in.items():
+            if k.lower() == "x-api-key":
+                provided = v or ""
+                break
+        if provided != api_key_required:
+            return {
+                "statusCode": 401,
+                "headers": _base_headers(out_hdr),
+                "isBase64Encoded": False,
+                "body": json.dumps({"error": "unauthorized", "message": "invalid API key"}),
+            }
+
     # Parse body
     body, berr = _parse_body(event)
     if berr:
