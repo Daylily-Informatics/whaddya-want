@@ -20,20 +20,7 @@ from client import identity
 from client.config_loader import load_client_params
 from client.monitor_engine import FaceProbeResult, MonitorConfig as MonCfg, MonitorEngine
 from client.shared_audio import AudioPlayer, get_shared_audio, speak_via_broker
-
-# ---- Speaker embedding (SpeechBrain) ----
-_SPK_READY = False
-try:
-    import torch  # noqa: F401
-    from speechbrain.pretrained import EncoderClassifier  # type: ignore
-
-    _SPK_READY = True
-except Exception as e:
-    print("[diag] speechbrain import error:", repr(e), file=sys.stderr)
-    _SPK_READY = False
-
-_SPK_DIR = Path(os.path.expanduser("~/.whaddya/speakers"))
-_SPK_DIR.mkdir(parents=True, exist_ok=True)
+from client.speaker_id import SPEAKER_EMBED_DIR, SPEAKER_MODEL_SOURCE, SPEAKER_IMPORT_ERROR, SpeakerEmbedder
 
 # ---- Optional face recog for image test ----
 _FACE_OK = False
@@ -93,13 +80,16 @@ async def stream_microphone(
     )
 
     loop = asyncio.get_running_loop()
-    raw_q: "queue.Queue[bytes]" = queue.Queue(maxsize=100)
+    stop_event = threading.Event()
+    raw_q: "queue.Queue[Optional[bytes]]" = queue.Queue(maxsize=100)
     async_q: "asyncio.Queue[bytes]" = asyncio.Queue(maxsize=100)
 
     def audio_cb(indata, frames, time_info, status):
         if status and verbose:
             print(status, file=sys.stderr)
         try:
+            if stop_event.is_set():
+                return
             raw = bytes(indata)
             if mute_event is not None and mute_event.is_set():
                 return
@@ -119,8 +109,13 @@ async def stream_microphone(
             device=input_device,
             callback=audio_cb,
         ):
-            while True:
-                chunk = raw_q.get()
+            while not stop_event.is_set():
+                try:
+                    chunk = raw_q.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                if chunk is None:
+                    break
                 loop.call_soon_threadsafe(async_q.put_nowait, chunk)
 
     threading.Thread(target=mic_thread, daemon=True).start()
@@ -142,6 +137,9 @@ async def stream_microphone(
             text = await finals_q.get()
             yield text
     finally:
+        stop_event.set()
+        with contextlib.suppress(queue.Full):
+            raw_q.put_nowait(None)
         send_task.cancel()
         recv_task.cancel()
 
@@ -385,32 +383,6 @@ def _norm_text_for_echo(s: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", s.lower())).strip()
 
 
-# ---- Voice embedding model (for identity) ----
-class SpeakerEmbed:
-    def __init__(self):
-        self.enabled = _SPK_READY
-        self.model = None
-
-    def _ensure(self):
-        if not self.enabled:
-            return
-        if self.model is None:
-            self.model = EncoderClassifier.from_hparams(
-                source="speechbrain/spkrec-ecapa-voxceleb",
-                run_opts={"device": "cpu"},
-            )
-
-    def embed(self, wav16: np.ndarray) -> Optional[np.ndarray]:
-        if not self.enabled:
-            return None
-        self._ensure()
-        if self.model is None:
-            return None
-        with torch.no_grad():
-            emb = self.model.encode_batch(torch.from_numpy(wav16).unsqueeze(0))
-        return emb.squeeze(0).squeeze(0).cpu().numpy().astype(np.float32)
-
-
 # ---- CLI loop ----
 async def run() -> bool:
     params = load_client_params()
@@ -570,7 +542,7 @@ async def run() -> bool:
             pass
 
     analysis_buf = deque(maxlen=int(args.rate * 6))
-    spk_embed = SpeakerEmbed()
+    spk_embed = SpeakerEmbedder()
     auto_register_name = (args.auto_register_name or args.force_enroll or "").strip()
     help_lines = [
         "Say 'hey Marvin' or 'ok Marvin' to enable command mode for 8 seconds.",
@@ -585,8 +557,14 @@ async def run() -> bool:
 
     intro_sent = False
     if not spk_embed.enabled:
+        reason = f" ({SPEAKER_IMPORT_ERROR})" if SPEAKER_IMPORT_ERROR else ""
         print(
-            "[identity] Speaker embedding model unavailable; voice identification and auto-registration are disabled.",
+            "[identity] Speaker embedding model unavailable; voice identification and auto-registration are disabled"
+            f"{reason}.",
+            file=sys.stderr,
+        )
+        print(
+            f"[identity] Uses {SPEAKER_MODEL_SOURCE} with embeddings in {SPEAKER_EMBED_DIR} when available.",
             file=sys.stderr,
         )
 
