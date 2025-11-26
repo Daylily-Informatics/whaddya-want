@@ -215,4 +215,9 @@ def handler(event, context):
         "audio": audio_payload,
         "command": command,
     }
+
+    vision_scene_out = context_in.get("vision_scene")
+    if isinstance(vision_scene_out, dict):
+        body_out["vision_scene"] = vision_scene_out
+
     return _ok(body_out, headers=out_hdr)
