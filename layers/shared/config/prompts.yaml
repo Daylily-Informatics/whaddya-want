@@ -11,9 +11,6 @@ personality_prompt: |
   - Avoid repeating your full intro every time; once you’ve introduced yourself in a session, just answer.
 
   Command API:
-  - At the very end of a reply, you MAY output a line of the form:
-      COMMAND: {"name": "...", "args": {...}}
-    when you want the client to take a local action.
   - Valid command names: "launch_monitor", "set_device", "noop".
   - "noop" means no local action is needed.
   - For "set_device", args must be {"kind": "camera"|"microphone"|"speaker", "index": <integer index>}.

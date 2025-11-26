@@ -36,7 +36,12 @@ from client import identity
 from client.config_loader import load_client_params
 from client.monitor_engine import FaceProbeResult, MonitorConfig as MonCfg, MonitorEngine
 from client.shared_audio import AudioPlayer, get_shared_audio, speak_via_broker
-from client.speaker_id import SPEAKER_EMBED_DIR, SPEAKER_MODEL_SOURCE, SPEAKER_IMPORT_ERROR, SpeakerEmbedder
+from client.speaker_id import (
+    SPEAKER_EMBED_DIR,
+    SPEAKER_MODEL_SOURCE,
+    SPEAKER_IMPORT_ERROR,
+    SpeakerEmbedder,
+)
 
 # ---- Optional face recog for image test ----
 _FACE_OK = False
@@ -103,9 +108,9 @@ async def stream_microphone(
     final transcripts as strings.
 
     Elegant mic behavior:
-      - Always feed analysis_buf so we can run speaker embeddings.
-      - Do NOT hard-mute the microphone on playback_mute; instead,
-        rely on self-voice suppression and text echo suppression.
+      - Always feed analysis_buf so we can run speaker embeddings / whoami.
+      - Do NOT hard-mute the microphone based on mute_event; rely on
+        echo suppression and self-voice suppression instead.
       - Only stop capturing when stop_event is set.
     """
     client = TranscribeStreamingClient(region=region)
@@ -128,17 +133,16 @@ async def stream_microphone(
                 return
             raw = bytes(indata)
 
-            # Always keep analysis_buf updated for embeddings / whoami, regardless of mute.
+            # Always keep analysis_buf updated so embeddings have signal.
             if analysis_buf is not None:
                 fmono = _bytes_to_float_mono_int16(raw, channels)
                 analysis_buf.extend(fmono.tolist())
 
             # IMPORTANT: do not hard-mute the mic when mute_event is set.
-            # Self-voice suppression and text echo suppression downstream
-            # will prevent Marvin from responding to his own voice.
+            # Downstream logic decides what transcripts to ignore.
             raw_q.put_nowait(raw)
         except queue.Full:
-            # drop data if we're overloaded; better to drop than block
+            # Drop data if we're overloaded; better to drop than block.
             pass
 
     def mic_thread():
@@ -183,7 +187,6 @@ async def stream_microphone(
             raw_q.put_nowait(None)
         send_task.cancel()
         recv_task.cancel()
-
 
 
 # ---- Helpers / commands ----
@@ -470,13 +473,19 @@ async def run() -> bool:
     ap = argparse.ArgumentParser(
         description="Voice client (unified identity + monitor trigger)"
     )
-    ap.add_argument("--broker-url", default=params.get("broker_url"), required=params.get("broker_url") is None)
+    ap.add_argument(
+        "--broker-url",
+        default=params.get("broker_url"),
+        required=params.get("broker_url") is None,
+    )
     ap.add_argument("--session", default=_cfg("session", str(uuid.uuid4())))
     ap.add_argument(
         "--region",
         default=_cfg(
             "region",
-            os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "us-west-2",
+            os.getenv("AWS_REGION")
+            or os.getenv("AWS_DEFAULT_REGION")
+            or "us-west-2",
         ),
     )
     ap.add_argument("--language", default=_cfg("language", "en-US"))
@@ -494,8 +503,16 @@ async def run() -> bool:
     )
     ap.add_argument("--rate", type=int, default=int(_cfg("rate", 16000)))
     ap.add_argument("--channels", type=int, default=int(_cfg("channels", 1)))
-    ap.add_argument("--id-threshold", type=float, default=float(_cfg("id_threshold", 0.65)))
-    ap.add_argument("--id-window", type=float, default=float(_cfg("id_window", 2.0)))
+    ap.add_argument(
+        "--id-threshold",
+        type=float,
+        default=float(_cfg("id_threshold", 0.65)),
+    )
+    ap.add_argument(
+        "--id-window",
+        type=float,
+        default=float(_cfg("id_window", 2.0)),
+    )
     ap.add_argument(
         "--auto-register-name",
         type=str,
@@ -537,17 +554,17 @@ async def run() -> bool:
         "--self-voice-name",
         type=str,
         default=_cfg("self_voice_name", os.getenv("SELF_VOICE_NAME")),
-        help="If set, ignore transcripts whose speaker ID matches this enrolled voice (self-talk suppression).",
+        help=(
+            "If set, ignore transcripts whose speaker ID matches this enrolled "
+            "voice (self-talk suppression)."
+        ),
     )
     args = ap.parse_args()
 
     # Face ID one-shot
     if args.identify_image:
         if not _FACE_OK:
-            print(
-                "[face] face_recognition not available.",
-                file=sys.stderr,
-            )
+            print("[face] face_recognition not available.", file=sys.stderr)
             sys.exit(2)
         img = face_recognition.load_image_file(args.identify_image)
         locs = face_recognition.face_locations(img, model="hog")
@@ -576,12 +593,12 @@ async def run() -> bool:
     if "--debug-http" in sys.argv:
         try:
             import http.client as _http_client
-            import logging
+            import logging as _logging
 
             _http_client.HTTPConnection.debuglevel = 1
-            logging.basicConfig()
-            logging.getLogger("urllib3").setLevel(logging.DEBUG)
-            logging.getLogger("urllib3").propagate = True
+            _logging.basicConfig()
+            _logging.getLogger("urllib3").setLevel(_logging.DEBUG)
+            _logging.getLogger("urllib3").propagate = True
             verbose = True
         except Exception:
             pass
@@ -609,7 +626,8 @@ async def run() -> bool:
     except Exception:
         pass
     print(
-        f"Session {args.session}  region={args.region}  devices: camera={cam_idx} mic={mic_idx} spk={spk_idx}"
+        f"Session {args.session}  region={args.region}  "
+        f"devices: camera={cam_idx} mic={mic_idx} spk={spk_idx}"
     )
 
     stop = asyncio.Event()
@@ -654,12 +672,13 @@ async def run() -> bool:
     if not spk_embed.enabled:
         reason = f" ({SPEAKER_IMPORT_ERROR})" if SPEAKER_IMPORT_ERROR else ""
         print(
-            "[identity] Speaker embedding model unavailable; voice identification and auto-registration are disabled"
-            f"{reason}.",
+            "[identity] Speaker embedding model unavailable; voice identification "
+            f"and auto-registration are disabled{reason}.",
             file=sys.stderr,
         )
         print(
-            f"[identity] Uses {SPEAKER_MODEL_SOURCE} with embeddings in {SPEAKER_EMBED_DIR} when available.",
+            f"[identity] Uses {SPEAKER_MODEL_SOURCE} with embeddings in "
+            f"{SPEAKER_EMBED_DIR} when available.",
             file=sys.stderr,
         )
 
@@ -925,6 +944,8 @@ async def run() -> bool:
             norm_transcript = _norm_text_for_echo(transcript)
             now = loop.time()
             in_cmd_window = now <= cmd_window_until
+
+            # Echo suppression vs last AI reply
             if (
                 last_ai_text_norm
                 and norm_transcript == last_ai_text_norm
@@ -936,15 +957,17 @@ async def run() -> bool:
                     )
                 continue
 
+            # Define cmd_text early (fixes use-before-assign)
+            cmd_text = transcript.strip().lower()
+
             print(f"YOU: {transcript}")
 
+            # Help
             if _HELP_RE.search(transcript):
                 print("[marvin help] Available commands:")
                 for line in help_lines:
                     print(f"  - {line}")
-                help_text = (
-                    "Here are the Marvin commands: " + " ".join(help_lines)
-                )
+                help_text = "Here are the Marvin commands: " + " ".join(help_lines)
                 await speak_via_broker(
                     broker_url=args.broker_url,
                     session_id=args.session,
@@ -961,6 +984,7 @@ async def run() -> bool:
                 )
                 continue
 
+            # Monitor control (voice)
             if _MONITOR_RE.search(transcript) or (
                 in_cmd_window and cmd_text.startswith("monitor")
             ):
@@ -971,6 +995,7 @@ async def run() -> bool:
                 await _stop_monitor()
                 continue
 
+            # Reset
             if _RESET_RE.search(transcript) or (
                 in_cmd_window and cmd_text.startswith("reset")
             ):
@@ -981,6 +1006,7 @@ async def run() -> bool:
                 stop.set()
                 break
 
+            # Whoami
             if _WHOAMI_RE.search(transcript) or (
                 in_cmd_window and cmd_text in ("whoami", "who am i")
             ):
@@ -1022,7 +1048,7 @@ async def run() -> bool:
 
                 print(
                     f"[whoami] voice={voice_name or 'unknown'} "
-                    f"face={face_name or face_probe and face_probe.fallback_label or 'unknown'}"
+                    f"face={face_name or (face_probe and face_probe.fallback_label) or 'unknown'}"
                 )
 
                 voice_hint = (
@@ -1082,6 +1108,7 @@ async def run() -> bool:
                 )
                 continue
 
+            # Wake phrase / command window
             now = loop.time()
             in_cmd_window = now <= cmd_window_until
 
@@ -1115,11 +1142,11 @@ async def run() -> bool:
                 if remainder:
                     transcript = remainder
                     norm_transcript = _norm_text_for_echo(transcript)
+                    cmd_text = transcript.strip().lower()
                 else:
                     continue
 
-            cmd_text = transcript.strip().lower()
-
+            # Exit
             if _EXIT_RE.search(transcript):
                 if in_cmd_window:
                     print("[voice] exit requested — shutting down.")
@@ -1128,6 +1155,7 @@ async def run() -> bool:
                 else:
                     print("[voice] 'exit' ignored (say 'hey Marvin' first).")
 
+            # Device command
             device_cmd = parse_device_command(transcript)
             if device_cmd:
                 if not in_cmd_window:
@@ -1147,7 +1175,7 @@ async def run() -> bool:
                     await _switch_speaker(idx)
                 continue
 
-            # Name registration: voice AND pending face (if any)
+            # Name registration
             name = parse_registration(transcript)
             if name:
                 wav = take_latest_seconds(
@@ -1167,6 +1195,7 @@ async def run() -> bool:
                             f"when registering {name}"
                         )
 
+            # Identity context for generic conversation
             wav_id = take_latest_seconds(analysis_buf, args.id_window, args.rate)
             context: Dict[str, Any] = {"intro_already_sent": intro_sent}
             monitor_ctx = None
@@ -1233,6 +1262,7 @@ async def run() -> bool:
                             break
                     await asyncio.sleep(0.05)
 
+            # Generic conversation turn
             body = await speak_via_broker(
                 broker_url=args.broker_url,
                 session_id=args.session,
