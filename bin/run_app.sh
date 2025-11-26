@@ -2,4 +2,4 @@ BROKER=$1
 
 PYTHONPATH=. python -m client.cli \
   --broker-url $BROKER   \
-  --setup-devices --voice Amy --voice-mode neural --verbose
+  --setup-devices --voice Matthew --voice-mode generative --verbose
