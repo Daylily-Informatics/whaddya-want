@@ -1,6 +1,21 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, asyncio, contextlib, io, json, os, queue, re, signal, subprocess, sys, traceback, threading, uuid, warnings
+import argparse
+import asyncio
+import contextlib
+import io
+import json
+import logging
+import os
+import queue
+import re
+import signal
+import subprocess
+import sys
+import threading
+import traceback
+import uuid
+import warnings
 from collections import deque
 from dataclasses import replace
 from pathlib import Path
@@ -35,6 +50,16 @@ except Exception:
 _STATE_DIR = Path(os.path.expanduser("~/.whaddya"))
 _STATE_DIR.mkdir(parents=True, exist_ok=True)
 _DEVICES_JSON = _STATE_DIR / "devices.json"
+
+
+def _configure_logging(debug: bool) -> None:
+    level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+        force=True,
+    )
 
 
 # ---- Finals-only handler ----
@@ -451,9 +476,11 @@ async def run() -> bool:
         default=_cfg_bool("save_audio", False),
     )
     ap.add_argument(
+        "-v",
         "--verbose",
-        action=argparse.BooleanOptionalAction,
-        default=_cfg_bool("verbose", False),
+        action="count",
+        default=1 if _cfg_bool("verbose", False) else 0,
+        help="Increase verbosity; use -vv for debug logging",
     )
     ap.add_argument(
         "--auto-start-monitor",
@@ -489,8 +516,16 @@ async def run() -> bool:
 
     voice_id = (args.voice or "").strip() or None
     self_voice = (args.self_voice_name or "").strip().lower() or None
-    verbose = bool(args.verbose)
+    verbosity = int(args.verbose or 0)
+    debug_logging = verbosity > 1
+    verbose = verbosity > 0
     save_audio = bool(args.save_audio)
+
+    _configure_logging(debug_logging)
+    if debug_logging:
+        os.environ["CLIENT_DEBUG"] = "1"
+    else:
+        os.environ.pop("CLIENT_DEBUG", None)
 
     # HTTP wire logs toggle
     if "--debug-http" in sys.argv:

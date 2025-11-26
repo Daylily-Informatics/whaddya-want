@@ -6,12 +6,19 @@ import asyncio
 import base64
 import io
 import json
+import logging
 import sys
 import threading
 from typing import Any, Dict, Optional, Callable, Awaitable, Tuple
 
 import numpy as np
 import requests
+
+logger = logging.getLogger(__name__)
+
+
+def _debug(msg: str, *args) -> None:
+    logger.debug(msg, *args)
 
 _audio_loop: asyncio.AbstractEventLoop | None = None
 _audio_thread: threading.Thread | None = None
@@ -33,6 +40,7 @@ def _ensure_audio_loop() -> asyncio.AbstractEventLoop:
                 thread.start()
                 _audio_loop = loop
                 _audio_thread = thread
+                _debug("started shared audio loop thread")
     assert _audio_loop is not None
     return _audio_loop
 
@@ -115,6 +123,7 @@ class AudioPlayer:
             self._mute_guard.set()
         loop = asyncio.get_running_loop()
         self._abort_flag.clear()
+        _debug("audio play requested (%d bytes)", len(data))
         try:
             audio, rate = await loop.run_in_executor(None, self._decode, data)
             if audio is None or rate is None:
@@ -133,6 +142,7 @@ class AudioPlayer:
         finally:
             if self._mute_guard is not None:
                 self._mute_guard.clear()
+            _debug("audio playback finished")
         return True
 
     def stop(self) -> None:
@@ -207,6 +217,8 @@ async def speak_via_broker(
     if verbose:
         print(f"[diag] POST {broker_url}")
         print("[diag] payload=", json.dumps(payload, indent=2))
+    if logger.isEnabledFor(logging.DEBUG):
+        _debug("broker request → url=%s text_only=%s payload_keys=%s", broker_url, text_only, sorted(payload.keys()))
 
     try:
         r = await asyncio.to_thread(
@@ -218,6 +230,7 @@ async def speak_via_broker(
         )
     except requests.RequestException as e:
         print(f"[broker error] request failed: {getattr(e,'args',[repr(e)])[0]}", file=sys.stderr)
+        _debug("broker request raised %s", e)
         return None
 
     if not r.ok:
@@ -247,6 +260,7 @@ async def speak_via_broker(
         body = r.json()
     except Exception as e:
         print(f"[broker error] invalid JSON response: {e}", file=sys.stderr)
+        _debug("broker response JSON decode failed: %s", e)
         return None
 
     audio_b64 = (body.get("audio") or {}).get("audio_base64")

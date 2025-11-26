@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 import threading
 import asyncio
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -10,6 +11,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 from ultralytics import YOLO
+
+logger = logging.getLogger(__name__)
+
+
+def _debug(msg: str, *args) -> None:
+    logger.debug(msg, *args)
 
 from client import identity
 from client.shared_audio import AudioPlayer, speak_via_broker
@@ -176,6 +183,13 @@ class MonitorEngine:
         self.player = player
         self.playback_mute = playback_mute
 
+        _debug(
+            "initializing MonitorEngine camera=%s voice_mode=%s vision_mode=%s",
+            cfg.camera_index,
+            cfg.voice_mode,
+            cfg.vision_mode,
+        )
+
         self.cap = cv2.VideoCapture(cfg.camera_index)
         if not self.cap.isOpened():
             raise RuntimeError(f"Cannot open camera index {cfg.camera_index}")
@@ -238,6 +252,7 @@ class MonitorEngine:
         """
         if self.cfg.vision_mode == "off":
             return
+        _debug("sending vision snapshot mode=%s text_only=%s", mode, self.cfg.vision_mode != "entry_only")
         if self.vision_busy:
             return
         self.vision_busy = True
