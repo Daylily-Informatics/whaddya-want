@@ -98,6 +98,16 @@ async def stream_microphone(
     mute_event: Optional[threading.Event] = None,
     verbose: bool = False,
 ) -> AsyncGenerator[str, None]:
+    """
+    Capture microphone audio, stream it to Amazon Transcribe, and yield
+    final transcripts as strings.
+
+    Elegant mic behavior:
+      - Always feed analysis_buf so we can run speaker embeddings.
+      - Do NOT hard-mute the microphone on playback_mute; instead,
+        rely on self-voice suppression and text echo suppression.
+      - Only stop capturing when stop_event is set.
+    """
     client = TranscribeStreamingClient(region=region)
     stream = await client.start_stream_transcription(
         language_code=language_code,
@@ -117,13 +127,18 @@ async def stream_microphone(
             if stop_event.is_set():
                 return
             raw = bytes(indata)
-            if mute_event is not None and mute_event.is_set():
-                return
+
+            # Always keep analysis_buf updated for embeddings / whoami, regardless of mute.
             if analysis_buf is not None:
                 fmono = _bytes_to_float_mono_int16(raw, channels)
                 analysis_buf.extend(fmono.tolist())
+
+            # IMPORTANT: do not hard-mute the mic when mute_event is set.
+            # Self-voice suppression and text echo suppression downstream
+            # will prevent Marvin from responding to his own voice.
             raw_q.put_nowait(raw)
         except queue.Full:
+            # drop data if we're overloaded; better to drop than block
             pass
 
     def mic_thread():
@@ -168,6 +183,7 @@ async def stream_microphone(
             raw_q.put_nowait(None)
         send_task.cancel()
         recv_task.cancel()
+
 
 
 # ---- Helpers / commands ----
