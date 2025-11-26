@@ -1140,6 +1140,62 @@ async def run() -> bool:
                     f"face={face_name or (face_probe and face_probe.fallback_label) or 'unknown'}"
                 )
 
+                vision_scene: Optional[Dict[str, Any]] = None
+                visual_desc = None
+                image_jpeg: Optional[bytes] = None
+                if monitor_engine is not None:
+                    try:
+                        import cv2
+
+                        frame = monitor_engine.get_best_recent_frame()
+                        if frame is not None:
+                            ok, buf = cv2.imencode(
+                                ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+                            )
+                            if ok:
+                                image_jpeg = buf.tobytes()
+                    except Exception as exc:
+                        vprint(f"[whoami] failed to capture frame: {exc}")
+
+                if image_jpeg is not None:
+                    vision_reply = await speak_via_broker(
+                        broker_url=args.broker_url,
+                        session_id=args.session,
+                        text="Describe the people in this frame for identification.",
+                        voice_id=voice_id,
+                        voice_mode=args.voice_mode,
+                        player=player,
+                        playback_mute=playback_mute,
+                        context={"intro_already_sent": True},
+                        text_only=True,
+                        timeout=30,
+                        verbose=verbose,
+                        barge_monitor=None,
+                        image_jpeg=image_jpeg,
+                    )
+                    if vision_reply:
+                        scene = vision_reply.get("vision_scene")
+                        if isinstance(scene, dict):
+                            vision_scene = scene
+
+                if vision_scene:
+                    people = vision_scene.get("people")
+                    if isinstance(people, list) and people:
+                        first = people[0]
+                        if isinstance(first, dict):
+                            approx_count = first.get("approx_count")
+                            notes = first.get("notes")
+                            desc_parts = []
+                            if isinstance(approx_count, int) and approx_count > 0:
+                                desc_parts.append(
+                                    f"about {approx_count} person"
+                                    + ("s" if approx_count != 1 else "")
+                                )
+                            if isinstance(notes, str) and notes.strip():
+                                desc_parts.append(notes.strip())
+                            if desc_parts:
+                                visual_desc = ", ".join(desc_parts)
+
                 voice_hint = (
                     f"By voice, I think you're {voice_name}. " if voice_name else ""
                 )
@@ -1180,6 +1236,11 @@ async def run() -> bool:
                     who_text = (
                         "I can't confidently identify you yet by voice or face."
                     )
+
+                if visual_desc:
+                    if not who_text.endswith((".", "!", "?")):
+                        who_text += "."
+                    who_text += f" Visually, I see {visual_desc}."
 
                 await speak_via_broker(
                     broker_url=args.broker_url,
