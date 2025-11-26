@@ -4,6 +4,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from .prompts import find_config_file
+
 
 def _env(name: str, default: str | None = None) -> str:
     """Read an environment variable or raise a helpful error."""
@@ -29,6 +31,7 @@ class RuntimeConfig:
     secrets_id: str
     voice_id: str
     history_limit: int = 10
+    prompts_path: str = str(find_config_file("prompts.yaml"))
 
     @classmethod
     def from_env(cls) -> "RuntimeConfig":
@@ -40,6 +43,7 @@ class RuntimeConfig:
             secrets_id=_env("LLM_SECRET_ID"),
             voice_id=_env("POLLY_VOICE", default="Joanna"),
             history_limit=int(_env("HISTORY_LIMIT", default="10")),
+            prompts_path=os.getenv("PROMPTS_CONFIG") or str(find_config_file("prompts.yaml")),
         )
 
 

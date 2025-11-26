@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .config import RuntimeConfig
+from .prompts import load_personality_prompt
 from .llm import LLMClient
 from .memory import ConversationStore, ConversationTurn
 from .speech import SpeechSynthesizer
@@ -28,11 +29,12 @@ class ConversationBroker:
             voice_id=config.voice_id,
             region_name=config.region_name,
         )
+        self._system_prompt = load_personality_prompt(config.prompts_path)
 
     def handle(self, session_id: str, user_text: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
         history = self._memory.fetch_history(session_id=session_id, limit=self._config.history_limit)
         messages = [
-            {"role": "system", "content": "You are a helpful, proactive AI companion."},
+            {"role": "system", "content": self._system_prompt},
             *({"role": turn.role, "content": turn.content} for turn in history),
             {"role": "user", "content": user_text},
         ]
