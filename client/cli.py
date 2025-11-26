@@ -844,6 +844,7 @@ async def run() -> bool:
 
             norm_transcript = _norm_text_for_echo(transcript)
             now = loop.time()
+            in_cmd_window = now <= cmd_window_until
             if (
                 last_ai_text_norm
                 and norm_transcript == last_ai_text_norm
