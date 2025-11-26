@@ -1124,6 +1124,11 @@ async def run() -> bool:
 
             wav_id = take_latest_seconds(analysis_buf, args.id_window, args.rate)
             context: Dict[str, Any] = {"intro_already_sent": intro_sent}
+            monitor_ctx = None
+            if monitor_engine is not None:
+                monitor_ctx = getattr(monitor_engine, "last_context_for_voice", None)
+            if monitor_ctx:
+                context.update(dict(monitor_ctx))
             is_self_voice = False
             if wav_id is not None:
                 if not spk_embed.enabled:
