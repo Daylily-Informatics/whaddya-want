@@ -1,3 +1,4 @@
+# layers/shared/python/companion/broker.py
 """Core orchestration logic shared by the Lambda handler."""
 from __future__ import annotations
 
@@ -11,10 +12,11 @@ from .prompts import load_personality_prompt
 from .llm import LLMClient
 from .memory import AISLongTermMemoryStore, ConversationStore, ConversationTurn
 from .speech import SpeechSynthesizer
+from .actions import ActionManager
 
 
 class ConversationBroker:
-    """Coordinates memory, LLM, and speech synthesis."""
+    """Coordinates memory, LLM, speech synthesis, and side-effectful actions."""
 
     def __init__(self, config: RuntimeConfig) -> None:
         self._config = config
@@ -34,6 +36,7 @@ class ConversationBroker:
             region_name=config.region_name,
         )
         self._system_prompt = load_personality_prompt(config.prompts_path)
+
         self._long_term_memory: AISLongTermMemoryStore | None = None
         if config.ais_memory_table:
             self._long_term_memory = AISLongTermMemoryStore(
@@ -41,6 +44,9 @@ class ConversationBroker:
                 region_name=config.region_name,
                 ttl_days=config.ais_memory_ttl_days,
             )
+
+        # Server-side actions (SMS/email/system commands)
+        self._actions = ActionManager(region_name=config.region_name)
 
     def handle(
         self,
@@ -61,6 +67,7 @@ class ConversationBroker:
               "tool_calls": [...],         # if the provider supports tools
             }
         """
+        # ---- Fetch short-term conversation history ----
         if self._config.use_memory:
             history = self._memory.fetch_history(
                 session_id=session_id,
@@ -69,7 +76,8 @@ class ConversationBroker:
         else:
             history = []
 
-        messages = [
+        # ---- Build messages for the LLM ----
+        messages: list[dict[str, str]] = [
             {
                 "role": "system",
                 "content": self._system_prompt,
@@ -78,8 +86,11 @@ class ConversationBroker:
             {"role": "user", "content": user_text},
         ]
         if context:
+            # Context is injected as a separate system message so it can carry
+            # vision + environment info without polluting the main prompt text.
             messages.append({"role": "system", "content": f"Context: {context}"})
 
+        # ---- Call the LLM ----
         llm_response = self._llm.chat(messages=messages)
 
         timestamp = datetime.now(timezone.utc)
@@ -87,6 +98,8 @@ class ConversationBroker:
             ConversationTurn(role="user", content=user_text, timestamp=timestamp),
             ConversationTurn(role="assistant", content=llm_response.message, timestamp=timestamp),
         ]
+
+        # ---- Persist short-term history ----
         if self._config.use_memory:
             self._memory.append_turns(
                 session_id=session_id,
@@ -94,6 +107,7 @@ class ConversationBroker:
                 limit=self._config.history_limit,
             )
 
+        # ---- TTS ----
         audio_payload = self._speech.synthesize(
             text=llm_response.message,
             session_id=session_id,
@@ -101,16 +115,49 @@ class ConversationBroker:
             voice_id=voice_id,
         )
 
+        # ---- Parse command from the LLM reply ----
         reply_text, command = _extract_command(llm_response.message)
 
+        # ---- Execute server-side actions for certain commands ----
+        server_action_result: Dict[str, Any] | None = None
+        if isinstance(command, dict):
+            cmd_name = command.get("name")
+            cmd_args = command.get("args") or {}
+            if cmd_name in {"send_text", "send_email", "run_command"}:
+                try:
+                    result = self._actions.run_server_action(str(cmd_name), cmd_args)
+                    server_action_result = {
+                        "name": result.name,
+                        "executed": result.executed,
+                        "error": result.error,
+                        "detail": result.detail,
+                    }
+                    # Attach a small status line the user can see, if provided.
+                    if result.visible_message:
+                        reply_text = f"{reply_text}\n\n{result.visible_message}"
+                    # Light-weight status inline with the command for clients that care.
+                    command = dict(command)
+                    command["server_result"] = server_action_result
+                except Exception as exc:  # pragma: no cover - defensive
+                    server_action_result = {
+                        "name": cmd_name,
+                        "executed": False,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                    command = dict(command)
+                    command["server_result"] = server_action_result
+
+        # ---- Optionally strip inline audio for text-only calls ----
         if text_only and isinstance(audio_payload, dict):
             audio_payload = dict(audio_payload)
             audio_payload["audio_base64"] = None
 
+        # ---- Long-term AIS memory ----
         if self._long_term_memory:
             metadata = {
                 "vision_scene": (context or {}).get("vision_scene"),
                 "command": command,
+                "server_action_result": server_action_result,
                 "tool_calls": llm_response.tool_calls,
                 "assistant_visible_text": reply_text,
             }
@@ -144,7 +191,17 @@ def _extract_command(reply: str) -> Tuple[str, Dict[str, Any]]:
     if not isinstance(reply, str):
         return str(reply), default_cmd
 
-    allowed_names = {"launch_monitor", "set_device", "noop"}
+    # Commands that are syntactically allowed. Some are executed only client-side
+    # (launch_monitor, set_device); others are executed on the server (send_text,
+    # send_email, run_command) with additional gating in ActionManager.
+    allowed_names = {
+        "launch_monitor",
+        "set_device",
+        "noop",
+        "send_text",
+        "send_email",
+        "run_command",
+    }
 
     # Look for a line starting with 'COMMAND:' and capture the JSON blob
     m = re.search(r"^COMMAND:\s*(\{.*\})\s*$", reply, flags=re.MULTILINE)

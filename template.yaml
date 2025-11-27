@@ -64,7 +64,7 @@ Parameters:
     Description: Enable HttpApi access logs (single-line JSON). Disable if you hit log config issues.
   AISMemoryTableName:
     Type: String
-    Default: whaddyawant_ais_long_term_memory
+    Default: whaddyawant_ais_memory  # whaddyawant_ais_long_term_memory
     Description: DynamoDB table name for AIS long-term memory persistence
   AISMemoryTtlDays:
     Type: Number
