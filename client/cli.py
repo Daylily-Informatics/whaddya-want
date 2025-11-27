@@ -230,6 +230,7 @@ _MONITOR_RE = re.compile(r"^\s*marvin[, ]+monitor\b", re.I)
 _RESET_RE = re.compile(r"^\s*marvin[, ]+reset\b", re.I)
 _HELP_RE = re.compile(r"^\s*marvin[, ]+help\b", re.I)
 _WHOAMI_RE = re.compile(r"^\s*marvin[, ]+whoami\b", re.I)
+_DUMP_MEM_RE = re.compile(r"^\s*marvin[, ]+dump memory\b", re.I)
 _DEVICE_CMD_RE = re.compile(
     r"""(?xi)
     \b(?:switch|change|set|use|select)\s+(?:the\s+)?
@@ -687,6 +688,7 @@ async def run() -> bool:
         "pause",
         "resume",
         "number threads",
+        "dump memory",
         "exit",
     ]
     help_lines = [
@@ -978,6 +980,7 @@ async def run() -> bool:
 
     last_ai_text_norm: Optional[str] = None
     last_ai_time: float = 0.0
+    last_memory_debug: Optional[Dict[str, Any]] = None
 
     try:
         while not stop.is_set():
@@ -1305,6 +1308,30 @@ async def run() -> bool:
                 else:
                     print("[voice] 'exit' ignored (say 'hey Marvin' first).")
 
+            if _DUMP_MEM_RE.search(transcript) or (
+                in_cmd_window and cmd_text.startswith("dump memory")
+            ):
+                if last_memory_debug:
+                    print("[memory debug] short-term history:")
+                    print(
+                        json.dumps(
+                            last_memory_debug.get("short_term_history") or [],
+                            indent=2,
+                        )
+                    )
+                    print("[memory debug] long-term matches:")
+                    print(
+                        json.dumps(
+                            last_memory_debug.get("long_term_matches") or [],
+                            indent=2,
+                        )
+                    )
+                else:
+                    print(
+                        "[memory debug] No memory data available from the last query."
+                    )
+                continue
+
             # Device command
             device_cmd = parse_device_command(transcript)
             if device_cmd:
@@ -1459,6 +1486,12 @@ async def run() -> bool:
                 last_ai_time = loop.time()
             else:
                 last_ai_text_norm = None
+
+            memory_debug = body.get("memory_debug")
+            if isinstance(memory_debug, dict):
+                last_memory_debug = memory_debug
+            else:
+                last_memory_debug = None
 
             cmd_spec = body.get("command")
             if isinstance(cmd_spec, dict):

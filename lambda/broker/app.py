@@ -220,4 +220,8 @@ def handler(event, context):
     if isinstance(vision_scene_out, dict):
         body_out["vision_scene"] = vision_scene_out
 
+    memory_debug = broker_out.get("memory_debug")
+    if isinstance(memory_debug, dict):
+        body_out["memory_debug"] = memory_debug
+
     return _ok(body_out, headers=out_hdr)
