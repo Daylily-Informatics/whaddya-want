@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from datetime import datetime, timezone
 from typing import Any, Dict, Tuple, List
@@ -13,6 +14,7 @@ from .llm import LLMClient
 from .memory import AISLongTermMemoryStore, ConversationStore, ConversationTurn
 from .speech import SpeechSynthesizer
 from .actions import ActionManager
+from .prospective import ProspectiveRuleStore
 
 
 class ConversationBroker:
@@ -37,25 +39,25 @@ class ConversationBroker:
         )
         self._system_prompt = load_personality_prompt(config.prompts_path)
 
-        # AIS long-term memory
         self._long_term_memory: AISLongTermMemoryStore | None = None
         if config.ais_memory_table:
-            print(f"[ais-memory] initializing with table={config.ais_memory_table!r}")
             self._long_term_memory = AISLongTermMemoryStore(
                 table_name=config.ais_memory_table,
                 region_name=config.region_name,
                 ttl_days=config.ais_memory_ttl_days,
+            )
+
+        # Prospective rules (if table configured)
+        self._prospective: ProspectiveRuleStore | None = None
+        prospective_table = os.getenv("PROSPECTIVE_RULES_TABLE", "")
+        if prospective_table:
+            print(f"[ais-memory] initializing prospective rules with table={prospective_table!r}")
+            self._prospective = ProspectiveRuleStore(
+                table_name=prospective_table,
+                region_name=config.region_name,
             )
         else:
-            print("[ais-memory] DISABLED (no AIS_MEMORY_TABLE configured)")
-
-        self._long_term_memory: AISLongTermMemoryStore | None = None
-        if config.ais_memory_table:
-            self._long_term_memory = AISLongTermMemoryStore(
-                table_name=config.ais_memory_table,
-                region_name=config.region_name,
-                ttl_days=config.ais_memory_ttl_days,
-            )
+            print("[ais-memory] prospective rules DISABLED (no PROSPECTIVE_RULES_TABLE)")
 
         # Server-side actions (SMS/email/system commands)
         self._actions = ActionManager(region_name=config.region_name)
@@ -88,7 +90,111 @@ class ConversationBroker:
         else:
             history = []
 
-        # ---- Long-term memory lookup (AIS) ----
+        # ---- Evaluate prospective rules (mute / speak) BEFORE memory/LLM ----
+        prospective_actions: List[Dict[str, Any]] = []
+        if self._prospective:
+            try:
+                prospective_actions = self._prospective.evaluate(
+                    session_id=session_id,
+                    user_text=user_text,
+                    context=context,
+                )
+            except Exception as exc:  # pragma: no cover
+                print(f"[prospective] evaluate error: {exc}")
+                prospective_actions = []
+
+        # Handle mute: if any active mute rule and no exception, we short-circuit.
+        mute_active = False
+        for act in prospective_actions:
+            if act.get("type") == "mute":
+                # Exception terms are checked in evaluate; if we got here, mute applies.
+                mute_active = True
+                break
+
+        if mute_active:
+            # Log the "muted" interaction to memory but don't call the LLM or speak.
+            timestamp = datetime.now(timezone.utc)
+            reply_text = ""  # no spoken text
+            command: Dict[str, Any] = {"name": "noop", "args": {}}
+            turns = [
+                ConversationTurn(role="user", content=user_text, timestamp=timestamp),
+                ConversationTurn(role="assistant", content=reply_text, timestamp=timestamp),
+            ]
+            if self._config.use_memory:
+                self._memory.append_turns(
+                    session_id=session_id,
+                    turns=turns,
+                    limit=self._config.history_limit,
+                )
+            if self._long_term_memory:
+                try:
+                    self._long_term_memory.record_exchange(
+                        session_id=session_id,
+                        timestamp=timestamp,
+                        user_text=user_text,
+                        assistant_text=reply_text,
+                        metadata={"prospective_actions": prospective_actions},
+                    )
+                except Exception as exc:  # pragma: no cover
+                    print(f"Warning: failed to persist AIS long-term memory (mute): {exc}")
+            audio_payload = None
+            return {
+                "text": reply_text,
+                "audio": audio_payload,
+                "command": command,
+                "tool_calls": [],
+            }
+
+        # Handle speak actions: for now, if any 'speak' rule fires, we synthesize that
+        # text and skip the LLM for this turn.
+        speak_actions = [a for a in prospective_actions if a.get("type") == "speak"]
+        if speak_actions:
+            # Use the first speak action
+            act = speak_actions[0]
+            text = str(act.get("text") or "")
+            times = int(act.get("times") or 1)
+            reply_text = (text + " ") * times
+            reply_text = reply_text.strip()
+            timestamp = datetime.now(timezone.utc)
+            command: Dict[str, Any] = {"name": "noop", "args": {}}
+            turns = [
+                ConversationTurn(role="user", content=user_text, timestamp=timestamp),
+                ConversationTurn(role="assistant", content=reply_text, timestamp=timestamp),
+            ]
+            if self._config.use_memory:
+                self._memory.append_turns(
+                    session_id=session_id,
+                    turns=turns,
+                    limit=self._config.history_limit,
+                )
+            if self._long_term_memory:
+                try:
+                    self._long_term_memory.record_exchange(
+                        session_id=session_id,
+                        timestamp=timestamp,
+                        user_text=user_text,
+                        assistant_text=reply_text,
+                        metadata={"prospective_actions": prospective_actions},
+                    )
+                except Exception as exc:  # pragma: no cover
+                    print(f"Warning: failed to persist AIS long-term memory (speak): {exc}")
+            audio_payload = self._speech.synthesize(
+                text=reply_text,
+                session_id=session_id,
+                response_id=str(int(timestamp.timestamp())),
+                voice_id=voice_id,
+            )
+            if text_only and isinstance(audio_payload, dict):
+                audio_payload = dict(audio_payload)
+                audio_payload["audio_base64"] = None
+            return {
+                "text": reply_text,
+                "audio": audio_payload,
+                "command": command,
+                "tool_calls": [],
+            }
+
+        # ---- Long-term AIS memory lookup for "remind me" style queries ----
         memory_snippets_text: str | None = None
         memories: list[Dict[str, Any]] = []
         is_memory_query = self._looks_like_memory_query(user_text)
@@ -108,11 +214,13 @@ class ConversationBroker:
                 memories = []
                 memory_snippets_text = None
 
-        # ---- Pure memory mode: bypass LLM for some queries ----
+        # ---- Pure memory mode: bypass LLM for simple recall questions ----
         if is_memory_query and self._is_pure_memory_question(user_text):
             if memories:
+                print(f"[ais-memory] pure-memory-hit session={session_id} count={len(memories)}")
                 reply_text = self._render_memory_reply(user_text, memories)
             else:
+                print(f"[ais-memory] pure-memory-miss session={session_id} (no relevant memories)")
                 reply_text = (
                     "I don't have any reliable memory of that topic. "
                     "My long-term log doesn't show anything relevant."
@@ -124,16 +232,12 @@ class ConversationBroker:
                 ConversationTurn(role="user", content=user_text, timestamp=timestamp),
                 ConversationTurn(role="assistant", content=reply_text, timestamp=timestamp),
             ]
-
-            # Persist short-term history
             if self._config.use_memory:
                 self._memory.append_turns(
                     session_id=session_id,
                     turns=turns,
                     limit=self._config.history_limit,
                 )
-
-            # Record deterministic memory reply into AIS
             if self._long_term_memory:
                 try:
                     self._long_term_memory.record_exchange(
@@ -141,9 +245,9 @@ class ConversationBroker:
                         timestamp=timestamp,
                         user_text=user_text,
                         assistant_text=reply_text,
-                        metadata={"server_action_result": None, "tool_calls": []},
+                        metadata={"prospective_actions": prospective_actions},
                     )
-                except Exception as exc:  # pragma: no cover
+                except Exception as exc:  # pragma: no cover - non-critical telemetry
                     print(f"Warning: failed to persist AIS long-term memory: {exc}")
 
             audio_payload = self._speech.synthesize(
@@ -217,6 +321,40 @@ class ConversationBroker:
 
         # ---- Execute server-side actions for certain commands ----
         server_action_result: Dict[str, Any] | None = None
+
+        # Prospective rule commands (handled before generic actions)
+        if isinstance(command, dict) and self._prospective:
+            cmd_name = command.get("name")
+            cmd_args = command.get("args") or {}
+            if cmd_name == "add_prospective_rule":
+                try:
+                    rule_id = self._prospective.add_rule(session_id, cmd_args)
+                    reply_text = f"{reply_text}\n\n[system] Added prospective rule {rule_id}."
+                except Exception as exc:
+                    reply_text = f"{reply_text}\n\n[system] Failed to add prospective rule: {exc}"
+            elif cmd_name == "clear_prospective_rules":
+                try:
+                    deleted = self._prospective.clear_rules(session_id)
+                    reply_text = f"{reply_text}\n\n[system] Cleared {deleted} prospective rules."
+                except Exception as exc:
+                    reply_text = f"{reply_text}\n\n[system] Failed to clear prospective rules: {exc}"
+            elif cmd_name == "list_prospective_rules":
+                try:
+                    rules = self._prospective.list_rules(session_id)
+                    if rules:
+                        lines = []
+                        for r in rules:
+                            lines.append(
+                                f"- {r.rule_id}: scope={r.scope} enabled={r.enabled} "
+                                f"condition={r.condition} action={r.action}"
+                            )
+                        reply_text = f"{reply_text}\n\n[system] Prospective rules:\n" + "\n".join(lines)
+                    else:
+                        reply_text = f"{reply_text}\n\n[system] No prospective rules for this session."
+                except Exception as exc:
+                    reply_text = f"{reply_text}\n\n[system] Failed to list prospective rules: {exc}"
+
+        # Now handle generic actions (SMS/email/commands)
         if isinstance(command, dict):
             cmd_name = command.get("name")
             cmd_args = command.get("args") or {}
@@ -256,7 +394,6 @@ class ConversationBroker:
                 "command": command,
                 "server_action_result": server_action_result,
                 "tool_calls": llm_response.tool_calls,
-                "assistant_visible_text": reply_text,
             }
             try:
                 self._long_term_memory.record_exchange(
@@ -305,7 +442,6 @@ class ConversationBroker:
     def _is_pure_memory_question(self, text: str) -> bool:
         """Return True if the user is clearly asking ONLY about past context."""
         t = (text or "").lower()
-        # crude, but OK: no 'why/should/how do I' + has 'remind/remember/have we talked'
         if any(w in t for w in ["why", "should", "how do i"]):
             return False
         return any(
@@ -396,6 +532,9 @@ def _extract_command(reply: str) -> Tuple[str, Dict[str, Any]]:
         "send_text",
         "send_email",
         "run_command",
+        "add_prospective_rule",
+        "clear_prospective_rules",
+        "list_prospective_rules",
     }
 
     # Look for a line starting with 'COMMAND:' and capture the JSON blob
@@ -411,11 +550,9 @@ def _extract_command(reply: str) -> Tuple[str, Dict[str, Any]]:
             if isinstance(parsed, dict):
                 name = parsed.get("name") or "noop"
                 args = parsed.get("args") or {}
-                if isinstance(name, str) and isinstance(args, dict):
-                    if name in allowed_names:
-                        cmd = {"name": name, "args": args}
+                if isinstance(name, str) and isinstance(args, dict) and name in allowed_names:
+                    cmd = {"name": name, "args": args}
         except Exception:
-            # On any parse error, fall back to noop but keep the cleaned text
             cmd = default_cmd
 
         return clean.strip(), cmd
@@ -434,7 +571,7 @@ def _extract_command(reply: str) -> Tuple[str, Dict[str, Any]]:
             flags=re.IGNORECASE | re.MULTILINE,
         ).rstrip()
         name = alt.group(1).strip()
-        args_raw = (alt.get(2) or "").strip() if hasattr(alt, "get") else (alt.group(2) or "").strip()
+        args_raw = (alt.group(2) or "").strip()
         cmd = default_cmd
         args: Dict[str, Any] = {}
         try:

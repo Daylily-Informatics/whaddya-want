@@ -28,6 +28,7 @@ Globals:
         ENABLE_OUTBOUND_EMAIL: !Ref EnableOutboundEmail
         ENABLE_SYSTEM_COMMANDS: !Ref EnableSystemCommands
         ACTION_EMAIL_FROM: !Ref ActionEmailFrom
+        PROSPECTIVE_RULES_TABLE: !Ref ProspectiveRulesTable  # NEW
 
 Parameters:
   ModelId:
@@ -99,6 +100,24 @@ Conditions:
 
 Resources:
   # --------- State (optional memory toggle only affects app behavior) ----------
+  ProspectiveRulesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-prospective-rules"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: session_id
+          AttributeType: S
+        - AttributeName: rule_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: session_id
+          KeyType: HASH
+        - AttributeName: rule_id
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
   ConversationTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -266,6 +285,15 @@ Resources:
                 - s3:GetObject
               Resource: !Sub '${AudioBucket.Arn}/*'
 
+            # DynamoDB (prospective rules)
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:Query
+                - dynamodb:DeleteItem
+                - dynamodb:BatchWriteItem
+              Resource: !GetAtt ProspectiveRulesTable.Arn
+
             # --- NEW: SNS + SES for actions ---
             - Effect: Allow
               Action:
@@ -305,3 +333,6 @@ Outputs:
   FunctionArn:
     Description: Broker Lambda ARN
     Value: !GetAtt BrokerFunction.Arn
+  ProspectiveRulesTableName:
+    Description: DynamoDB table for prospective rules
+    Value: !Ref ProspectiveRulesTable
