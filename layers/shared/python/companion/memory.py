@@ -35,6 +35,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
 
 import json
+import re
 import boto3
 from boto3.dynamodb.conditions import Key
 
@@ -225,12 +226,16 @@ class AISLongTermMemoryStore:
         query: str | None = None,
         limit: int = 8,
     ) -> List[Dict[str, Any]]:
-        """Return up to ``limit`` recent exchanges for a session.
+        """Return up to ``limit`` relevant exchanges for a session.
 
-        This is a very simple, in-memory scoring over the most recent items for
-        the given ``session_id``. If ``query`` is provided, we rank by the
-        number of query tokens that appear in the user/assistant text; if no
-        match is found, we fall back to the newest items.
+        Strategy:
+        - Query up to a few hundred most recent items for this session_id.
+        - Normalize the query into crude tokens (lowercased, stripped of punctuation,
+          and with trailing 's' removed to collapse simple plural/singular).
+        - Score each item by how many tokens appear in its user+assistant text.
+        - Take the top-ranked items.
+        - If there are not enough scored items, pad with the newest items so we
+          still give the model some context even when the query is vague.
         """
         if not session_id:
             return []
@@ -239,19 +244,49 @@ class AISLongTermMemoryStore:
             resp = self._table.query(
                 KeyConditionExpression=Key("session_id").eq(session_id),
                 ScanIndexForward=False,  # newest first
-                Limit=100,
+                Limit=500,               # allow deeper history within this session
             )
         except Exception:
             # On any query failure, do not break the main flow; just return nothing.
             return []
 
         items = resp.get("Items", []) or []
+        if not items:
+            return []
 
+        # --- Normalize query into tokens -------------------------------------
         query_norm = (query or "").strip().lower()
-        if not query_norm:
+        if query_norm:
+            # remove most punctuation
+            q_clean = re.sub(r"[^\w\s]", " ", query_norm)
+            raw_tokens = q_clean.split()
+
+            stopwords = {
+                "the", "a", "an", "and", "or", "but",
+                "to", "for", "of", "in", "on", "at", "about",
+                "me", "you", "we", "i", "our", "your",
+                "is", "are", "was", "were", "be", "been",
+                "do", "did", "does", "have", "has", "had",
+                "this", "that", "these", "those",
+                "what", "which", "when", "where", "why", "how",
+                "past", "before", "earlier", "remind", "remember",
+            }
+            tokens: set[str] = set()
+            for t in raw_tokens:
+                if not t or t in stopwords:
+                    continue
+                # crude singular/plural collapse
+                base = t.rstrip("s")
+                if base:
+                    tokens.add(base)
+        else:
+            tokens = set()
+
+        # --- Score items -----------------------------------------------------
+        if not tokens:
+            # No meaningful tokens: just take newest items as a fallback.
             selected = items[:limit]
         else:
-            tokens = {t for t in query_norm.split() if t}
             scored: list[Tuple[int, Dict[str, Any]]] = []
             for it in items:
                 user = (it.get("user") or {}).get("content") or ""
@@ -259,15 +294,27 @@ class AISLongTermMemoryStore:
                 text = f"{user} {assistant}".lower()
                 if not text:
                     continue
-                score = sum(1 for t in tokens if t in text)
+                # normalize text like we did for the query
+                t_clean = re.sub(r"[^\w\s]", " ", text)
+                # crude singular/plural collapse on the fly
+                t_clean = " ".join(w.rstrip("s") for w in t_clean.split())
+                score = sum(1 for tok in tokens if tok and tok in t_clean)
                 if score > 0:
                     scored.append((score, it))
 
-            if scored:
-                scored.sort(key=lambda pair: pair[0], reverse=True)
-                selected = [it for _, it in scored[:limit]]
-            else:
-                selected = items[:limit]
+            scored.sort(key=lambda pair: pair[0], reverse=True)
+            selected: List[Dict[str, Any]] = [it for _, it in scored[:limit]]
+
+            # If we didn't get enough scored items, pad with newest unseen items.
+            if len(selected) < limit:
+                seen = set(id(it) for it in selected)
+                for it in items:
+                    if id(it) in seen:
+                        continue
+                    selected.append(it)
+                    seen.add(id(it))
+                    if len(selected) >= limit:
+                        break
 
         # Present oldest -> newest for readability
         try:

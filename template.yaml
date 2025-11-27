@@ -43,7 +43,7 @@ Parameters:
     Default: Joanna
   HistoryLimit:
     Type: Number
-    Default: 12
+    Default: 18
     MinValue: 0
     MaxValue: 64
   LLMSecretArn:
@@ -71,7 +71,7 @@ Parameters:
     Description: DynamoDB table name for AIS long-term memory persistence
   AISMemoryTtlDays:
     Type: Number
-    Default: 30
+    Default: 365
     MinValue: 0
     Description: TTL for AIS long-term memory items (0 to disable expiration)
   EnableOutboundSms:
