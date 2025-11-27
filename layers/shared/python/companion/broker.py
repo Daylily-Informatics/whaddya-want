@@ -137,7 +137,7 @@ class ConversationBroker:
 
         # ---- TTS ----
         audio_payload = self._speech.synthesize(
-            text=llm_response.message,
+            text=reply_text, #llm_response.message,
             session_id=session_id,
             response_id=str(int(timestamp.timestamp())),
             voice_id=voice_id,
