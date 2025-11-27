@@ -224,16 +224,24 @@ class ConversationBroker:
         ]
         return any(k in text for k in keywords)
 
-    def _format_memory_snippets(self, exchanges: list[Dict[str, Any]]) -> str:
-        """Format AIS memory exchanges into a compact, readable summary."""
+    def _format_memory_snippets(self, exchanges: Any) -> str:
         if not exchanges:
+            return ""
+
+        if not isinstance(exchanges, list):
+            print(f"[ais-memory] expected list of dicts, got {type(exchanges)}: {repr(exchanges)[:500]}")
             return ""
 
         lines: list[str] = []
         for ex in exchanges:
+            if not isinstance(ex, dict):
+                print(f"[ais-memory] skipping non-dict memory item: {type(ex)} {repr(ex)[:200]}")
+                continue
+
             ts = ex.get("timestamp") or ""
             user = (ex.get("user") or {}).get("content") or ""
             assistant = (ex.get("assistant") or {}).get("content") or ""
+            
             # Truncate very long texts so we don't blow out the prompt
             if len(user) > 300:
                 user = user[:297] + "..."

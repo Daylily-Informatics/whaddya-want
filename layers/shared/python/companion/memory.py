@@ -32,8 +32,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
+import json
 import boto3
 from boto3.dynamodb.conditions import Key
 
@@ -251,7 +252,7 @@ class AISLongTermMemoryStore:
             selected = items[:limit]
         else:
             tokens = {t for t in query_norm.split() if t}
-            scored: list[tuple[int, Dict[str, Any]]] = []
+            scored: list[Tuple[int, Dict[str, Any]]] = []
             for it in items:
                 user = (it.get("user") or {}).get("content") or ""
                 assistant = (it.get("assistant") or {}).get("content") or ""
