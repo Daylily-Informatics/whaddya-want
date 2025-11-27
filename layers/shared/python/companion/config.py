@@ -36,6 +36,8 @@ class RuntimeConfig:
     llm_model_id: str = ""
     use_memory: bool = True
     vision_model_id: str = ""  # Bedrock multimodal model for vision (optional)
+    ais_memory_table: str = ""
+    ais_memory_ttl_days: int = 30
 
     @classmethod
     def from_env(cls) -> "RuntimeConfig":
@@ -50,6 +52,8 @@ class RuntimeConfig:
 
         model_id = _env("MODEL_ID", default="amazon.titan-text-express-v1")
         vision_model_id = os.getenv("VISION_MODEL_ID", "").strip()
+        ais_memory_table = os.getenv("AIS_MEMORY_TABLE", "").strip()
+        ais_memory_ttl_days = int(os.getenv("AIS_MEMORY_TTL_DAYS", "30"))
 
         provider = os.getenv("LLM_PROVIDER", "").strip().lower()
         if not provider:
@@ -78,6 +82,8 @@ class RuntimeConfig:
             llm_model_id=model_id,
             use_memory=use_memory,
             vision_model_id=vision_model_id,
+            ais_memory_table=ais_memory_table,
+            ais_memory_ttl_days=ais_memory_ttl_days,
         )
 
 

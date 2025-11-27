@@ -22,6 +22,8 @@ Globals:
         VISION_MODEL_ID: !Ref VisionModelId
         POLLY_VOICE: !Ref PollyVoice
         AI_NAME: Marvin
+        AIS_MEMORY_TABLE: !Ref AISMemoryTable
+        AIS_MEMORY_TTL_DAYS: !Ref AISMemoryTtlDays
         # Optional: external LLM secret ARN (pass empty to skip)
 
 Parameters:
@@ -60,6 +62,15 @@ Parameters:
     AllowedValues: ["true","false"]
     Default: "true"
     Description: Enable HttpApi access logs (single-line JSON). Disable if you hit log config issues.
+  AISMemoryTableName:
+    Type: String
+    Default: whaddyawant_ais_long_term_memory
+    Description: DynamoDB table name for AIS long-term memory persistence
+  AISMemoryTtlDays:
+    Type: Number
+    Default: 30
+    MinValue: 0
+    Description: TTL for AIS long-term memory items (0 to disable expiration)
 
 Conditions:
   HasSecret: !Not [!Equals [!Ref LLMSecretArn, ""]]
@@ -78,6 +89,25 @@ Resources:
       KeySchema:
         - AttributeName: session_id
           KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  AISMemoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref AISMemoryTableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: session_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: session_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
       TimeToLiveSpecification:
         AttributeName: ttl
         Enabled: true
@@ -191,6 +221,11 @@ Resources:
                 - dynamodb:GetItem
                 - dynamodb:PutItem
               Resource: !GetAtt ConversationTable.Arn
+            # DynamoDB (AIS long-term memory)
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+              Resource: !GetAtt AISMemoryTable.Arn
             # Polly for TTS
             - Effect: Allow
               Action: [polly:SynthesizeSpeech]
@@ -231,6 +266,9 @@ Outputs:
   MemoryTableName:
     Description: DynamoDB table for session memory
     Value: !Ref ConversationTable
+  AISMemoryTableName:
+    Description: DynamoDB table for AIS long-term memory
+    Value: !Ref AISMemoryTable
   FunctionArn:
     Description: Broker Lambda ARN
     Value: !GetAtt BrokerFunction.Arn

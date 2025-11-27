@@ -521,7 +521,7 @@ async def run() -> bool:
     ap.add_argument(
         "--id-threshold",
         type=float,
-        default=float(_cfg("id_threshold", 0.65)),
+        default=float(_cfg("id_threshold", 0.55)),
     )
     ap.add_argument(
         "--id-window",

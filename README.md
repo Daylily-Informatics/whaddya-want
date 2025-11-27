@@ -203,6 +203,9 @@ components wire together:
 - **`lambda/broker`** – Python Lambda function that orchestrates DynamoDB
   memory, Secrets Manager (OpenAI credentials), the OpenAI Chat Completions
   endpoint, and Amazon Polly for speech synthesis.
+- **`AISMemoryTable`** – DynamoDB table capturing long-term conversational
+  exchanges (including optional `vision_scene` context) with timestamps for
+  future retrieval.
 - **`src/companion`** – Shared runtime package imported by the Lambda handler
   containing configuration helpers, DynamoDB persistence, OpenAI wrapper, and
   Polly/Rekognition utilities.

@@ -22,7 +22,8 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, List
+import json
+from typing import Any, Dict, List
 
 import boto3
 
@@ -147,4 +148,53 @@ class ConversationStore:
         self._table.put_item(Item=item)
 
 
-__all__ = ["ConversationStore", "ConversationTurn"]
+class AISLongTermMemoryStore:
+    """Persists full exchanges into an AIS long-term memory table."""
+
+    def __init__(self, table_name: str, region_name: str, ttl_days: int = 0) -> None:
+        self._table = boto3.resource("dynamodb", region_name=region_name).Table(table_name)
+        self._ttl_days = max(ttl_days, 0)
+
+    @staticmethod
+    def _json_sanitize(data: Dict[str, Any] | None) -> Dict[str, Any]:
+        if not data:
+            return {}
+        try:
+            return json.loads(json.dumps(data, default=str))
+        except Exception:
+            # Fallback: stringify everything if something could not be serialized
+            return {"raw": str(data)}
+
+    def record_exchange(
+        self,
+        *,
+        session_id: str,
+        timestamp: datetime,
+        user_text: str,
+        assistant_text: str,
+        metadata: Dict[str, Any] | None = None,
+    ) -> None:
+        item: Dict[str, Any] = {
+            "session_id": session_id,
+            "timestamp": timestamp.isoformat(),
+            "user": {
+                "role": "user",
+                "content": user_text,
+            },
+            "assistant": {
+                "role": "assistant",
+                "content": assistant_text,
+            },
+        }
+
+        sanitized = self._json_sanitize(metadata)
+        if sanitized:
+            item["metadata"] = sanitized
+
+        if self._ttl_days:
+            item["ttl"] = int(timestamp.timestamp()) + self._ttl_days * 24 * 3600
+
+        self._table.put_item(Item=item)
+
+
+__all__ = ["AISLongTermMemoryStore", "ConversationStore", "ConversationTurn"]
