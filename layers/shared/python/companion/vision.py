@@ -32,32 +32,43 @@ class VisionClient:
         hint: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Call a Claude 3/3.5/3.7 Sonnet-like model with an image and get back a compact JSON scene.
+        Call a Claude 3/3.5/3.7 Sonnet-like model with an image and get back a
+        compact JSON scene rich enough for downstream memory.
 
         The prompt instructs the model to return a single JSON object with keys:
-          - caption: str
-          - people:  [ { "approx_count": int, "notes": str } ]
-          - animals: [ { "species": str, "approx_count": int, "notes": str } ]
-          - objects: [str]
+          - caption / detailed_caption: str
+          - people:  [ { "approx_count": int, "attributes": str, "activities": str } ]
+          - animals: [ { "species": str, "approx_count": int, "attributes": str } ]
+          - objects: [ {"name": str, "count": int, "attributes": str} ]
           - layout:  str
+          - lighting: str
+          - salient_facts: [str]
         """
         img_b64 = base64.b64encode(image_bytes).decode("ascii")
 
         user_text = (
             "You are Marvin's camera. Given this single indoor camera frame, "
             "describe the scene as ONE JSON object and nothing else.\n"
+            "Return concise but information-dense fields so both short-term and "
+            "long-term memory can capture the scene without needing the raw "
+            "image.\n"
             'Schema: {"caption": str, '
-            '"people": [{"approx_count": int, "notes": str}], '
-            '"animals": [{"species": str, "approx_count": int, "notes": str}], '
-            '"objects": [str], "layout": str}.\n'
-            "Do not include markdown, backticks, or any extra commentary."
+            '"detailed_caption": str, '
+            '"people": [{"approx_count": int, "attributes": str, "activities": str}], '
+            '"animals": [{"species": str, "approx_count": int, "attributes": str}], '
+            '"objects": [{"name": str, "count": int, "attributes": str}], '
+            '"layout": str, "lighting": str, "salient_facts": [str]}.\n'
+            "Include colors, relative positions (left/center/right, foreground/" \
+            "background), visible text, and anything distinctive that would help "
+            "recall the image later. Do not include markdown, backticks, or any "
+            "extra commentary."
         )
         if hint:
             user_text += f"\nAdditional non-visual hints from other sensors: {hint}"
 
         body = {
             "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 400,
+            "max_tokens": 650,
             "messages": [
                 {
                     "role": "user",
