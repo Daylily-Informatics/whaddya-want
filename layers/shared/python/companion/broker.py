@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, List
 
 from .config import RuntimeConfig
 from .prompts import load_personality_prompt
@@ -76,21 +76,82 @@ class ConversationBroker:
         else:
             history = []
 
-        # ---- Build messages for the LLM ----
+        # ---- Long-term memory lookup (AIS) ----
         memory_snippets_text: str | None = None
-        if self._long_term_memory and self._looks_like_memory_query(user_text):
+        memories: list[Dict[str, Any]] = []
+        is_memory_query = self._looks_like_memory_query(user_text)
+
+        if self._long_term_memory and is_memory_query:
             try:
                 memories = self._long_term_memory.search_exchanges(
                     session_id=session_id,
                     query=user_text,
-                    limit=800,
+                    limit=8,
                 )
                 if memories:
                     print(f"[ais-memory] injecting {len(memories)} exchanges for session={session_id}")
-                memory_snippets_text = self._format_memory_snippets(memories)
+                    memory_snippets_text = self._format_memory_snippets(memories)
             except Exception as exc:  # pragma: no cover - non-critical telemetry
                 print(f"Warning: failed to retrieve AIS long-term memory: {exc}")
+                memories = []
+                memory_snippets_text = None
 
+        # ---- Pure memory mode: bypass LLM for some queries ----
+        if is_memory_query and self._is_pure_memory_question(user_text):
+            if memories:
+                reply_text = self._render_memory_reply(user_text, memories)
+            else:
+                reply_text = (
+                    "I don't have any reliable memory of that topic. "
+                    "My long-term log doesn't show anything relevant."
+                )
+
+            command: Dict[str, Any] = {"name": "noop", "args": {}}
+            timestamp = datetime.now(timezone.utc)
+            turns = [
+                ConversationTurn(role="user", content=user_text, timestamp=timestamp),
+                ConversationTurn(role="assistant", content=reply_text, timestamp=timestamp),
+            ]
+
+            # Persist short-term history
+            if self._config.use_memory:
+                self._memory.append_turns(
+                    session_id=session_id,
+                    turns=turns,
+                    limit=self._config.history_limit,
+                )
+
+            # Record deterministic memory reply into AIS
+            if self._long_term_memory:
+                try:
+                    self._long_term_memory.record_exchange(
+                        session_id=session_id,
+                        timestamp=timestamp,
+                        user_text=user_text,
+                        assistant_text=reply_text,
+                        metadata={"server_action_result": None, "tool_calls": []},
+                    )
+                except Exception as exc:  # pragma: no cover
+                    print(f"Warning: failed to persist AIS long-term memory: {exc}")
+
+            audio_payload = self._speech.synthesize(
+                text=reply_text,
+                session_id=session_id,
+                response_id=str(int(timestamp.timestamp())),
+                voice_id=voice_id,
+            )
+            if text_only and isinstance(audio_payload, dict):
+                audio_payload = dict(audio_payload)
+                audio_payload["audio_base64"] = None
+
+            return {
+                "text": reply_text,
+                "audio": audio_payload,
+                "command": command,
+                "tool_calls": [],
+            }
+
+        # ---- Build messages for the LLM ----
         messages: list[dict[str, str]] = [
             {
                 "role": "system",
@@ -106,9 +167,7 @@ class ConversationBroker:
                 }
             )
 
-        messages.extend(
-            {"role": turn.role, "content": turn.content} for turn in history
-        )
+        messages.extend({"role": turn.role, "content": turn.content} for turn in history)
         messages.append({"role": "user", "content": user_text})
 
         if context:
@@ -132,12 +191,13 @@ class ConversationBroker:
                 turns=turns,
                 limit=self._config.history_limit,
             )
+
         # ---- Parse command from the LLM reply ----
         reply_text, command = _extract_command(llm_response.message)
 
         # ---- TTS ----
         audio_payload = self._speech.synthesize(
-            text=reply_text, #llm_response.message,
+            text=reply_text,  # use cleaned text, not raw with COMMAND
             session_id=session_id,
             response_id=str(int(timestamp.timestamp())),
             voice_id=voice_id,
@@ -221,7 +281,8 @@ class ConversationBroker:
             "previous conversation",
             "earlier in this conversation",
             "based on everything we've done",
-            "summarize what we've done",           
+            "summarize what we've done",
+            # vision-ish memory cues
             "have you ever seen",
             "what have you seen",
             "pictures you've seen",
@@ -229,7 +290,48 @@ class ConversationBroker:
         ]
         return any(k in text for k in keywords)
 
+    def _is_pure_memory_question(self, text: str) -> bool:
+        """Return True if the user is clearly asking ONLY about past context."""
+        t = (text or "").lower()
+        # crude, but OK: no 'why/should/how do I' + has 'remind/remember/have we talked'
+        if any(w in t for w in ["why", "should", "how do i"]):
+            return False
+        return any(
+            phrase in t
+            for phrase in [
+                "remind me",
+                "remember when",
+                "have we discussed",
+                "have we talked about",
+                "what did we talk about",
+                "what did i tell you",
+                "what have we said about",
+                "what things we've said about",
+                "remind me if i asked you",
+                "remind me what we talked about",
+            ]
+        )
+
+    def _render_memory_reply(self, user_text: str, memories: List[Dict[str, Any]]) -> str:
+        """Generate a deterministic, non-hallucinated summary of AIS memory."""
+        lines: list[str] = []
+        for ex in memories:
+            ts = ex.get("timestamp") or ""
+            user = (ex.get("user") or {}).get("content") or ""
+            assistant = (ex.get("assistant") or {}).get("content") or ""
+            if not user and not assistant:
+                continue
+            prefix = f"[{ts}] " if ts else ""
+            if user:
+                lines.append(f"{prefix}You said: {user}")
+            if assistant:
+                lines.append(f"{prefix}I replied: {assistant}")
+        if not lines:
+            return "I don't have any reliable memory on that topic in my log."
+        return "Here's what I have in my long-term log about that:\n" + "\n".join(lines[:16])
+
     def _format_memory_snippets(self, exchanges: Any) -> str:
+        """Format AIS memory exchanges into a compact, readable summary."""
         if not exchanges:
             return ""
 
@@ -246,7 +348,7 @@ class ConversationBroker:
             ts = ex.get("timestamp") or ""
             user = (ex.get("user") or {}).get("content") or ""
             assistant = (ex.get("assistant") or {}).get("content") or ""
-            
+
             # Truncate very long texts so we don't blow out the prompt
             if len(user) > 300:
                 user = user[:297] + "..."
@@ -320,7 +422,7 @@ def _extract_command(reply: str) -> Tuple[str, Dict[str, Any]]:
             flags=re.IGNORECASE | re.MULTILINE,
         ).rstrip()
         name = alt.group(1).strip()
-        args_raw = (alt.group(2) or "").strip()
+        args_raw = (alt.get(2) or "").strip() if hasattr(alt, "get") else (alt.group(2) or "").strip()
         cmd = default_cmd
         args: Dict[str, Any] = {}
         try:
