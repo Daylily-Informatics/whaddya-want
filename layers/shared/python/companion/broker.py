@@ -77,14 +77,38 @@ class ConversationBroker:
             history = []
 
         # ---- Build messages for the LLM ----
+        memory_snippets_text: str | None = None
+        if self._long_term_memory and self._looks_like_memory_query(user_text):
+            try:
+                memories = self._long_term_memory.search_exchanges(
+                    session_id=session_id,
+                    query=user_text,
+                    limit=8,
+                )
+                memory_snippets_text = self._format_memory_snippets(memories)
+            except Exception as exc:  # pragma: no cover - non-critical telemetry
+                print(f"Warning: failed to retrieve AIS long-term memory: {exc}")
+
         messages: list[dict[str, str]] = [
             {
                 "role": "system",
                 "content": self._system_prompt,
             },
-            *({"role": turn.role, "content": turn.content} for turn in history),
-            {"role": "user", "content": user_text},
         ]
+
+        if memory_snippets_text:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": f"Relevant past memory:\n{memory_snippets_text}",
+                }
+            )
+
+        messages.extend(
+            {"role": turn.role, "content": turn.content} for turn in history
+        )
+        messages.append({"role": "user", "content": user_text})
+
         if context:
             # Context is injected as a separate system message so it can carry
             # vision + environment info without polluting the main prompt text.
@@ -155,7 +179,7 @@ class ConversationBroker:
         # ---- Long-term AIS memory ----
         if self._long_term_memory:
             metadata = {
-                "vision_scene": (context or {}).get("vision_scene"),
+                "vision_scene": (context or {}).get("vision_scene") if context else None,
                 "command": command,
                 "server_action_result": server_action_result,
                 "tool_calls": llm_response.tool_calls,
@@ -178,6 +202,50 @@ class ConversationBroker:
             "command": command,
             "tool_calls": llm_response.tool_calls,
         }
+
+    def _looks_like_memory_query(self, user_text: str) -> bool:
+        """Heuristic to decide whether the user is asking about past context.
+
+        This is intentionally cheap and conservative; it only fires on obvious
+        "what did we do before" / "remind me" style questions.
+        """
+        text = (user_text or "").lower()
+        keywords = [
+            "remind me",
+            "remember when",
+            "what did we decide",
+            "what did we talk about",
+            "what were we doing",
+            "last time we",
+            "previous conversation",
+            "earlier in this conversation",
+            "based on everything we've done",
+            "summarize what we've done",
+        ]
+        return any(k in text for k in keywords)
+
+    def _format_memory_snippets(self, exchanges: list[Dict[str, Any]]) -> str:
+        """Format AIS memory exchanges into a compact, readable summary."""
+        if not exchanges:
+            return ""
+
+        lines: list[str] = []
+        for ex in exchanges:
+            ts = ex.get("timestamp") or ""
+            user = (ex.get("user") or {}).get("content") or ""
+            assistant = (ex.get("assistant") or {}).get("content") or ""
+            # Truncate very long texts so we don't blow out the prompt
+            if len(user) > 300:
+                user = user[:297] + "..."
+            if len(assistant) > 300:
+                assistant = assistant[:297] + "..."
+            header = f"- [{ts}] You: {user}" if ts else f"- You: {user}"
+            lines.append(header)
+            if assistant:
+                lines.append(f"  Marvin: {assistant}")
+
+        # Cap total lines to keep this block small
+        return "\n".join(lines[:40])
 
 
 def _extract_command(reply: str) -> Tuple[str, Dict[str, Any]]:

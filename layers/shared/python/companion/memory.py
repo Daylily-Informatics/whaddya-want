@@ -14,18 +14,28 @@ table, which stores a single item per session:
     }
 
 Older deployments may still have an earlier format where each element of
-`turns` was a {"user": "...", "assistant": "..."} pair. We transparently
-convert those entries into the new per-message structure on read/write.
+`turns` is a {"user": "...", "assistant": "..."} pair.
+
+The AIS long-term memory store is separate, with one item per exchange:
+
+    {
+      "session_id": "...",
+      "timestamp": "...",
+      "user": {...},
+      "assistant": {...},
+      "metadata": {...},
+      "ttl": <epoch-seconds>
+    }
 """
+
 from __future__ import annotations
 
-from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import json
 from typing import Any, Dict, List
 
 import boto3
+from boto3.dynamodb.conditions import Key
 
 
 @dataclass(slots=True)
@@ -67,34 +77,34 @@ class ConversationStore:
             if "role" in entry and "content" in entry:
                 ts_raw = entry.get("timestamp")
                 try:
-                    ts = datetime.fromisoformat(ts_raw) if isinstance(ts_raw, str) else now
+                    ts = datetime.fromisoformat(ts_raw) if ts_raw else now
                 except Exception:
                     ts = now
                 turns.append(
                     ConversationTurn(
-                        role=str(entry.get("role") or "assistant"),
-                        content=str(entry.get("content") or ""),
+                        role=str(entry["role"]),
+                        content=str(entry["content"]),
                         timestamp=ts,
                     )
                 )
                 continue
 
-            # Legacy format: a single dict with "user" and "assistant" fields
+            # Legacy format: {"user": "...", "assistant": "..."}
             user_text = entry.get("user")
-            if isinstance(user_text, str) and user_text.strip():
+            assistant_text = entry.get("assistant")
+            if user_text is not None:
                 turns.append(
                     ConversationTurn(
                         role="user",
-                        content=user_text,
+                        content=str(user_text),
                         timestamp=now,
                     )
                 )
-            assistant_text = entry.get("assistant")
-            if isinstance(assistant_text, str) and assistant_text.strip():
+            if assistant_text is not None:
                 turns.append(
                     ConversationTurn(
                         role="assistant",
-                        content=assistant_text,
+                        content=str(assistant_text),
                         timestamp=now,
                     )
                 )
@@ -102,38 +112,50 @@ class ConversationStore:
         return turns
 
     @staticmethod
-    def _encode_turns(turns: Iterable[ConversationTurn]) -> list[dict[str, Any]]:
-        """Encode ConversationTurn objects for storage."""
-        out: list[dict[str, Any]] = []
+    def _encode_turns(turns: List[ConversationTurn]) -> List[Dict[str, Any]]:
+        """Encode ConversationTurn objects into a JSON-serializable list."""
+        encoded: list[dict[str, Any]] = []
         for t in turns:
-            out.append(
+            encoded.append(
                 {
                     "role": t.role,
                     "content": t.content,
                     "timestamp": t.timestamp.isoformat(),
                 }
             )
-        return out
+        return encoded
 
     # ---- Public API ----
-    def fetch_history(self, session_id: str, limit: int) -> list[ConversationTurn]:
-        resp = self._table.get_item(Key={"session_id": session_id})
-        item = resp.get("Item") or {}
-        raw_turns = item.get("turns") or []
-        turns = self._decode_turns(raw_turns)
+    def fetch_history(self, *, session_id: str, limit: int) -> List[ConversationTurn]:
+        """Fetch up to `limit` recent turns for a session."""
+        try:
+            resp = self._table.get_item(Key={"session_id": session_id})
+        except Exception:
+            return []
+
+        item = resp.get("Item")
+        if not item:
+            return []
+
+        turns = self._decode_turns(item.get("turns"))
         if limit > 0 and len(turns) > limit:
             turns = turns[-limit:]
         return turns
 
     def append_turns(
         self,
-        session_id: str,
-        turns: Iterable[ConversationTurn],
         *,
+        session_id: str,
+        turns: List[ConversationTurn],
         limit: int,
     ) -> None:
-        """Append new turns to the stored history, trimming to `limit`."""
-        existing = self.fetch_history(session_id=session_id, limit=limit or 0)
+        """Append new turns to the stored history for a session.
+
+        This method re-fetches the existing history to keep things simple.
+        For high-throughput workloads you might want to switch to a more
+        sophisticated append-only model.
+        """
+        existing = self.fetch_history(session_id=session_id, limit=0)
         new_turns = existing + list(turns)
         if limit > 0 and len(new_turns) > limit:
             new_turns = new_turns[-limit:]
@@ -195,6 +217,75 @@ class AISLongTermMemoryStore:
             item["ttl"] = int(timestamp.timestamp()) + self._ttl_days * 24 * 3600
 
         self._table.put_item(Item=item)
+
+    def search_exchanges(
+        self,
+        session_id: str,
+        query: str | None = None,
+        limit: int = 8,
+    ) -> List[Dict[str, Any]]:
+        """Return up to ``limit`` recent exchanges for a session.
+
+        This is a very simple, in-memory scoring over the most recent items for
+        the given ``session_id``. If ``query`` is provided, we rank by the
+        number of query tokens that appear in the user/assistant text; if no
+        match is found, we fall back to the newest items.
+        """
+        if not session_id:
+            return []
+
+        try:
+            resp = self._table.query(
+                KeyConditionExpression=Key("session_id").eq(session_id),
+                ScanIndexForward=False,  # newest first
+                Limit=100,
+            )
+        except Exception:
+            # On any query failure, do not break the main flow; just return nothing.
+            return []
+
+        items = resp.get("Items", []) or []
+
+        query_norm = (query or "").strip().lower()
+        if not query_norm:
+            selected = items[:limit]
+        else:
+            tokens = {t for t in query_norm.split() if t}
+            scored: list[tuple[int, Dict[str, Any]]] = []
+            for it in items:
+                user = (it.get("user") or {}).get("content") or ""
+                assistant = (it.get("assistant") or {}).get("content") or ""
+                text = f"{user} {assistant}".lower()
+                if not text:
+                    continue
+                score = sum(1 for t in tokens if t in text)
+                if score > 0:
+                    scored.append((score, it))
+
+            if scored:
+                scored.sort(key=lambda pair: pair[0], reverse=True)
+                selected = [it for _, it in scored[:limit]]
+            else:
+                selected = items[:limit]
+
+        # Present oldest -> newest for readability
+        try:
+            selected.sort(key=lambda it: it.get("timestamp") or "")
+        except Exception:
+            pass
+
+        normalized: List[Dict[str, Any]] = []
+        for it in selected:
+            normalized.append(
+                {
+                    "session_id": it.get("session_id"),
+                    "timestamp": it.get("timestamp"),
+                    "user": it.get("user") or {},
+                    "assistant": it.get("assistant") or {},
+                    "metadata": it.get("metadata") or {},
+                }
+            )
+        return normalized
 
 
 __all__ = ["AISLongTermMemoryStore", "ConversationStore", "ConversationTurn"]
