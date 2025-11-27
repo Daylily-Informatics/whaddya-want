@@ -88,6 +88,8 @@ class ConversationBroker:
         else:
             history = []
 
+        memory_debug: dict[str, Any] | None = None
+
         # ---- Long-term memory lookup (AIS) ----
         memory_snippets_text: str | None = None
         memories: list[Dict[str, Any]] = []
@@ -107,6 +109,20 @@ class ConversationBroker:
                 print(f"Warning: failed to retrieve AIS long-term memory: {exc}")
                 memories = []
                 memory_snippets_text = None
+
+        if is_memory_query:
+            history_debug = [
+                {
+                    "role": turn.role,
+                    "content": turn.content,
+                    "timestamp": turn.timestamp.isoformat(),
+                }
+                for turn in history
+            ]
+            memory_debug = {
+                "short_term_history": history_debug,
+                "long_term_matches": memories,
+            }
 
         # ---- Pure memory mode: bypass LLM for some queries ----
         if is_memory_query and self._is_pure_memory_question(user_text):
@@ -161,6 +177,7 @@ class ConversationBroker:
                 "audio": audio_payload,
                 "command": command,
                 "tool_calls": [],
+                "memory_debug": memory_debug,
             }
 
         # ---- Build messages for the LLM ----
@@ -274,6 +291,7 @@ class ConversationBroker:
             "audio": audio_payload,
             "command": command,
             "tool_calls": llm_response.tool_calls,
+            "memory_debug": memory_debug,
         }
 
     def _looks_like_memory_query(self, user_text: str) -> bool:
