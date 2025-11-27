@@ -102,7 +102,7 @@ Resources:
   ConversationTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: whaddyawant_session_memory
+      TableName: !Sub "${AWS::StackName}-session-memory"
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: session_id
@@ -117,7 +117,7 @@ Resources:
   AISMemoryTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: !Ref AISMemoryTableName
+      TableName: !Sub "${AWS::StackName}-ais-memory"
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: session_id
@@ -184,20 +184,20 @@ Resources:
       RetentionInDays: 7
 
   BrokerHttpApi:
-    Type: AWS::Serverless::HttpApi
-    Properties:
-      StageName: $default
-      CorsConfiguration:
-        AllowOrigins: ['*']             # tighten later
-        AllowMethods: ['POST','OPTIONS']
-        AllowHeaders: ['content-type','x-client-session']
-      AccessLogSettings:
-        # Only include access logs when enabled
-        !If
-          - EnableLogs
-          - DestinationArn: !GetAtt HttpApiLogs.Arn
-            Format: '{ "requestId":"$context.requestId","status":$context.status,"integrationStatus":"$context.integrationStatus","integrationError":"$context.integrationErrorMessage","ip":"$context.identity.sourceIp","ua":"$context.identity.userAgent","path":"$context.path" }'
-          - !Ref "AWS::NoValue"
+      Type: AWS::Serverless::HttpApi
+      Properties:
+        StageName: $default
+        CorsConfiguration:
+          AllowOrigins: ['*']             # tighten later
+          AllowMethods: ['POST','OPTIONS']
+          AllowHeaders: ['content-type','x-client-session']
+        AccessLogSettings:
+          Fn::If:
+            - EnableLogs
+            - DestinationArn:
+                Fn::GetAtt: [HttpApiLogs, Arn]
+              Format: '{ "requestId":"$context.requestId","status":$context.status,"integrationStatus":"$context.integrationStatus","integrationError":"$context.integrationErrorMessage","ip":"$context.identity.sourceIp","ua":"$context.identity.userAgent","path":"$context.path" }'
+            - Ref: AWS::NoValue
 
   # --------- Shared Python layer ----------
   SharedLayer:
