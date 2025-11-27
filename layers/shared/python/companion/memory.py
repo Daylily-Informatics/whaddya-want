@@ -244,7 +244,7 @@ class AISLongTermMemoryStore:
             resp = self._table.query(
                 KeyConditionExpression=Key("session_id").eq(session_id),
                 ScanIndexForward=False,  # newest first
-                Limit=500,               # allow deeper history within this session
+                Limit=1050,               # allow deeper history within this session
             )
         except Exception:
             # On any query failure, do not break the main flow; just return nothing.
@@ -288,12 +288,34 @@ class AISLongTermMemoryStore:
             selected = items[:limit]
         else:
             scored: list[Tuple[int, Dict[str, Any]]] = []
+
             for it in items:
                 user = (it.get("user") or {}).get("content") or ""
                 assistant = (it.get("assistant") or {}).get("content") or ""
-                text = f"{user} {assistant}".lower()
+                meta = it.get("metadata") or {}
+                vision = meta.get("vision_scene") or ""
+
+                # flatten vision_scene to text
+                vision_text = ""
+                if isinstance(vision, dict):
+                    caption = vision.get("caption") or ""
+                    objs = vision.get("objects") or []
+                    people = vision.get("people") or []
+                    # crude flatten; adjust to your actual schema
+                    vision_parts = [caption]
+                    vision_parts.extend(str(o) for o in objs)
+                    vision_parts.extend(str(p) for p in people)
+                    vision_text = " ".join(vision_parts)
+                else:
+                    vision_text = str(vision)
+
+                text = f"{user} {assistant} {vision_text}".lower()
                 if not text:
                     continue
+
+                t_clean = re.sub(r"[^\w\s]", " ", text)
+                t_clean = " ".join(w.rstrip("s") for w in t_clean.split())
+                score = sum(1 for tok in tokens if tok and tok in t_clean)
                 # normalize text like we did for the query
                 t_clean = re.sub(r"[^\w\s]", " ", text)
                 # crude singular/plural collapse on the fly
