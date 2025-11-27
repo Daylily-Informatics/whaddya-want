@@ -153,8 +153,21 @@ class LLMClient:
         if not self._bedrock:
             raise RuntimeError("Bedrock client not initialised")
 
+        # Bedrock Converse requires the first message to have role="user". If our
+        # trimmed history begins with an assistant/system turn (e.g., because the
+        # stored context was truncated), drop leading non-user messages so the call
+        # always starts with a valid user turn.
+        convo_for_bedrock = convo
+        if convo_for_bedrock and convo_for_bedrock[0].get("role") != "user":
+            for idx, msg in enumerate(convo_for_bedrock):
+                if msg.get("role") == "user":
+                    convo_for_bedrock = convo_for_bedrock[idx:]
+                    break
+            else:
+                convo_for_bedrock = [{"role": "user", "content": "Let's begin."}]
+
         messages: list[dict[str, Any]] = []
-        for msg in convo:
+        for msg in convo_for_bedrock:
             role = msg["role"]
             text = msg["content"]
             messages.append({"role": role, "content": [{"text": text}]})
