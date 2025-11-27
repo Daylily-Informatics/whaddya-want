@@ -37,6 +37,18 @@ class ConversationBroker:
         )
         self._system_prompt = load_personality_prompt(config.prompts_path)
 
+        # AIS long-term memory
+        self._long_term_memory: AISLongTermMemoryStore | None = None
+        if config.ais_memory_table:
+            print(f"[ais-memory] initializing with table={config.ais_memory_table!r}")
+            self._long_term_memory = AISLongTermMemoryStore(
+                table_name=config.ais_memory_table,
+                region_name=config.region_name,
+                ttl_days=config.ais_memory_ttl_days,
+            )
+        else:
+            print("[ais-memory] DISABLED (no AIS_MEMORY_TABLE configured)")
+
         self._long_term_memory: AISLongTermMemoryStore | None = None
         if config.ais_memory_table:
             self._long_term_memory = AISLongTermMemoryStore(
