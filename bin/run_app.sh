@@ -7,5 +7,6 @@ ACTION_EMAIL_FROM=john@dyly.bio  # verified in SES
 
 PYTHONPATH=. python -m client.cli \
   --broker-url $BROKER   \
-  --setup-devices --voice Matthew --voice-mode generative --verbose -vv --enroll-ai-voice --self-voice-name Matthew
+  --setup-devices --voice Matthew --voice-mode generative --verbose -vv --self-voice-name Matthew
 
+# --enroll-ai-voice
