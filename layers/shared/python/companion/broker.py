@@ -85,6 +85,8 @@ class ConversationBroker:
                     query=user_text,
                     limit=8,
                 )
+                if memories:
+                    print(f"[ais-memory] injecting {len(memories)} exchanges for session={session_id}")
                 memory_snippets_text = self._format_memory_snippets(memories)
             except Exception as exc:  # pragma: no cover - non-critical telemetry
                 print(f"Warning: failed to retrieve AIS long-term memory: {exc}")
@@ -130,6 +132,8 @@ class ConversationBroker:
                 turns=turns,
                 limit=self._config.history_limit,
             )
+        # ---- Parse command from the LLM reply ----
+        reply_text, command = _extract_command(llm_response.message)
 
         # ---- TTS ----
         audio_payload = self._speech.synthesize(
@@ -138,9 +142,6 @@ class ConversationBroker:
             response_id=str(int(timestamp.timestamp())),
             voice_id=voice_id,
         )
-
-        # ---- Parse command from the LLM reply ----
-        reply_text, command = _extract_command(llm_response.message)
 
         # ---- Execute server-side actions for certain commands ----
         server_action_result: Dict[str, Any] | None = None
