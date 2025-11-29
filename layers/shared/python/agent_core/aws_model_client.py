@@ -23,7 +23,6 @@ from typing import Any, Dict, List, Tuple
 
 import boto3
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -96,7 +95,6 @@ class AwsModelClient:
         if not results:
             return "I couldn't generate a response."
         text = results[0].get("outputText") or "I couldn't generate a response."
-        logger.debug("Titan response text length=%s", len(text))
         return text
 
     def _chat_converse(self, system: str, convo: List[Dict[str, str]]) -> str:
@@ -126,19 +124,23 @@ class AwsModelClient:
             kwargs["system"] = [{"text": system}]
 
         try:
+            logger.debug(
+                "Invoking converse model %s with %s messages (system_present=%s)",
+                self._model,
+                len(messages),
+                had_system,
+            )
             out = self._bedrock.converse(**kwargs)
             text = out["output"]["message"]["content"][0]["text"]
-            logger.debug("Converse response text length=%s", len(text))
             return text
         except Exception as e:  # pragma: no cover - defensive fallback
             msg = str(e)
-            logger.warning("Converse call failed: %s", msg)
+            logger.warning("Bedrock converse error: %s", msg)
             # Some models don't support system; retry without it.
             if had_system and ("system" in msg.lower() or "doesn't support system" in msg.lower()):
                 kwargs.pop("system", None)
                 out = self._bedrock.converse(**kwargs)
                 text = out["output"]["message"]["content"][0]["text"]
-                logger.debug("Converse retry (no system) text length=%s", len(text))
                 return text
             # Last resort: surface a generic failure message.
             return "I had trouble talking to the language model backend."
@@ -180,13 +182,127 @@ class AwsModelClient:
           ]
         }
 
-        For now we synthesize a single `store_memory` tool call for the most
+        For now we synthesize a `store_memory` tool call for the most
         recent user message so that the planner will persist it as a MEMORY
         row in the AgentStateTable. This is a stopgap until native Bedrock
         tool calling is wired through.
+
+        This implementation also applies simple heuristics to decide
+        whether to store a memory at all, and to classify it as FACT,
+        SPECULATION, or AI_INSIGHT based on the text.
         """
         logger.debug("Chat called with %s messages; generating reply", len(messages))
         reply_text = self._chat_bedrock(messages)
+
+        # Helper: decide whether a user utterance is worth persisting.
+        def _should_store(text: str) -> bool:
+            stripped = (text or "").strip()
+            if not stripped:
+                return False
+
+            lower = stripped.lower()
+            tokens = lower.split()
+
+            # Very short noise / fillers.
+            noise_words = {
+                "hi",
+                "hey",
+                "hello",
+                "yo",
+                "ok",
+                "okay",
+                "k",
+                "kk",
+                "lol",
+                "help",
+                "test",
+                "exit",
+                "quit",
+                "bye",
+                "goodbye",
+            }
+            if lower in noise_words:
+                return False
+            if len(tokens) == 1 and tokens[0] in noise_words:
+                return False
+
+            # Command-like chatter that shouldn't become long-term memory.
+            if lower.startswith(("command ", "cmd ", "run ", "shell ")):
+                return False
+
+            # If it's extremely short and doesn't reference self/you and has
+            # no digits, treat as noise.
+            pronoun_keywords = {
+                "i",
+                "i'm",
+                "im",
+                "my",
+                "me",
+                "mine",
+                "we",
+                "our",
+                "you",
+                "your",
+                "yours",
+            }
+            has_digit = any(ch.isdigit() for ch in lower)
+            if len(tokens) <= 2 and not (set(tokens) & pronoun_keywords) and not has_digit:
+                return False
+
+            return True
+
+        # Helper: classify the memory kind based on simple patterns.
+        def _classify_memory_kind(text: str) -> str:
+            lower = (text or "").lower()
+
+            speculative_markers = [
+                "i think",
+                "i guess",
+                "maybe",
+                "probably",
+                "i'm not sure",
+                "im not sure",
+                "i am not sure",
+                "not sure",
+                "i wonder",
+                "might be",
+            ]
+            for marker in speculative_markers:
+                if marker in lower:
+                    return "SPECULATION"
+
+            # Compliments or judgments about the AI or the interaction.
+            compliment_markers = [
+                "you are the best",
+                "you're the best",
+                "youre the best",
+                "you are great",
+                "you are awesome",
+                "you are amazing",
+                "you are helpful",
+                "you are very helpful",
+            ]
+            if any(marker in lower for marker in compliment_markers):
+                return "AI_INSIGHT"
+
+            if ("you are" in lower or "you're" in lower or "youre" in lower) and any(
+                pw in lower
+                for pw in [
+                    "good",
+                    "great",
+                    "amazing",
+                    "awesome",
+                    "helpful",
+                    "smart",
+                    "nice",
+                    "kind",
+                    "cool",
+                ]
+            ):
+                return "AI_INSIGHT"
+
+            # Default: treat as a concrete fact (often about the user).
+            return "FACT"
 
         # Find the most recent user message; this is what we'll persist.
         last_user_text: str | None = None
@@ -202,20 +318,31 @@ class AwsModelClient:
         tool_calls: List[Dict[str, Any]] = []
 
         if last_user_text:
-            mem_args = {
-                "memory_kind": "FACT",
-                "summary": last_user_text[:160],
-                "content": {"user_text": last_user_text},
-                "tags": [],
-                "links": [],
-            }
-            logger.debug("Synthesizing store_memory for user text preview='%s'", last_user_text[:60])
-            tool_calls.append(
-                {
-                    "name": "store_memory",
-                    "arguments": json.dumps(mem_args),
+            if _should_store(last_user_text):
+                memory_kind = _classify_memory_kind(last_user_text)
+                mem_args = {
+                    "memory_kind": memory_kind,
+                    "summary": last_user_text[:160],
+                    "content": {"user_text": last_user_text},
+                    "tags": [],
+                    "links": [],
                 }
-            )
+                logger.debug(
+                    "Synthesizing store_memory(kind=%s) for user text preview='%s'",
+                    memory_kind,
+                    last_user_text[:60],
+                )
+                tool_calls.append(
+                    {
+                        "name": "store_memory",
+                        "arguments": json.dumps(mem_args),
+                    }
+                )
+            else:
+                logger.debug(
+                    "Skipping memory synthesis for noisy user text preview='%s'",
+                    last_user_text[:60],
+                )
 
         assistant_msg: Dict[str, Any] = {
             "role": "assistant",
