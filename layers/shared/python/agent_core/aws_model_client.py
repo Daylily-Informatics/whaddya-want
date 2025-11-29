@@ -17,14 +17,10 @@ calling.
 """
 
 import json
-import logging
 import os
 from typing import Any, Dict, List, Tuple
 
 import boto3
-
-
-logger = logging.getLogger(__name__)
 
 
 class AwsModelClient:
@@ -35,7 +31,6 @@ class AwsModelClient:
         if not self._model:
             raise RuntimeError("MODEL_ID must be configured (env var or constructor).")
         self._bedrock = boto3.client("bedrock-runtime", region_name=self._region)
-        logger.debug("Initialized AwsModelClient", extra={"model": self._model, "region": self._region})
 
     # ---- Internal helpers (adapted from the 0.0.20 LLM client) ----
 
@@ -129,13 +124,12 @@ class AwsModelClient:
             return text
         except Exception as e:  # pragma: no cover - defensive fallback
             msg = str(e)
-            logger.warning("Bedrock converse call failed: %s", msg)
             # Some models don't support system; retry without it.
             if had_system and ("system" in msg.lower() or "doesn't support system" in msg.lower()):
                 kwargs.pop("system", None)
                 out = self._bedrock.converse(**kwargs)
                 text = out["output"]["message"]["content"][0]["text"]
-            return text
+                return text
             # Last resort: surface a generic failure message.
             return "I had trouble talking to the language model backend."
 

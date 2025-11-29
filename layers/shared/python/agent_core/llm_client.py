@@ -1,12 +1,8 @@
 from __future__ import annotations
 
-import logging
 from typing import Any, Dict, List
 
 from . import tools as agent_tools
-
-
-logger = logging.getLogger(__name__)
 
 
 def build_system_prompt(personality_prompt: str) -> str:
@@ -35,13 +31,6 @@ def chat_with_tools(
     if tools is None:
         tools = agent_tools.TOOLS_SPEC
 
-    logger.debug(
-        "Invoking model client with %d messages and %d tools",
-        len(messages),
-        len(tools or []),
-    )
-
     # This is intentionally abstract; replace with your own client.
     response = model_client.chat(messages=messages, tools=tools)
-    logger.debug("Model client returned messages of length %d", len(response.get("messages", [])))
     return response
