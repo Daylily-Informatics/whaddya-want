@@ -16,6 +16,11 @@ This version also:
 - Answers certain simple questions ("what is my name", "how old am I",
   "do I have dogs") directly from long-term MEMORY rows when possible,
   falling back to the LLM only when no confident memory-based answer exists.
+
+Important:
+- We now REQUIRE MODEL_ID to be set (no default Titan). If the chosen model
+  does not support system messages, we surface a clear error instead of
+  silently stripping the system message.
 """
 
 import json
@@ -34,11 +39,14 @@ logger = logging.getLogger(__name__)
 
 class AwsModelClient:
     def __init__(self, model_id: str | None = None, region_name: str | None = None) -> None:
-        # Prefer explicit args, then env, then a sensible Bedrock default.
-        self._model: str = (model_id or os.getenv("MODEL_ID") or "amazon.titan-text-express-v1").strip()
-        self._region: str = (region_name or os.getenv("AWS_REGION") or "us-west-2").strip()
+        # Prefer explicit args, then env. No silent default to Titan anymore.
+        self._model: str = (model_id or os.getenv("MODEL_ID") or "").strip()
         if not self._model:
-            raise RuntimeError("MODEL_ID must be configured (env var or constructor).")
+            raise RuntimeError(
+                "AwsModelClient: MODEL_ID must be configured (env var MODEL_ID or constructor). "
+                "Choose a Bedrock model that supports system messages, e.g. meta.llama3-1-8b-instruct-v1:0."
+            )
+        self._region: str = (region_name or os.getenv("AWS_REGION") or "us-west-2").strip()
         self._bedrock = boto3.client("bedrock-runtime", region_name=self._region)
         logger.info("Initialized AwsModelClient model=%s region=%s", self._model, self._region)
 
@@ -82,7 +90,6 @@ class AwsModelClient:
                 "topP": 0.9,
             },
         }
-        had_system = bool(system)
         if system:
             kwargs["system"] = [{"text": system}]
 
@@ -91,7 +98,7 @@ class AwsModelClient:
                 "Invoking converse model %s with %s messages (system_present=%s)",
                 self._model,
                 len(messages),
-                had_system,
+                bool(system),
             )
             out = self._bedrock.converse(**kwargs)
             text = out["output"]["message"]["content"][0]["text"]
@@ -99,22 +106,29 @@ class AwsModelClient:
         except Exception as e:  # pragma: no cover - defensive fallback
             msg = str(e)
             logger.warning("Bedrock converse error: %s", msg)
-            # Some models don't support system; retry without it.
-            if had_system and ("system" in msg.lower() or "doesn't support system" in msg.lower()):
-                kwargs.pop("system", None)
-                out = self._bedrock.converse(**kwargs)
-                text = out["output"]["message"]["content"][0]["text"]
-                return text
+
+            # Explicitly surface "no system support" instead of silently stripping system.
+            if "doesn't support system messages" in msg.lower():
+                return (
+                    "Model configuration error: the configured MODEL_ID does not support "
+                    "system messages. Please choose a Bedrock model that supports system "
+                    "prompts (for example, a meta.llama3-based model) and set MODEL_ID "
+                    "accordingly."
+                )
+
             # Last resort: surface a generic failure message.
             return "I had trouble talking to the language model backend."
 
     def _chat_bedrock(self, messages: List[Dict[str, Any]]) -> str:
         """Route all calls through Bedrock `converse`."""
         system, convo = self._split_system_and_messages(messages)
-        model_id = (self._model or "").strip()
-        if not model_id:
+        if not self._model:
             raise RuntimeError("MODEL_ID must be set for Bedrock provider.")
-        logger.debug("Routing chat via converse for model %s (system_present=%s)", model_id, bool(system))
+        logger.debug(
+            "Routing chat via converse for model %s (system_present=%s)",
+            self._model,
+            bool(system),
+        )
         return self._chat_converse(system, convo)
 
     # ---- Helpers for memory semantics ----
@@ -159,7 +173,6 @@ class AwsModelClient:
 
         # --- Name questions ---
         if "what is my name" in lower or "what's my name" in lower or "who am i" in lower:
-            # Search for memories that look like "my name is X" or "I'm X"
             candidates: List[str] = []
             mem_items = memory_store.recent_memories(agent_id=agent_id, limit=100)
             for item in mem_items:
@@ -232,7 +245,6 @@ class AwsModelClient:
                     else:
                         joined = ", ".join(unique_names)
                         return f"Yes. You've told me you have dogs, including {joined}."
-                # No names, but dog references exist
                 return "Yes, I remember you telling me you have dogs."
 
         return None
