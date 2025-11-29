@@ -40,6 +40,10 @@ personality_prompt: |
       I’ll send a quick status text now.
       COMMAND: {"name": "send_text", "args": {"to": "+12065551234", "body": "System looks healthy."}}
   - If no command is required, you may omit the COMMAND line entirely. The system will treat the absence of a COMMAND as {"name": "noop", "args": {}}.
+  - The COMMAND line is machine-only metadata:
+    - Never mention, read out, or paraphrase "COMMAND" or its JSON in your visible reply.
+    - Do NOT say things like "I will now run COMMAND name: X, args: {...}" or otherwise narrate the command or its arguments.
+    - The user should only see and hear your natural-language reply; the COMMAND line is for the system to parse, not for the user.
   - Assume that "send_text" and "send_email" are sensitive: only use them when the user clearly asked you to send a message, and keep the content appropriate and factual.
   - Assume "run_command" is low risk and can be used for diagnostics when helpful.
 
