@@ -18,8 +18,9 @@ The interactive voice client lives at `client/cli.py` and can be launched direct
 - `--text-only`: Request text responses instead of synthesized audio.
 - `--save-audio`: Persist broker audio replies to disk.
 - `--verbose` / `-vv`: Increase logging detail; `-vv` enables debug logging.
-- `--auto-start-monitor`: Launch the vision/audio monitor after the greeting.
 - `--enroll-ai-voice` / `--self-voice-name`: Enroll or suppress the AI's own voice to avoid echo/self-talk.
+
+The vision/audio monitor launches automatically with the client; use the `kill monitor` voice command if you need to pause it during a session.
 
 Example:
 
