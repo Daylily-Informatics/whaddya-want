@@ -9,6 +9,10 @@ responses that the cloud services generate. All heavy computation—speech
 recognition, multimodal perception, reasoning, and text-to-speech—runs on the
 cloud provider.
 
+For a complete list of developer and operational CLI entry points (including
+the voice client, Makefile targets, and helper scripts), see
+[CLI.md](CLI.md).
+
 ## Bootstrapping the repository
 
 Run the helper script to create a Python environment (either a virtual
