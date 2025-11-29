@@ -6,7 +6,7 @@ import json
 import os
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, Tuple, List
+from typing import Any, Dict, Tuple, List, Optional
 
 from .config import RuntimeConfig
 from .prompts import load_personality_prompt
@@ -286,16 +286,32 @@ class ConversationBroker:
         messages.extend({"role": turn.role, "content": turn.content} for turn in history)
         messages.append({"role": "user", "content": user_text})
 
+        vision_scene = None
+        if isinstance(context, dict):
+            vision_scene = context.get("vision_scene") if isinstance(context.get("vision_scene"), dict) else None
+
         if context:
             # Context is injected as a separate system message so it can carry
             # vision + environment info without polluting the main prompt text.
             messages.append({"role": "system", "content": f"Context: {context}"})
 
+        vision_context_text = self._format_vision_scene_for_prompt(vision_scene)
+        if vision_context_text:
+            messages.append({"role": "system", "content": vision_context_text})
+
         # ---- Call the LLM ----
         llm_response = self._llm.chat(messages=messages)
 
         timestamp = datetime.now(timezone.utc)
-        turns = [
+        context_turns: list[ConversationTurn] = []
+        if vision_context_text:
+            context_turns.append(
+                ConversationTurn(
+                    role="system", content=vision_context_text, timestamp=timestamp
+                )
+            )
+
+        turns = context_turns + [
             ConversationTurn(role="user", content=user_text, timestamp=timestamp),
             ConversationTurn(role="assistant", content=llm_response.message, timestamp=timestamp),
         ]
@@ -391,6 +407,7 @@ class ConversationBroker:
         if self._long_term_memory:
             metadata = {
                 "vision_scene": (context or {}).get("vision_scene") if context else None,
+                "vision_context_summary": vision_context_text,
                 "command": command,
                 "server_action_result": server_action_result,
                 "tool_calls": llm_response.tool_calls,
@@ -509,6 +526,68 @@ class ConversationBroker:
 
         # Cap total lines to keep this block small
         return "\n".join(lines[:40])
+
+    def _format_vision_scene_for_prompt(self, scene: Optional[Dict[str, Any]]) -> str:
+        """Render a vision scene dictionary into a compact, LLM-friendly string."""
+        if not isinstance(scene, dict):
+            return ""
+
+        lines: list[str] = []
+
+        caption = scene.get("detailed_caption") or scene.get("caption")
+        if caption:
+            lines.append(f"Scene: {caption}")
+
+        layout = scene.get("layout")
+        if layout:
+            lines.append(f"Layout: {layout}")
+
+        lighting = scene.get("lighting")
+        if lighting:
+            lines.append(f"Lighting: {lighting}")
+
+        def _format_entities(key: str) -> list[str]:
+            out: list[str] = []
+            entries = scene.get(key)
+            if not isinstance(entries, list):
+                return out
+            for ent in entries:
+                if not isinstance(ent, dict):
+                    continue
+                name = ent.get("name") or ent.get("species") or key.rstrip("s")
+                count = ent.get("count") or ent.get("approx_count")
+                attrs = ent.get("attributes") or ent.get("activities") or ent.get("notes")
+                suffix = f" (x{count})" if isinstance(count, int) else ""
+                detail = f": {attrs}" if attrs else ""
+                out.append(f"- {name}{suffix}{detail}")
+            return out
+
+        people_lines = _format_entities("people")
+        if people_lines:
+            lines.append("People:")
+            lines.extend(people_lines)
+
+        animal_lines = _format_entities("animals")
+        if animal_lines:
+            lines.append("Animals:")
+            lines.extend(animal_lines)
+
+        object_lines = _format_entities("objects")
+        if object_lines:
+            lines.append("Objects:")
+            lines.extend(object_lines)
+
+        salient = scene.get("salient_facts") or scene.get("memory_bullets")
+        if isinstance(salient, list) and salient:
+            lines.append("Salient:")
+            for fact in salient:
+                if isinstance(fact, str):
+                    lines.append(f"- {fact}")
+
+        if not lines:
+            return ""
+
+        return "Vision observation (save for recall):\n" + "\n".join(lines)
 
 
 def _extract_command(reply: str) -> Tuple[str, Dict[str, Any]]:
