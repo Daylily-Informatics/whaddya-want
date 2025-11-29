@@ -22,5 +22,5 @@ PYTHONPATH=$PWD:$PWD/layers/shared/python python -m client.cli --session $SESSIO
   --broker-url $BROKER   \
   --setup-devices --voice Matthew --voice-mode generative --verbose -vv --self-voice-name Matthew 
 
-
+echo AGENT_STATE_TABLE :  $AGENT_STATE_TABLE
 # --enroll-ai-voice
