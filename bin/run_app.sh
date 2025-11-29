@@ -10,4 +10,5 @@ PYTHONPATH=. python -m client.cli --session $SESSION \
   --broker-url $BROKER   \
   --setup-devices --voice Matthew --voice-mode generative --verbose -vv --self-voice-name Matthew
 
+
 # --enroll-ai-voice
