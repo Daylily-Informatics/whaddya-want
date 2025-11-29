@@ -204,6 +204,16 @@ def _ensure_unique(entries: List[Dict[str, Any]], name: str, etype: str) -> Opti
     return None
 
 
+def _prune_person_record(rec: Dict[str, Any]) -> bool:
+    """
+    Remove empty person records.
+
+    Returns True if the record still contains identifying data (voice or face),
+    False if it should be dropped entirely.
+    """
+    return bool(rec.get("voice") or rec.get("face"))
+
+
 # ---------------------------------------------------------------------------
 # Cosine helpers
 # ---------------------------------------------------------------------------
@@ -263,6 +273,54 @@ def enroll_animal(name: str, etype: str, sig_vec: np.ndarray) -> None:
     else:
         entries[idx] = rec
     _save(entries)
+
+
+# ---------------------------------------------------------------------------
+# Delete / unenroll
+# ---------------------------------------------------------------------------
+
+def delete_face(name: str) -> bool:
+    """
+    Remove a person's face profile.
+
+    Returns True if a face entry was removed.
+    """
+    entries = _load()
+    idx = _ensure_unique(entries, name, "person")
+    if idx is None:
+        return False
+    rec = entries[idx]
+    if "face" not in rec:
+        return False
+    rec.pop("face", None)
+    if not _prune_person_record(rec):
+        entries.pop(idx)
+    else:
+        entries[idx] = rec
+    _save(entries)
+    return True
+
+
+def delete_voice(name: str) -> bool:
+    """
+    Remove a person's voice profile.
+
+    Returns True if a voice entry was removed.
+    """
+    entries = _load()
+    idx = _ensure_unique(entries, name, "person")
+    if idx is None:
+        return False
+    rec = entries[idx]
+    if "voice" not in rec:
+        return False
+    rec.pop("voice", None)
+    if not _prune_person_record(rec):
+        entries.pop(idx)
+    else:
+        entries[idx] = rec
+    _save(entries)
+    return True
 
 
 # ---------------------------------------------------------------------------
