@@ -352,7 +352,9 @@ def identify_face(face_vec: np.ndarray, threshold: float = 0.45) -> Optional[str
     return best_name if best >= 0.60 else None
 
 
-def identify_voice(voice_vec: np.ndarray, threshold: float = 0.65) -> Optional[str]:
+def best_voice_match(voice_vec: np.ndarray) -> tuple[Optional[str], float]:
+    """Return the closest voice match along with its cosine similarity."""
+
     entries = _load()
     best, best_name = -1.0, None
     vv_query = np.asarray(voice_vec, dtype=np.float32)
@@ -363,7 +365,12 @@ def identify_voice(voice_vec: np.ndarray, threshold: float = 0.65) -> Optional[s
         sim = _cos(vv_query, np.array(vv, dtype=np.float32))
         if sim > best:
             best, best_name = sim, e.get("name")
-    return best_name if best >= threshold else None
+    return best_name, float(best)
+
+
+def identify_voice(voice_vec: np.ndarray, threshold: float = 0.65) -> Optional[str]:
+    name, score = best_voice_match(voice_vec)
+    return name if score >= threshold else None
 
 
 def identify_animal(etype: str, sig_vec: np.ndarray, max_dist: float = 0.22) -> Optional[str]:

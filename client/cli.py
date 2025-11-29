@@ -1432,21 +1432,36 @@ async def run() -> bool:
                             "[identity] Unable to embed current voice sample."
                         )
                     else:
-                        who = identity.identify_voice(
-                            vec, threshold=args.id_threshold
+                        best_name, best_score = identity.best_voice_match(vec)
+                        recognized = (
+                            best_name if best_score >= args.id_threshold else None
                         )
-                        if who:
+                        if recognized:
                             if (
                                 self_voice
-                                and who.strip().lower() == self_voice
+                                and recognized.strip().lower() == self_voice
                             ):
-                                print(
-                                    f"[voice] Ignoring self voice signature ({who})."
-                                )
-                                is_self_voice = True
+                                # Be more willing to treat the specified voice as self-voice
+                                # while still requiring a small safety margin above the
+                                # general identification threshold.
+                                self_voice_need = max(args.id_threshold + 0.05, 0.60)
+                                if best_score >= self_voice_need:
+                                    print(
+                                        f"[voice] Ignoring self voice signature ({recognized})."
+                                    )
+                                    is_self_voice = True
+                                else:
+                                    vprint(
+                                        (
+                                            "[identity] Weak self-voice match "
+                                            f"(score={best_score:.2f}); treating as user."
+                                        )
+                                    )
                             else:
-                                context["speaker_id"] = who
-                                print(f"[identity] Recognized speaker: {who}")
+                                context["speaker_id"] = recognized
+                                print(
+                                    f"[identity] Recognized speaker: {recognized}"
+                                )
                         elif auto_registered_name is None:
                             new_name = auto_register_name or f"Guest-{args.session[:8]}"
                             identity.enroll_voice(new_name, vec)
