@@ -1,6 +1,7 @@
-BROKER=$1
-SESSION=$2
-MODEL_ID=$3
+export BROKER=$1
+export STACK=$2
+export SESSION=$3
+export MODEL_ID=$4
 
 ENABLE_OUTBOUND_SMS=1          # to actually send SMS
 ENABLE_OUTBOUND_EMAIL=1        # to actually send email
