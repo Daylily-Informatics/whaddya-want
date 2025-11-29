@@ -830,16 +830,48 @@ async def run() -> bool:
         if cam_idx is None:
             print("[monitor] no camera index configured.", file=sys.stderr)
             return
+
+        async def _monitor_communicate(
+            *,
+            text: str,
+            context: Optional[Dict[str, Any]],
+            text_only: bool,
+            timeout: float,
+            image_jpeg: Optional[bytes],
+        ) -> Optional[Dict[str, Any]]:
+            return await speak_via_broker(
+                broker_url=args.broker_url,
+                session_id=args.session,
+                text=text,
+                voice_id=voice_id,
+                voice_mode=args.voice_mode,
+                player=player,
+                playback_mute=playback_mute,
+                context=context,
+                text_only=text_only,
+                timeout=timeout,
+                verbose=verbose,
+                barge_monitor=None,
+                image_jpeg=image_jpeg,
+            )
+
         cfg = MonCfg(
-            broker_url=args.broker_url,
-            session=args.session,
-            voice_id=voice_id,
-            voice_mode=args.voice_mode,
             camera_index=cam_idx,
             mic_index=mic_idx,
         )
         try:
-            monitor_engine = MonitorEngine(cfg, player, playback_mute)
+            monitor_engine = MonitorEngine(
+                cfg,
+                player,
+                playback_mute,
+                communicate=lambda text, context, text_only, timeout, image_jpeg: _monitor_communicate(
+                    text=text,
+                    context=context,
+                    text_only=text_only,
+                    timeout=timeout,
+                    image_jpeg=image_jpeg,
+                ),
+            )
         except Exception as e:
             print(f"[monitor] failed to start: {e}", file=sys.stderr)
             monitor_engine = None

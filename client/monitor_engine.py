@@ -6,7 +6,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -19,7 +19,7 @@ def _debug(msg: str, *args) -> None:
     logger.debug(msg, *args)
 
 from client import identity
-from client.shared_audio import AudioPlayer, speak_via_broker
+from client.shared_audio import AudioPlayer
 
 try:
     import face_recognition  # type: ignore
@@ -141,12 +141,14 @@ def yolo_entities_strict(
     return ent
 
 
+MonitorCommunicator = Callable[
+    [str, Optional[Dict[str, Any]], bool, float, Optional[bytes]],
+    Awaitable[Optional[Dict[str, Any]]],
+]
+
+
 @dataclass
 class MonitorConfig:
-    broker_url: str
-    session: str
-    voice_id: Optional[str]
-    voice_mode: str
     camera_index: int
     mic_index: Optional[int]
     # detection thresholds
@@ -178,15 +180,16 @@ class MonitorEngine:
         cfg: MonitorConfig,
         player: AudioPlayer,
         playback_mute: threading.Event,
+        communicate: MonitorCommunicator,
     ):
         self.cfg = cfg
         self.player = player
         self.playback_mute = playback_mute
+        self.communicate = communicate
 
         _debug(
-            "initializing MonitorEngine camera=%s voice_mode=%s vision_mode=%s",
+            "initializing MonitorEngine camera=%s vision_mode=%s",
             cfg.camera_index,
-            cfg.voice_mode,
             cfg.vision_mode,
         )
 
@@ -225,19 +228,12 @@ class MonitorEngine:
         self.last_context_for_voice: Optional[Dict[str, Any]] = None
 
     async def _speak(self, text: str, *, timeout: float = 30.0) -> None:
-        await speak_via_broker(
-            broker_url=self.cfg.broker_url,
-            session_id=self.cfg.session,
-            text=text,
-            voice_id=self.cfg.voice_id,
-            voice_mode=self.cfg.voice_mode,
-            player=self.player,
-            playback_mute=self.playback_mute,
-            context={"intro_already_sent": True},
-            text_only=False,
-            timeout=timeout,
-            verbose=False,
-            barge_monitor=None,
+        await self.communicate(
+            text,
+            {"intro_already_sent": True},
+            False,
+            timeout,
+            None,
         )
 
     async def _send_vision_snapshot(
@@ -287,20 +283,12 @@ class MonitorEngine:
             )
             self.last_context_for_voice = ctx_for_voice
 
-            await speak_via_broker(
-                broker_url=self.cfg.broker_url,
-                session_id=self.cfg.session,
-                text=message_text,
-                voice_id=self.cfg.voice_id,
-                voice_mode=self.cfg.voice_mode,
-                player=self.player,
-                playback_mute=self.playback_mute,
-                context=ctx,
-                text_only=(mode != "entry"),
-                timeout=30,
-                verbose=False,
-                barge_monitor=None,
-                image_jpeg=jpeg_bytes,
+            await self.communicate(
+                message_text,
+                ctx,
+                mode != "entry",
+                30,
+                jpeg_bytes,
             )
         finally:
             self.vision_busy = False
