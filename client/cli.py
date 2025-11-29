@@ -430,23 +430,6 @@ def _test_mic_device(mic: int, timeout: float = 5.0) -> None:
         print(f"[mic test warning] {exc}", file=sys.stderr)
 
 
-def _xtest_mic_device(mic: int, timeout: float = 5.0) -> None:
-    """Validate a microphone device without letting the app hang forever."""
-
-    def _work() -> None:
-        sd.check_input_settings(device=mic, samplerate=16000, channels=1)
-        with sd.InputStream(device=mic, channels=1, samplerate=16000) as s:
-            # Force CoreAudio to fully start the stream
-            s.read(1)
-
-    _run_blocking_with_timeout(
-        _work,
-        timeout=timeout,
-        desc=f"opening/testing microphone device index {mic}",
-    )
-    print("[ok] microphone test passed.")
-
-
 def _test_speaker_device(spk: int, timeout: float = 5.0) -> None:
     """Validate a speaker/output device with a short test tone and timeout."""
 
