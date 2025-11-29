@@ -37,6 +37,16 @@ Resources:
           Projection:
             ProjectionType: ALL
 
+  SharedDependenciesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: whaddya-want-shared
+      Description: Shared Python deps + agent_core
+      ContentUri: layers/shared
+      CompatibleRuntimes:
+        - python3.11
+      RetentionPolicy: Delete
+
   BrokerFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -64,6 +74,8 @@ Resources:
           Properties:
             Path: /agent
             Method: POST
+      Layers:
+        - !Ref SharedDependenciesLayer
 
   AgentHeartbeatFunction:
     Type: AWS::Serverless::Function
@@ -86,6 +98,8 @@ Resources:
                 - bedrock:Converse
                 - bedrock:ConverseStream
               Resource: '*'
+      Layers:
+        - !Ref SharedDependenciesLayer
 
   AgentHeartbeatRule:
     Type: AWS::Events::Rule
@@ -103,3 +117,24 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: events.amazonaws.com
       SourceArn: !GetAtt AgentHeartbeatRule.Arn
+
+Outputs:
+  BrokerEndpoint:
+    Description: Invoke URL for the conversation broker
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/agent"
+
+  RestApiId:
+    Description: API Gateway REST API ID
+    Value: !Ref ServerlessRestApi
+
+  AgentStateTableName:
+    Description: DynamoDB table for agent unified state+memory
+    Value: !Ref AgentStateTable
+
+  BrokerFunctionArn:
+    Description: Broker Lambda ARN
+    Value: !GetAtt BrokerFunction.Arn
+
+  AgentHeartbeatFunctionArn:
+    Description: Heartbeat Lambda ARN
+    Value: !GetAtt AgentHeartbeatFunction.Arn
