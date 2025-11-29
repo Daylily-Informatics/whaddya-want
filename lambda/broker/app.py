@@ -1,6 +1,5 @@
-from __future__ import annotations
-
 import json
+import logging
 import os
 from datetime import datetime, timezone
 from typing import Any, Dict
@@ -11,7 +10,11 @@ from agent_core.planner import handle_llm_result
 from agent_core.actions import dispatch_background_actions
 from agent_core import llm_client
 from agent_core.aws_model_client import AwsModelClient
+from agent_core.logging_utils import configure_logging
 
+
+configure_logging(int(os.environ.get("VERBOSE", "0")))
+logger = logging.getLogger(__name__)
 
 AGENT_ID = os.environ.get("AGENT_ID", "marvin")
 
@@ -42,6 +45,7 @@ def _payload_from_event(event: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def handler(event, context):
+    logger.info("Broker invoked with requestContext=%s", event.get("requestContext"))
     body = _payload_from_event(event)
     session_id = _derive_session_id(event)
     source = body.get("source", "user")
@@ -57,9 +61,11 @@ def handler(event, context):
         payload={"transcript": transcript, "raw": body},
     )
     memory_store.put_event(agent_event)
+    logger.debug("Stored incoming event payload: %s", agent_event.payload)
 
     # Retrieve recent memories for context
     memories = memory_store.recent_memories(agent_id=AGENT_ID, limit=40)
+    logger.debug("Loaded %s recent memories", len(memories))
 
     # Build messages for the model
     personality_prompt = body.get("personality_prompt") or (
@@ -86,12 +92,15 @@ def handler(event, context):
         messages=messages,
         tools=agent_tools.TOOLS_SPEC,
     )
+    logger.debug("LLM response keys: %s", list(llm_response.keys()))
 
     actions, new_memories, reply_text = handle_llm_result(llm_response, agent_event)
     for mem in new_memories:
         memory_store.put_memory(mem)
+        logger.debug("Persisted new memory from broker handler: %s", mem.summary)
 
     dispatch_background_actions(actions)
+    logger.info("Broker produced %s actions", len(actions))
 
     resp_body = {
         "reply_text": reply_text,

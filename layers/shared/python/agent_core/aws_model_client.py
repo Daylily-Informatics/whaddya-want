@@ -17,10 +17,14 @@ calling.
 """
 
 import json
+import logging
 import os
 from typing import Any, Dict, List, Tuple
 
 import boto3
+
+
+logger = logging.getLogger(__name__)
 
 
 class AwsModelClient:
@@ -31,6 +35,7 @@ class AwsModelClient:
         if not self._model:
             raise RuntimeError("MODEL_ID must be configured (env var or constructor).")
         self._bedrock = boto3.client("bedrock-runtime", region_name=self._region)
+        logger.info("Initialized AwsModelClient model=%s region=%s", self._model, self._region)
 
     # ---- Internal helpers (adapted from the 0.0.20 LLM client) ----
 
@@ -79,6 +84,7 @@ class AwsModelClient:
             },
         }
 
+        logger.debug("Invoking Titan model %s with %s convo messages", self._model, len(convo))
         resp = self._bedrock.invoke_model(
             modelId=self._model or "amazon.titan-text-express-v1",
             contentType="application/json",
@@ -90,6 +96,7 @@ class AwsModelClient:
         if not results:
             return "I couldn't generate a response."
         text = results[0].get("outputText") or "I couldn't generate a response."
+        logger.debug("Titan response text length=%s", len(text))
         return text
 
     def _chat_converse(self, system: str, convo: List[Dict[str, str]]) -> str:
@@ -121,14 +128,17 @@ class AwsModelClient:
         try:
             out = self._bedrock.converse(**kwargs)
             text = out["output"]["message"]["content"][0]["text"]
+            logger.debug("Converse response text length=%s", len(text))
             return text
         except Exception as e:  # pragma: no cover - defensive fallback
             msg = str(e)
+            logger.warning("Converse call failed: %s", msg)
             # Some models don't support system; retry without it.
             if had_system and ("system" in msg.lower() or "doesn't support system" in msg.lower()):
                 kwargs.pop("system", None)
                 out = self._bedrock.converse(**kwargs)
                 text = out["output"]["message"]["content"][0]["text"]
+                logger.debug("Converse retry (no system) text length=%s", len(text))
                 return text
             # Last resort: surface a generic failure message.
             return "I had trouble talking to the language model backend."
@@ -139,6 +149,7 @@ class AwsModelClient:
         model_id = (self._model or "").strip()
         if not model_id:
             raise RuntimeError("MODEL_ID must be set for Bedrock provider.")
+        logger.debug("Routing chat for model %s (system_present=%s)", model_id, bool(system))
         if model_id.startswith("amazon.titan-text-express"):
             return self._chat_titan(system, convo)
         # Default: use the generic converse API.
@@ -174,6 +185,7 @@ class AwsModelClient:
         row in the AgentStateTable. This is a stopgap until native Bedrock
         tool calling is wired through.
         """
+        logger.debug("Chat called with %s messages; generating reply", len(messages))
         reply_text = self._chat_bedrock(messages)
 
         # Find the most recent user message; this is what we'll persist.
@@ -197,6 +209,7 @@ class AwsModelClient:
                 "tags": [],
                 "links": [],
             }
+            logger.debug("Synthesizing store_memory for user text preview='%s'", last_user_text[:60])
             tool_calls.append(
                 {
                     "name": "store_memory",
@@ -209,6 +222,7 @@ class AwsModelClient:
             "content": reply_text,
             "tool_calls": tool_calls,
         }
+        logger.debug("Returning assistant message with %s tool calls", len(tool_calls))
         return {"messages": [*messages, assistant_msg]}
 
     @classmethod

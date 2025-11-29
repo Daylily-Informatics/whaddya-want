@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import os
 from datetime import datetime
+import logging
+import os
 from typing import Any, Dict, List, Optional
 
 import boto3
 from boto3.dynamodb.conditions import Key
 
 from .schema import Event, Memory, MemoryKind
+
+
+logger = logging.getLogger(__name__)
 
 
 _TABLE_NAME = os.environ.get("AGENT_STATE_TABLE")
@@ -18,6 +23,8 @@ if not _TABLE_NAME:
 _dynamo = boto3.resource("dynamodb")
 _table = _dynamo.Table(_TABLE_NAME)
 
+logger.debug("Using DynamoDB table %s for agent state", _TABLE_NAME)
+
 
 def put_event(event: Event) -> None:
     """
@@ -26,7 +33,9 @@ def put_event(event: Event) -> None:
     Event.to_item() is responsible for producing the correct
     pk/sk layout for the unified state table.
     """
-    _table.put_item(Item=event.to_item())
+    item = event.to_item()
+    logger.debug("Persisting event: %s", item)
+    _table.put_item(Item=item)
 
 
 def put_memory(memory: Memory) -> None:
@@ -36,7 +45,9 @@ def put_memory(memory: Memory) -> None:
     Memory.to_item() is responsible for producing the correct
     pk/sk/gsi layout and tagging with memory_kind, etc.
     """
-    _table.put_item(Item=memory.to_item())
+    item = memory.to_item()
+    logger.debug("Persisting memory: %s", item)
+    _table.put_item(Item=item)
 
 
 def recent_memories(
@@ -55,6 +66,7 @@ def recent_memories(
     So we query by pk and prefix on "TS#" and then filter down to
     MEMORY items (and optionally specific MemoryKind values).
     """
+    logger.debug("Querying recent memories for agent %s (limit=%s)", agent_id, limit)
     resp = _table.query(
         KeyConditionExpression=Key("pk").eq(f"AGENT#{agent_id}")
         & Key("sk").begins_with("TS#"),
@@ -68,7 +80,9 @@ def recent_memories(
         items = [i for i in items if i.get("memory_kind") in allowed]
 
     # still newest-first; trim to limit
-    return items[:limit]
+    trimmed = items[:limit]
+    logger.debug("Returning %s recent memories (from %s fetched)", len(trimmed), len(items))
+    return trimmed
 
 
 def query_memories(
@@ -85,6 +99,7 @@ def query_memories(
       - `summary` (if present)
       - any string values in `content` (if it's a dict)
     """
+    logger.debug("Querying memories for agent %s with substring '%s'", agent_id, query)
     resp = _table.query(
         KeyConditionExpression=Key("pk").eq(f"AGENT#{agent_id}")
         & Key("sk").begins_with("TS#"),
@@ -117,4 +132,5 @@ def query_memories(
             if len(filtered) >= limit:
                 break
 
+    logger.debug("Query returned %s memories matching '%s'", len(filtered), query)
     return filtered

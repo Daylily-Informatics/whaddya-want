@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List
 
 from . import tools as agent_tools
+
+
+logger = logging.getLogger(__name__)
 
 
 def build_system_prompt(personality_prompt: str) -> str:
@@ -10,7 +14,9 @@ def build_system_prompt(personality_prompt: str) -> str:
         "You have tools to store and query long-term memory. "
         "Use them to distinguish FACT, SPECULATION, and AI_INSIGHT memories."
     )
-    return personality_prompt.strip() + "\n\n" + memory_instructions
+    prompt = personality_prompt.strip() + "\n\n" + memory_instructions
+    logger.debug("Built system prompt with personality '%s'", personality_prompt[:80])
+    return prompt
 
 
 def chat_with_tools(
@@ -31,6 +37,11 @@ def chat_with_tools(
     if tools is None:
         tools = agent_tools.TOOLS_SPEC
 
+    logger.debug(
+        "Invoking model client with %s messages and %s tools", len(messages), len(tools)
+    )
+
     # This is intentionally abstract; replace with your own client.
     response = model_client.chat(messages=messages, tools=tools)
+    logger.debug("Model client returned keys: %s", list(response.keys()))
     return response
