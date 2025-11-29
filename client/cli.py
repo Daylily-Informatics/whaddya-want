@@ -1427,19 +1427,15 @@ async def run() -> bool:
             # Identity context for generic conversation
             wav_id = take_latest_seconds(analysis_buf, args.id_window, args.rate)
             context: Dict[str, Any] = {"intro_already_sent": intro_sent}
-            monitor_ctx = None
-            if monitor_engine is not None:
-                monitor_ctx = getattr(monitor_engine, "last_context_for_voice", None)
-            if monitor_ctx:
-                context.update(dict(monitor_ctx))
-                
-            
-            # NEW: attach a frame for environment questions
+
+            # NEW: attach a fresh frame for environment questions
             image_jpeg: Optional[bytes] = None
             if monitor_engine is not None and _is_env_question(transcript):
                 try:
                     import cv2
-                    frame = monitor_engine.get_best_recent_frame()
+                    frame = monitor_engine.capture_env_snapshot_frame()
+                    if frame is None:
+                        frame = monitor_engine.get_best_recent_frame()
                     if frame is not None:
                         ok, buf = cv2.imencode(
                             ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80]
@@ -1448,6 +1444,12 @@ async def run() -> bool:
                             image_jpeg = buf.tobytes()
                 except Exception as exc:
                     vprint(f"[env] failed to capture frame for env question: {exc}")
+
+            monitor_ctx = None
+            if monitor_engine is not None:
+                monitor_ctx = getattr(monitor_engine, "last_context_for_voice", None)
+            if monitor_ctx:
+                context.update(dict(monitor_ctx))
                     
             is_self_voice = False
             if wav_id is not None:

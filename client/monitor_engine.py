@@ -328,6 +328,31 @@ class MonitorEngine:
         self._record_frame(frame, ents, sharpness)
         return frame, ents, sharpness
 
+    def capture_env_snapshot_frame(self) -> Optional[np.ndarray]:
+        """
+        Grab a fresh frame for environment questions and update state.
+
+        This forces a new camera read and detection pass so that any reply to
+        "what do you see" style questions reflects the current scene rather
+        than an older buffered frame. Even if nothing is detected, the latest
+        context is refreshed for downstream voice turns.
+        """
+
+        frame, ents, sharpness = self._capture_entities()
+        if frame is None:
+            return None
+
+        self.last_context_for_voice = {
+            "intro_already_sent": True,
+            "monitor_text": "MANUAL_SNAPSHOT: env_question",
+            "monitor_snapshot_mode": "manual",
+            "monitor_snapshot_ts": time.time(),
+            "monitor_snapshot_sharpness": sharpness,
+            "monitor_detected_entities": [et for et, _ in ents],
+        }
+
+        return frame.copy()
+
     def _make_snotty_name(
         self, ents: List[Tuple[str, Tuple[int, int, int, int]]], frame_shape: Tuple[int, int, int]
     ) -> str:
