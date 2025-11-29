@@ -615,12 +615,6 @@ async def run() -> bool:
         help="Increase verbosity; use -vv for debug logging",
     )
     ap.add_argument(
-        "--auto-start-monitor",
-        action=argparse.BooleanOptionalAction,
-        default=_cfg_bool("auto_start_monitor", False),
-        help="Launch the monitor automatically after the greeting",
-    )
-    ap.add_argument(
         "--enroll-ai-voice",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -728,7 +722,6 @@ async def run() -> bool:
     spk_embed = SpeakerEmbedder()
     auto_register_name = (args.auto_register_name or args.force_enroll or "").strip()
     available_commands = [
-        "monitor",
         "whoami",
         "delete face <USERNAME>",
         "delete voice <USERNAME>",
@@ -750,6 +743,7 @@ async def run() -> bool:
         "While command mode is active, say 'switch/change/set/use/select' the camera, microphone, or speaker to a device number.",
         "Say 'marvin help' to hear this list again.",
         "Say 'marvin whoami' to have me guess your identity by voice and face.",
+        "The monitor now starts automatically with the client; say 'kill monitor' to pause it.",
         "Available commands: " + ", ".join(available_commands),
     ]
 
@@ -879,8 +873,7 @@ async def run() -> bool:
         monitor_engine = None
         monitor_task = None
 
-    if args.auto_start_monitor:
-        await _start_monitor()
+    await _start_monitor()
 
     mic: Optional[AsyncGenerator[str, None]] = None
     mic_task: Optional[asyncio.Task] = None
@@ -981,17 +974,22 @@ async def run() -> bool:
 
             await _stop_monitor()
 
+            restart_monitor = True
+
             if kind == "camera":
                 cam_idx = idx
                 _persist_devices(cam_idx, mic_idx, spk_idx)
                 print(f"[voice] camera switched to index {cam_idx} (via command).")
-                return
             elif kind == "microphone":
                 await _switch_microphone(idx)
-                return
             elif kind == "speaker":
                 await _switch_speaker(idx)
-                return
+            else:
+                restart_monitor = False
+
+            if restart_monitor:
+                await _start_monitor()
+            return
 
     # stdin watcher
     manual_q: "asyncio.Queue[str]" = asyncio.Queue()

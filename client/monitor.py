@@ -5,7 +5,7 @@ import sys
 
 def main() -> int:
     print(
-        "[monitor] Standalone monitor process deprecated — launch via the main CLI to run in-process.",
+        "[monitor] Standalone monitor entry removed — start the voice client to run the monitor automatically.",
         file=sys.stderr,
     )
     return 1
