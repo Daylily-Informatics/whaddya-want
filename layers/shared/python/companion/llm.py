@@ -153,8 +153,18 @@ class LLMClient:
         if not self._bedrock:
             raise RuntimeError("Bedrock client not initialised")
 
+        # The Bedrock Converse API requires the conversation to start with a user turn.
+        # Filter out any leading non-user messages (e.g., corrupted history) so we don't
+        # raise a 502 and instead continue with the latest valid user turn.
+        first_user_idx = next(
+            (idx for idx, msg in enumerate(convo) if (msg.get("role") or "") == "user"),
+            None,
+        )
+        if first_user_idx is None:
+            raise ValueError("Bedrock Converse requires at least one user message")
+
         messages: list[dict[str, Any]] = []
-        for msg in convo:
+        for msg in convo[first_user_idx:]:
             role = msg["role"]
             text = msg["content"]
             messages.append({"role": role, "content": [{"text": text}]})
