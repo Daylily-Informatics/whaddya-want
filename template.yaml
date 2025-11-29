@@ -1,278 +1,56 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: Serverless resources for the AI companion conversation broker
+Description: Rank-4 agent skeleton for whaddya-want
 
 Globals:
   Function:
-    Runtime: python3.11
     Timeout: 30
+    Runtime: python3.11
     MemorySize: 512
-    Tracing: Active
-    Architectures: [arm64]
-    Environment:
-      Variables:
-        # --- Behavior toggles (parameterized below) ---
-        USE_MEMORY: !Ref UseMemory
-        HISTORY_LIMIT: !Ref HistoryLimit
-        # --- Resources wired at deploy ---
-        CONVERSATION_TABLE: !Ref ConversationTable
-        AUDIO_BUCKET: !Ref AudioBucket
-        # --- LLM / TTS / VISION ---
-        MODEL_ID: !Ref ModelId
-        VISION_MODEL_ID: !Ref VisionModelId
-        POLLY_VOICE: !Ref PollyVoice
-        AI_NAME: Marvin
-        AIS_MEMORY_TABLE: !Ref AISMemoryTable
-        AIS_MEMORY_TTL_DAYS: !Ref AISMemoryTtlDays        # Optional: externa
-        ENABLE_OUTBOUND_SMS: !Ref EnableOutboundSms
-        ENABLE_OUTBOUND_EMAIL: !Ref EnableOutboundEmail
-        ENABLE_SYSTEM_COMMANDS: !Ref EnableSystemCommands
-        ACTION_EMAIL_FROM: !Ref ActionEmailFrom
-        PROSPECTIVE_RULES_TABLE: !Ref ProspectiveRulesTable  # NEW
-
-Parameters:
-  ModelId:
-    Type: String
-    Default: meta.llama3-1-8b-instruct-v1:0
-    Description: Bedrock model ID (or inference profile ARN). Titan text uses amazon.titan-text-express-v1.
-  VisionModelId:
-    Type: String
-    Default: anthropic.claude-3-5-sonnet-20240620-v1:0
-    Description: Bedrock multimodal model ID for vision (Claude 3.x Sonnet with image support).
-  PollyVoice:
-    Type: String
-    Default: Joanna
-  HistoryLimit:
-    Type: Number
-    Default: 18
-    MinValue: 0
-    MaxValue: 64
-  LLMSecretArn:
-    Type: String
-    Default: ""
-    Description: Existing Secrets Manager secret ARN with external LLM API key (optional)
-  UseMemory:
-    Type: String
-    AllowedValues: ["true", "false"]
-    Default: "true"
-    Description: Enable short-term session memory in DynamoDB (true/false)
-  ReservedConcurrency:
-    Type: Number
-    Default: 5
-    MinValue: 0
-    Description: Hard cap on concurrent Lambda invocations (0 disables)
-  EnableApiAccessLogs:
-    Type: String
-    AllowedValues: ["true","false"]
-    Default: "true"
-    Description: Enable HttpApi access logs (single-line JSON). Disable if you hit log config issues.
-  AISMemoryTableName:
-    Type: String
-    Default: whaddyawant_ais_memory  # whaddyawant_ais_long_term_memory
-    Description: DynamoDB table name for AIS long-term memory persistence
-  AISMemoryTtlDays:
-    Type: Number
-    Default: 365
-    MinValue: 0
-    Description: TTL for AIS long-term memory items (0 to disable expiration)
-  EnableOutboundSms:
-    Type: String
-    AllowedValues: ["true", "false"]
-    Default: "true"
-    Description: Enable server-side SMS via SNS when true.
-  EnableOutboundEmail:
-    Type: String
-    AllowedValues: ["true", "false"]
-    Default: "true"
-    Description: Enable server-side email via SES when true.
-  EnableSystemCommands:
-    Type: String
-    AllowedValues: ["true", "false"]
-    Default: "true"
-    Description: Enable whitelisted system commands (run_command) when true.
-  ActionEmailFrom:
-    Type: String
-    Default: "john@dyly.bio"
-    Description: Verified SES sender address for send_email.
-Conditions:
-  HasSecret: !Not [!Equals [!Ref LLMSecretArn, ""]]
-  EnableLogs: !Equals [!Ref EnableApiAccessLogs, "true"]
 
 Resources:
-  # --------- State (optional memory toggle only affects app behavior) ----------
-  ProspectiveRulesTable:
+  AgentStateTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: !Sub "${AWS::StackName}-prospective-rules"
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
-        - AttributeName: session_id
+        - AttributeName: pk
           AttributeType: S
-        - AttributeName: rule_id
+        - AttributeName: sk
+          AttributeType: S
+        - AttributeName: gsi1pk
+          AttributeType: S
+        - AttributeName: gsi1sk
           AttributeType: S
       KeySchema:
-        - AttributeName: session_id
+        - AttributeName: pk
           KeyType: HASH
-        - AttributeName: rule_id
+        - AttributeName: sk
           KeyType: RANGE
-      TimeToLiveSpecification:
-        AttributeName: ttl
-        Enabled: true
-  ConversationTable:
-    Type: AWS::DynamoDB::Table
-    Properties:
-      TableName: !Sub "${AWS::StackName}-session-memory"
-      BillingMode: PAY_PER_REQUEST
-      AttributeDefinitions:
-        - AttributeName: session_id
-          AttributeType: S
-      KeySchema:
-        - AttributeName: session_id
-          KeyType: HASH
-      TimeToLiveSpecification:
-        AttributeName: ttl
-        Enabled: true
-
-  AISMemoryTable:
-    Type: AWS::DynamoDB::Table
-    Properties:
-      TableName: !Sub "${AWS::StackName}-ais-memory"
-      BillingMode: PAY_PER_REQUEST
-      AttributeDefinitions:
-        - AttributeName: session_id
-          AttributeType: S
-        - AttributeName: timestamp
-          AttributeType: S
-      KeySchema:
-        - AttributeName: session_id
-          KeyType: HASH
-        - AttributeName: timestamp
-          KeyType: RANGE
-      TimeToLiveSpecification:
-        AttributeName: ttl
-        Enabled: true
-
-  # --------- Audio artifact storage ----------
-  AudioBucket:
-    Type: AWS::S3::Bucket
-    Properties:
-      BucketEncryption:
-        ServerSideEncryptionConfiguration:
-          - ServerSideEncryptionByDefault:
-              SSEAlgorithm: AES256
-      OwnershipControls:
-        Rules:
-          - ObjectOwnership: BucketOwnerPreferred
-      PublicAccessBlockConfiguration:
-        BlockPublicAcls: true
-        BlockPublicPolicy: true
-        IgnorePublicAcls: true
-        RestrictPublicBuckets: true
-      LifecycleConfiguration:
-        Rules:
-          - Id: expire-audio
-            Status: Enabled
-            ExpirationInDays: 7
-            AbortIncompleteMultipartUpload:
-              DaysAfterInitiation: 7
-
-  AudioBucketPolicy:
-    Type: AWS::S3::BucketPolicy
-    Properties:
-      Bucket: !Ref AudioBucket
-      PolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Sid: EnforceTLS
-            Effect: Deny
-            Principal: "*"
-            Action: "s3:*"
-            Resource:
-              - !Sub "${AudioBucket.Arn}"
-              - !Sub "${AudioBucket.Arn}/*"
-            Condition:
-              Bool:
-                aws:SecureTransport: false
-
-  # --------- API (HTTP API with logs + CORS) ----------
-  HttpApiLogs:
-    Type: AWS::Logs::LogGroup
-    Condition: EnableLogs
-    Properties:
-      LogGroupName: !Sub "/aws/apigw/${AWS::StackName}-http"
-      RetentionInDays: 7
-
-  BrokerHttpApi:
-      Type: AWS::Serverless::HttpApi
-      Properties:
-        StageName: $default
-        CorsConfiguration:
-          AllowOrigins: ['*']             # tighten later
-          AllowMethods: ['POST','OPTIONS']
-          AllowHeaders: ['content-type','x-client-session']
-        AccessLogSettings:
-          Fn::If:
-            - EnableLogs
-            - DestinationArn:
-                Fn::GetAtt: [HttpApiLogs, Arn]
-              Format: '{ "requestId":"$context.requestId","status":$context.status,"integrationStatus":"$context.integrationStatus","integrationError":"$context.integrationErrorMessage","ip":"$context.identity.sourceIp","ua":"$context.identity.userAgent","path":"$context.path" }'
-            - Ref: AWS::NoValue
-
-  # --------- Shared Python layer ----------
-  SharedLayer:
-    Type: AWS::Serverless::LayerVersion
-    Properties:
-      LayerName: shared-companion
-      ContentUri: layers/shared
-      CompatibleRuntimes: [python3.11]
-      RetentionPolicy: Delete
-    Metadata:
-      BuildMethod: python3.11
-
-  # --------- Broker Lambda ----------
-  BrokerFunctionLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-broker"
-      RetentionInDays: 7
+      GlobalSecondaryIndexes:
+        - IndexName: gsi1
+          KeySchema:
+            - AttributeName: gsi1pk
+              KeyType: HASH
+            - AttributeName: gsi1sk
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
 
   BrokerFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: !Sub "${AWS::StackName}-broker"
       CodeUri: lambda/broker/
       Handler: app.handler
-      Layers:
-        - !Ref SharedLayer
-      ReservedConcurrentExecutions: !Ref ReservedConcurrency
-      Events:
-        ApiEvent:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref BrokerHttpApi
-            Path: /ingest/audio
-            Method: POST
+      Environment:
+        Variables:
+          AGENT_STATE_TABLE: !Ref AgentStateTable
+          AGENT_ID: marvin
       Policies:
-        - AWSLambdaBasicExecutionRole
-        - AWSXrayWriteOnlyAccess
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AgentStateTable
         - Version: '2012-10-17'
           Statement:
-            # DynamoDB (session memory)
-            - Effect: Allow
-              Action:
-                - dynamodb:GetItem
-                - dynamodb:PutItem
-              Resource: !GetAtt ConversationTable.Arn
-            # DynamoDB (AIS long-term memory)
-            - Effect: Allow
-              Action:
-                - dynamodb:PutItem
-              Resource: !GetAtt AISMemoryTable.Arn
-            # Polly for TTS
-            - Effect: Allow
-              Action: [polly:SynthesizeSpeech]
-              Resource: '*'
-            # Bedrock (InvokeModel + Converse)
             - Effect: Allow
               Action:
                 - bedrock:InvokeModel
@@ -280,61 +58,48 @@ Resources:
                 - bedrock:Converse
                 - bedrock:ConverseStream
               Resource: '*'
-            # S3 for audio artifacts
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            Path: /agent
+            Method: POST
+
+  AgentHeartbeatFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambda/agent_heartbeat/
+      Handler: handler.handler
+      Environment:
+        Variables:
+          AGENT_STATE_TABLE: !Ref AgentStateTable
+          AGENT_ID: marvin
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AgentStateTable
+        - Version: '2012-10-17'
+          Statement:
             - Effect: Allow
               Action:
-                - s3:PutObject
-                - s3:GetObject
-              Resource: !Sub '${AudioBucket.Arn}/*'
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+                - bedrock:Converse
+                - bedrock:ConverseStream
+              Resource: '*'
 
-            # DynamoDB (prospective rules)
-            - Effect: Allow
-              Action:
-                - dynamodb:PutItem
-                - dynamodb:Query
-                - dynamodb:DeleteItem
-                - dynamodb:BatchWriteItem
-              Resource: !GetAtt ProspectiveRulesTable.Arn
+  AgentHeartbeatRule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: rate(5 minutes)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt AgentHeartbeatFunction.Arn
+          Id: AgentHeartbeatTarget
 
-            # --- NEW: SNS + SES for actions ---
-            - Effect: Allow
-              Action:
-                - sns:Publish
-              Resource: "*"     # or a specific SNS topic/region if you want to tighten
-
-            - Effect: Allow
-              Action:
-                - ses:SendEmail
-                - ses:SendRawEmail
-              Resource: "*"     # SES is usually '*'; can tighten with identity ARNs
-        - !If
-          - HasSecret
-          - Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action: [secretsmanager:GetSecretValue]
-                Resource: !Ref LLMSecretArn
-          - !Ref 'AWS::NoValue'
-
-Outputs:
-  BrokerEndpoint:
-    Description: Invoke URL for the conversation broker
-    Value: !Sub "https://${BrokerHttpApi}.execute-api.${AWS::Region}.amazonaws.com/ingest/audio"
-  ApiId:
-    Description: HTTP API ID
-    Value: !Ref BrokerHttpApi
-  AudioBucketName:
-    Description: S3 bucket for audio artifacts
-    Value: !Ref AudioBucket
-  MemoryTableName:
-    Description: DynamoDB table for session memory
-    Value: !Ref ConversationTable
-  AISMemoryTableName:
-    Description: DynamoDB table for AIS long-term memory
-    Value: !Ref AISMemoryTable
-  FunctionArn:
-    Description: Broker Lambda ARN
-    Value: !GetAtt BrokerFunction.Arn
-  ProspectiveRulesTableName:
-    Description: DynamoDB table for prospective rules
-    Value: !Ref ProspectiveRulesTable
+  AgentHeartbeatPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AgentHeartbeatFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AgentHeartbeatRule.Arn
