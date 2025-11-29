@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -38,9 +42,12 @@ def actions_from_tool_calls(tool_calls: List[Dict[str, Any]]) -> List[Action]:
 
 def dispatch_background_actions(actions: List[Action]) -> None:
     # Stub: hook this into SNS, SQS, email, home automation, etc.
-    # For now we just log to stdout so you can see what the agent wants to do.
+    # For now we use structured logging so you can trace what the agent wants to do.
     if not actions:
+        logger.debug("No background actions to dispatch")
         return
-    print("[agent_core.actions] Dispatching actions:")
+
     for act in actions:
-        print(f"  - {act.action_type} (confirm={act.require_user_confirm}): {act.payload}")
+        logger.info(
+            "Dispatching action", extra={"action_type": act.action_type, "payload": act.payload}
+        )
