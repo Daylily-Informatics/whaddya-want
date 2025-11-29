@@ -1441,7 +1441,10 @@ async def run() -> bool:
                                 self_voice
                                 and recognized.strip().lower() == self_voice
                             ):
-                                self_voice_need = max(args.id_threshold, 0.70)
+                                # Be more willing to treat the specified voice as self-voice
+                                # while still requiring a small safety margin above the
+                                # general identification threshold.
+                                self_voice_need = max(args.id_threshold + 0.05, 0.60)
                                 if best_score >= self_voice_need:
                                     print(
                                         f"[voice] Ignoring self voice signature ({recognized})."
