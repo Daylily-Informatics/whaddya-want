@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
 
 from .schema import Event, Memory, MemoryKind
 from . import memory_store
 from .actions import actions_from_tool_calls, Action
+
+
+logger = logging.getLogger(__name__)
 
 
 def _coerce_memory_kind(value: str) -> MemoryKind:
@@ -45,12 +49,21 @@ def handle_llm_result(
     reply_text = last.get("content") or ""
     tool_calls = last.get("tool_calls") or []
 
+    logger.debug(
+        "Handling LLM result: %s messages, %s tool calls, reply='%s'",
+        len(messages),
+        len(tool_calls),
+        reply_text,
+    )
+
     new_memories: List[Memory] = []
     all_tool_calls: List[Dict[str, Any]] = []
 
     for tc in tool_calls:
         name = tc.get("name")
         args = _parse_tool_args(tc.get("arguments"))
+
+        logger.debug("Processing tool call: %s %s", name, args)
 
         if name == "store_memory":
             kind_str = args.get("memory_kind", "META")
@@ -66,6 +79,7 @@ def handle_llm_result(
                 links=args.get("links") or [],
             )
             new_memories.append(mem)
+            logger.debug("Queued new memory (%s): %s", mem.memory_kind, mem.summary)
 
         elif name == "query_memory":
             query = args.get("query", "")
@@ -96,4 +110,5 @@ def handle_llm_result(
             all_tool_calls.append({"name": name, "arguments": args})
 
     actions = actions_from_tool_calls(all_tool_calls)
+    logger.debug("Derived %s actions from tool calls", len(actions))
     return actions, new_memories, reply_text
