@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List
 from datetime import datetime, timezone
