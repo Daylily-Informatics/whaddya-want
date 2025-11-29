@@ -21,7 +21,7 @@ import warnings
 from collections import deque
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, Optional, Tuple
+from typing import Any, AsyncGenerator, Dict, Optional, Tuple, Callable
 
 import numpy as np
 import sounddevice as sd
@@ -383,6 +383,68 @@ def _prompt_choice(options, title):
             return sel
         print("Invalid selection, try again.")
 
+def _run_blocking_with_timeout(fn: Callable[[], None], timeout: float, desc: str) -> None:
+    """Run a blocking audio check in a worker thread with a timeout.
+
+    This prevents hangs when CoreAudio / sounddevice wedges while opening a device.
+    """
+    result_q: "queue.Queue[tuple[bool, Optional[BaseException]]]" = queue.Queue(maxsize=1)
+
+    def worker() -> None:
+        try:
+            fn()
+            result_q.put((True, None))
+        except BaseException as exc:  # re-raise in caller
+            result_q.put((False, exc))
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    try:
+        ok, exc = result_q.get(timeout=timeout)
+    except queue.Empty:
+        raise RuntimeError(
+            f"Timed out while {desc}. This device or backend may be hanging; "
+            f"try a different device or check OS audio permissions."
+        )
+    if not ok:
+        assert exc is not None
+        raise exc
+
+
+def _test_mic_device(mic: int, timeout: float = 5.0) -> None:
+    """Validate a microphone device without letting the app hang forever."""
+
+    def _work() -> None:
+        sd.check_input_settings(device=mic, samplerate=16000, channels=1)
+        with sd.InputStream(device=mic, channels=1, samplerate=16000) as s:
+            # Force CoreAudio to fully start the stream
+            s.read(1)
+
+    _run_blocking_with_timeout(
+        _work,
+        timeout=timeout,
+        desc=f"opening/testing microphone device index {mic}",
+    )
+    print("[ok] microphone test passed.")
+
+
+def _test_speaker_device(spk: int, timeout: float = 5.0) -> None:
+    """Validate a speaker/output device with a short test tone and timeout."""
+
+    def _work() -> None:
+        sd.check_output_settings(device=spk, samplerate=16000, channels=1)
+        dur = 0.2
+        t = np.linspace(0, dur, int(16000 * dur), False)
+        tone = 0.2 * np.sin(2 * np.pi * 880 * t)
+        sd.play(tone, samplerate=16000, device=spk)
+        sd.wait()
+
+    _run_blocking_with_timeout(
+        _work,
+        timeout=timeout,
+        desc=f"opening/testing speaker device index {spk}",
+    )
+    print("[ok] speaker test passed.")
 
 def device_setup_interactive() -> Tuple[int, int, int]:
     cams = _detect_cameras()
@@ -393,20 +455,11 @@ def device_setup_interactive() -> Tuple[int, int, int]:
     if not mics:
         raise RuntimeError("No microphones detected.")
     mic = _prompt_choice(mics, "Available Microphones")
-    sd.check_input_settings(device=mic, samplerate=16000, channels=1)
-    with sd.InputStream(device=mic, channels=1, samplerate=16000) as s:
-        s.read(1)
-    print("[ok] microphone test passed.")
+    _test_mic_device(mic)
     if not sp:
         raise RuntimeError("No speakers detected.")
     spk = _prompt_choice(sp, "Available Speakers")
-    sd.check_output_settings(device=spk, samplerate=16000, channels=1)
-    dur = 0.2
-    t = np.linspace(0, dur, int(16000 * dur), False)
-    tone = 0.2 * np.sin(2 * np.pi * 880 * t)
-    sd.play(tone, samplerate=16000, device=spk)
-    sd.wait()
-    print("[ok] speaker test passed.")
+    _test_speaker_device(spk)
     _DEVICES_JSON.write_text(
         json.dumps(
             {"camera_index": cam, "mic_index": mic, "speaker_index": spk},
@@ -855,13 +908,7 @@ async def run() -> bool:
             await mic.aclose()
 
         try:
-            sd.check_input_settings(device=new_idx, samplerate=args.rate, channels=args.channels)
-            with sd.InputStream(
-                device=new_idx,
-                channels=args.channels,
-                samplerate=args.rate,
-            ) as s:
-                s.read(1)
+            _test_mic_device(new_idx, timeout=5.0)
         except Exception as exc:
             print(f"[voice] unable to switch microphone: {exc}", file=sys.stderr)
             _start_microphone(prev_idx)
