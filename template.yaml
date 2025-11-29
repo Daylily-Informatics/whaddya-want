@@ -226,6 +226,8 @@ Resources:
       ContentUri: layers/shared
       CompatibleRuntimes: [python3.11]
       RetentionPolicy: Delete
+    Metadata:
+      BuildMethod: python3.11
 
   # --------- Broker Lambda ----------
   BrokerFunctionLogGroup:
