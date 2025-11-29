@@ -75,6 +75,8 @@ The `Makefile` wraps common AWS SAM actions:
 ## Identity and memory utilities (bin/)
 
 - `bin/dump_memory.py [--target short|long|both]` — Dump DynamoDB conversation and AIS memory tables to JSON via DynamoDB Scan.
+- `bin/dump_face_profiles.py` — Export face-profile metadata and embeddings recorded locally.
+- `bin/dump_voice_profiles.py` — Export voice-profile metadata and embeddings recorded locally.
 - `bin/unenroll_profiles.py --name <profile> [--type voice|face|both]` — Remove enrolled voice/face profiles locally and optionally purge Rekognition entries.
 - `bin/exec_on_my_behalf.py` — Execute limited local actions (e.g., `open_url`) based on JSON tool calls piped to stdin.
 - `bin/run_app.sh <broker> <session>` — Launch the voice client with preconfigured feature flags for outbound actions and self-voice suppression.
