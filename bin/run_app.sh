@@ -20,7 +20,7 @@ ACTION_EMAIL_FROM=john@dyly.bio  # verified in SES
 
 PYTHONPATH=$PWD:$PWD/layers/shared/python python -m client.cli --session $SESSION \
   --broker-url $BROKER   \
-  --setup-devices --voice Matthew --voice-mode generative --verbose -vv --self-voice-name Matthew 
+  --setup-devices --voice Matthew --voice-mode generative --verbose -vv --self-voice-name Matthew -vv
 
 echo AGENT_STATE_TABLE :  $AGENT_STATE_TABLE
 # --enroll-ai-voice
