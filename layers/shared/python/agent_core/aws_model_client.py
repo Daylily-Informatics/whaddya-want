@@ -102,32 +102,7 @@ class AwsModelClient:
         return messages
 
     def _convert_tools_to_bedrock(self, tools: Optional[List[Dict[str, Any]]]) -> Optional[Dict[str, Any]]:
-        """Translate generic tool specs into Bedrock toolConfig structure.
-
-        The generic spec looks like:
-
-            {
-              "name": "store_memory",
-              "description": "...",
-              "parameters": { ... JSON schema ... }
-            }
-
-        Bedrock expects:
-
-            "toolConfig": {
-              "tools": [
-                {
-                  "toolSpec": {
-                    "name": "store_memory",
-                    "description": "...",
-                    "inputSchema": {"json": { ... }}
-                  }
-                },
-                ...
-              ],
-              "toolChoice": {"auto": {}}
-            }
-        """
+        """Translate generic tool specs into Bedrock toolConfig structure."""
         if not tools:
             return None
 
@@ -160,7 +135,7 @@ class AwsModelClient:
         self,
         system: str,
         convo: List[Dict[str, str]],
-        tools: Optional[List[Dict[str, Any]]] = None,
+        tools: Optional[List[Dict[str, Any]]],
     ) -> Dict[str, Any]:
         """Low-level wrapper around Bedrock `converse` that returns the raw output."""
         messages = self._build_bedrock_messages(convo)
@@ -233,11 +208,7 @@ class AwsModelClient:
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]],
     ) -> Tuple[str, List[Dict[str, Any]]]:
-        """Call Bedrock and return (reply_text, tool_calls).
-
-        `tool_calls` is a list of {"name": str, "arguments": json_string}
-        in the generic format that planner.handle_llm_result expects.
-        """
+        """Call Bedrock and return (reply_text, tool_calls)."""
         system, convo = self._split_system_and_messages(messages)
         if not self._model:
             raise RuntimeError("MODEL_ID must be set for Bedrock provider.")
@@ -301,13 +272,7 @@ class AwsModelClient:
         return texts
 
     def _answer_from_memory(self, user_text: str) -> Optional[str]:
-        """Try to answer simple questions directly from MEMORY rows.
-
-        Supported patterns (case-insensitive):
-        - "what is my name", "who am i"
-        - "how old am i", "what is my age", "my age?"
-        - "do i have dogs", "do i have a dog", "do i have any dogs"
-        """
+        """Try to answer simple questions directly from MEMORY rows."""
         if not user_text:
             return None
 
@@ -404,19 +369,7 @@ class AwsModelClient:
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
-        """Return an LLM response shaped for agent_core.planner.handle_llm_result.
-
-        We currently:
-        - Optionally answer some simple questions directly from long-term memory.
-        - Otherwise, call the Bedrock model to get a reply (via `converse`),
-          optionally with a toolConfig if `tools` are provided.
-        - Optionally synthesize a `store_memory` tool call for the most recent
-          user message so the planner will persist it as a MEMORY row.
-
-        Native Bedrock tool-calling can be wired in without changing the
-        planner or action dispatcher because we translate Bedrock toolCalls
-        into the generic `tool_calls` format.
-        """
+        """Return an LLM response shaped for agent_core.planner.handle_llm_result."""
         logger.debug("Chat called with %s messages; generating reply", len(messages))
 
         # Find the most recent user message; this is what we'll persist and may answer from.
@@ -455,7 +408,6 @@ class AwsModelClient:
             lower = stripped.lower()
             tokens = lower.split()
 
-            # Very short noise / fillers.
             noise_words = {
                 "hi",
                 "hey",
@@ -478,12 +430,9 @@ class AwsModelClient:
             if len(tokens) == 1 and tokens[0] in noise_words:
                 return False
 
-            # Command-like chatter that shouldn't become long-term memory.
             if lower.startswith(("command ", "cmd ", "run ", "shell ")):
                 return False
 
-            # If it's extremely short and doesn't reference self/you and has
-            # no digits, treat as noise.
             pronoun_keywords = {
                 "i",
                 "i'm",
@@ -523,7 +472,6 @@ class AwsModelClient:
                 if marker in lower:
                     return "SPECULATION"
 
-            # Compliments or judgments about the AI or the interaction.
             compliment_markers = [
                 "you are the best",
                 "you're the best",
@@ -553,7 +501,6 @@ class AwsModelClient:
             ):
                 return "AI_INSIGHT"
 
-            # Default: treat as a concrete fact (often about the user).
             return "FACT"
 
         # Synthesize a store_memory call if appropriate and not already present.
