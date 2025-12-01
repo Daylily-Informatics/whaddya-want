@@ -54,13 +54,22 @@ Resources:
       Handler: app.handler
       Environment:
         Variables:
+          # Bedrock model used by AwsModelClient.from_env()
+          MODEL_ID: meta.llama3-1-8b-instruct-v1:0
+          # Unified state + memory table
           AGENT_STATE_TABLE: !Ref AgentStateTable
+          # Logical agent ID (used as partition key prefix)
           AGENT_ID: marvin
+          # Optional: default Polly voice for agent speech (fallback is Matthew)
+          # AGENT_VOICE_ID: Matthew
+          # Optional: S3 bucket for storing synthesized audio (if you wire one)
+          # AUDIO_BUCKET: your-audio-bucket-name
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref AgentStateTable
         - Version: '2012-10-17'
           Statement:
+            # Bedrock for LLM calls
             - Effect: Allow
               Action:
                 - bedrock:InvokeModel
@@ -68,6 +77,17 @@ Resources:
                 - bedrock:Converse
                 - bedrock:ConverseStream
               Resource: '*'
+            # Polly for speech synthesis
+            - Effect: Allow
+              Action:
+                - polly:SynthesizeSpeech
+              Resource: '*'
+            # If you later configure AUDIO_BUCKET, you can uncomment and tighten this:
+            # - Effect: Allow
+            #   Action:
+            #     - s3:PutObject
+            #   Resource:
+            #     - arn:aws:s3:::your-audio-bucket-name/*
       Events:
         Api:
           Type: Api
@@ -84,6 +104,8 @@ Resources:
       Handler: handler.handler
       Environment:
         Variables:
+          # Must match the model you actually want the heartbeat to use
+          MODEL_ID: meta.llama3-1-8b-instruct-v1:0
           AGENT_STATE_TABLE: !Ref AgentStateTable
           AGENT_ID: marvin
       Policies:
