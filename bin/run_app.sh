@@ -5,13 +5,13 @@
 # Usage examples:
 #
 #   # Basic: derive session name automatically (requires AWS_PROFILE and --region or AWS_REGION)
-#   source bin/run_app.sh --stack-name marpro18 --region us-west-2
+#   ./bin/run_app.sh --stack-name marpro18 --region us-west-2
 #
 #   # Explicit session name
-#   source bin/run_app.sh --stack-name marpro18 --region us-west-2 --session-name jem18
+#   ./bin/run_app.sh --stack-name marpro18 --region us-west-2 --session-name jem18
 #
 #   # Override voice + add extra CLI flags
-#   source bin/run_app.sh \
+#   ./bin/run_app.sh \
 #     --stack-name marpro18 \
 #     --region us-west-2 \
 #     --session-name jem18 \
@@ -20,7 +20,7 @@
 #     --extra-cli-args "--verbose --vv"
 #
 #   # Just list valid Polly voices and supported voice-modes in this region
-#   source bin/run_app.sh --query-voices --region us-west-2
+#   ./bin/run_app.sh --query-voices --region us-west-2
 #
 # Flags:
 #   --stack-name     (required unless --query-voices) CloudFormation stack name.
@@ -32,31 +32,78 @@
 #   --query-voices   (optional) Print Polly voices + supported voice-modes and exit.
 #
 # Requirements:
-#   - AWS_PROFILE must be set in the environment before sourcing this script.
-#
+#   - AWS_PROFILE must be set in the environment before running this script.
 
 set -euo pipefail
+
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  echo "This script must be executed directly, not sourced." >&2
+  return 1
+fi
+
+require_aws_profile() {
+  if [[ -z "${AWS_PROFILE:-}" ]]; then
+    echo "ERROR: AWS_PROFILE is not set. Please export AWS_PROFILE before running this script." >&2
+    exit 1
+  fi
+}
+
+COMMON_REGION_ARG=""
+COMMON_REMAINING_ARGS=()
+parse_region_and_remainder() {
+  COMMON_REGION_ARG=""
+  COMMON_REMAINING_ARGS=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --region)
+        COMMON_REGION_ARG="${2:-}"
+        shift 2
+        ;;
+      --region=*)
+        COMMON_REGION_ARG="${1#*=}"
+        shift
+        ;;
+      *)
+        COMMON_REMAINING_ARGS+=("$1")
+        shift
+        ;;
+    esac
+  done
+}
+
+apply_region() {
+  local provided="$1"
+  if [[ -n "$provided" ]]; then
+    export AWS_REGION="$provided"
+  elif [[ -n "${AWS_REGION:-}" ]]; then
+    export AWS_REGION
+  else
+    echo "ERROR: you must set --region or AWS_REGION." >&2
+    exit 1
+  fi
+  export DEFAULT_AWS_REGION="$AWS_REGION"
+  export AWS_DEFAULT_REGION="$AWS_REGION"
+}
 
 usage() {
   cat >&2 <<EOF
 Usage:
-  source bin/run_app.sh --stack-name STACK --region REGION [--session-name SESSION] \\
-                        [--voice VOICE] [--voice-mode MODE] [--extra-cli-args "FLAGS"] [--query-voices]
+  ./bin/run_app.sh --stack-name STACK --region REGION [--session-name SESSION] \\
+                   [--voice VOICE] [--voice-mode MODE] [--extra-cli-args "FLAGS"] [--query-voices]
 
 Examples:
-  source bin/run_app.sh --stack-name marpro18 --region us-west-2
-  source bin/run_app.sh --stack-name marpro18 --region us-west-2 --session-name jem18
-  source bin/run_app.sh --stack-name marpro18 --region us-west-2 --extra-cli-args "--verbose --vv"
-  source bin/run_app.sh --query-voices --region us-west-2
+  ./bin/run_app.sh --stack-name marpro18 --region us-west-2
+  ./bin/run_app.sh --stack-name marpro18 --region us-west-2 --session-name jem18
+  ./bin/run_app.sh --stack-name marpro18 --region us-west-2 --extra-cli-args "--verbose --vv"
+  ./bin/run_app.sh --query-voices --region us-west-2
 EOF
 }
 
-# Enforce AWS_PROFILE
-if [[ -z "${AWS_PROFILE:-}" ]]; then
-  echo "ERROR: AWS_PROFILE is not set. Please export AWS_PROFILE before running this script." >&2
-  usage
-  return 1 2>/dev/null || exit 1
-fi
+parse_region_and_remainder "$@"
+set -- "${COMMON_REMAINING_ARGS[@]}"
+require_aws_profile
+apply_region "$COMMON_REGION_ARG"
+REGION="$AWS_REGION"
 
 # Defaults
 STACK=""
@@ -65,7 +112,6 @@ VOICE="Matthew"
 VOICE_MODE="generative"
 EXTRA_CLI_ARGS=""
 QUERY_VOICES=0
-REGION_FLAG=""
 
 # Parse flags
 while [[ $# -gt 0 ]]; do
@@ -76,10 +122,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --session-name)
       SESSION="${2:-}"
-      shift 2
-      ;;
-    --region)
-      REGION_FLAG="${2:-}"
       shift 2
       ;;
     --voice)
@@ -100,29 +142,15 @@ while [[ $# -gt 0 ]]; do
       ;;
     -h|--help)
       usage
-      return 0 2>/dev/null || exit 0
+      exit 0
       ;;
     *)
       echo "Unknown argument: $1" >&2
       usage
-      return 1 2>/dev/null || exit 1
+      exit 1
       ;;
   esac
 done
-
-# Region/env plumbing:
-# - Prefer explicit --region flag.
-# - Else use existing AWS_REGION.
-# - Else error.
-if [[ -n "$REGION_FLAG" ]]; then
-  REGION="$REGION_FLAG"
-elif [[ -n "${AWS_REGION:-}" ]]; then
-  REGION="$AWS_REGION"
-else
-  echo "ERROR: Region is not set. Please pass --region REGION or export AWS_REGION." >&2
-  usage
-  return 1 2>/dev/null || exit 1
-fi
 
 export AGENT_ID=marvin
 export REGION
@@ -144,14 +172,14 @@ if [[ "$QUERY_VOICES" -eq 1 ]]; then
   echo "Supported voice modes (client-side concept, not Polly-specific):"
   echo "  generative   - LLM-driven conversational agent with TTS output"
   echo "  tts-only     - (if you implement it) pure TTS playback without LLM"
-  return 0 2>/dev/null || exit 0
+  exit 0
 fi
 
 # From here on, we need a stack.
 if [[ -z "$STACK" ]]; then
   echo "ERROR: --stack-name is required (unless using --query-voices)." >&2
   usage
-  return 1 2>/dev/null || exit 1
+  exit 1
 fi
 
 # Default session if not provided: STACK-YYYYmmdd-HHMMSS
@@ -198,7 +226,7 @@ else
   )"
   if [[ "$REST_API_ID" = "None" || -z "$REST_API_ID" ]]; then
     echo "ERROR: Could not derive BrokerEndpoint or RestApiId from stack '$STACK'." >&2
-    return 1 2>/dev/null || exit 1
+    exit 1
   fi
   export BROKER="https://${REST_API_ID}.execute-api.${REGION}.amazonaws.com/Prod/agent"
 fi
