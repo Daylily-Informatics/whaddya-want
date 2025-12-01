@@ -13,8 +13,7 @@ import sounddevice as sd
 from amazon_transcribe.client import TranscribeStreamingClient
 
 from agent_core.logging_utils import configure_logging
-from . import identity  # NEW: voice identity helpers
-
+from . import identity
 
 logger = logging.getLogger(__name__)
 
@@ -200,7 +199,7 @@ def transcribe_once(duration_s: float, device_index: int) -> Tuple[str, Optional
 
 
 # ---------------------------------------------------------------------------
-# TTS via Polly + sounddevice
+# TTS via Polly + sounddevice (with embedding of agent voice)
 # ---------------------------------------------------------------------------
 
 def synthesize_and_play(
@@ -209,13 +208,13 @@ def synthesize_and_play(
     output_device: int,
     region_name: Optional[str] = None,
     sample_rate: int = RATE,
-) -> float:
+) -> Tuple[float, Optional[List[float]]]:
     """Use Polly to synthesize `text` and play it via sounddevice (non-blocking).
 
-    Returns an approximate playback duration in seconds.
+    Returns (playback_duration_seconds, agent_voice_embedding).
     """
     if not text:
-        return 0.0
+        return 0.0, None
 
     region = region_name or os.getenv("AWS_REGION") or os.getenv("REGION") or "us-west-2"
     polly = boto3.client("polly", region_name=region)
@@ -228,11 +227,15 @@ def synthesize_and_play(
     audio_bytes = resp["AudioStream"].read()
     data = np.frombuffer(audio_bytes, dtype=np.int16)
 
+    # Compute an embedding of the agent's own voice for echo suppression.
+    float_data = data.astype(np.float32)
+    voice_embedding = _compute_embedding_from_samples(float_data)
+
     logger.info("[AGENT_VOICE_PLAY] %s", text)
     logger.debug("Playing %d samples at %d Hz on device %s", len(data), sample_rate, output_device)
     sd.play(data, samplerate=sample_rate, device=output_device)
     play_sec = len(data) / float(sample_rate)
-    return play_sec
+    return play_sec, voice_embedding
 
 
 # ---------------------------------------------------------------------------
@@ -318,7 +321,7 @@ def split_speech_and_debug(text: str) -> Tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Echo suppression
+# Echo suppression (text + embedding)
 # ---------------------------------------------------------------------------
 
 def is_echo(utter: str, last_agent: str) -> bool:
@@ -348,6 +351,27 @@ def is_echo(utter: str, last_agent: str) -> bool:
     return False
 
 
+def embedding_cosine_similarity(a: Optional[List[float]], b: Optional[List[float]]) -> float:
+    """Cosine similarity between two embeddings."""
+    if not a or not b:
+        return 0.0
+    n = min(len(a), len(b))
+    if n == 0:
+        return 0.0
+    dot = 0.0
+    na = 0.0
+    nb = 0.0
+    for i in range(n):
+        va = float(a[i])
+        vb = float(b[i])
+        dot += va * vb
+        na += va * va
+        nb += vb * vb
+    if na <= 0.0 or nb <= 0.0:
+        return 0.0
+    return dot / (na**0.5 * nb**0.5)
+
+
 # ---------------------------------------------------------------------------
 # Main loops
 # ---------------------------------------------------------------------------
@@ -366,12 +390,14 @@ def audio_loop(args: argparse.Namespace) -> None:
 
     voice_id = args.voice or os.getenv("AGENT_VOICE_ID") or "Matthew"
 
-    # Track which speaker we think is active, based on voice embeddings.
+    # Speaker tracking
+    voice_matching_enabled: bool = True
     current_speaker_name: Optional[str] = None
     last_ack_speaker_name: Optional[str] = None
 
     last_agent_speech: str = ""
     agent_playing_until: float = 0.0
+    last_agent_voice_embedding: Optional[List[float]] = None
 
     while True:
         try:
@@ -387,8 +413,20 @@ def audio_loop(args: argparse.Namespace) -> None:
             logger.info("[MIC] %s", utter)
             if args.verbose:
                 print(f"[YOU] {utter}")
+                if embedding is not None:
+                    print(f"[DEBUG] mic_embedding_dim={len(embedding)}")
+                else:
+                    print("[DEBUG] mic_embedding=None")
 
             lower = utter.lower()
+
+            # Resume voice matching command
+            if "marvin, please resume voice matching" in lower:
+                if not voice_matching_enabled:
+                    voice_matching_enabled = True
+                    logger.info("Voice matching resumed by voice command.")
+                    if args.verbose:
+                        print("[DEBUG] Voice matching resumed by user command.")
 
             # Stop command: interrupt agent speech and resume listening.
             if (
@@ -409,7 +447,16 @@ def audio_loop(args: argparse.Namespace) -> None:
                     print("[system] Ignoring utterance during agent playback window.")
                 continue
 
-            # If utter looks like the last agent speech, treat as echo even if playback ended.
+            # Embedding-based self-voice detection: ignore if it looks like the agent's own voice.
+            if embedding is not None and last_agent_voice_embedding is not None:
+                sim = embedding_cosine_similarity(embedding, last_agent_voice_embedding)
+                if sim >= 0.9:
+                    logger.info("[VOICE_ECHO_IGNORED] sim=%.3f utter=%s", sim, utter)
+                    if args.verbose:
+                        print(f"[system] Ignoring utterance that matches agent voice (sim={sim:.3f}).")
+                    continue
+
+            # Text-based echo detection as a secondary guard.
             if last_agent_speech and is_echo(utter, last_agent_speech):
                 logger.info("[ECHO_IGNORED] %s", utter)
                 if args.verbose:
@@ -418,7 +465,10 @@ def audio_loop(args: argparse.Namespace) -> None:
 
             # Try to resolve the speaker identity from the voice embedding.
             pending_greet_name: Optional[str] = None
-            if embedding is not None:
+
+            if voice_matching_enabled and embedding is not None:
+                resolved_name: Optional[str] = None
+                is_new: bool = False
                 try:
                     resolved_name, is_new = identity.resolve_voice(
                         embedding=embedding,
@@ -433,32 +483,57 @@ def audio_loop(args: argparse.Namespace) -> None:
                     # Unknown speaker: prompt for a name and enroll.
                     prompt_text = "I don't recognize your voice yet. What should I call you?"
                     logger.info("[VOICE_ENROLL_PROMPT]")
-                    synthesize_and_play(
+                    play_sec, last_agent_voice_embedding = synthesize_and_play(
                         text=prompt_text,
                         voice_id=voice_id,
                         output_device=out_dev,
                         region_name=os.getenv("AWS_REGION") or os.getenv("REGION"),
                     )
+                    agent_playing_until = time.time() + play_sec
+
                     name_utter, name_embedding = transcribe_once(
                         duration_s=3.0,
                         device_index=in_dev,
                     )
-                    claimed_name = (name_utter or "").strip().split()[0] or None
-                    if claimed_name:
+                    logger.info("[MIC_NAME] %s", name_utter)
+                    claimed_name_raw = (name_utter or "").strip()
+                    claimed_name_token = claimed_name_raw.split()[0] if claimed_name_raw else ""
+                    claimed_name = claimed_name_token or None
+
+                    if args.verbose:
+                        print(f"[DEBUG] claimed_name_raw={claimed_name_raw!r} token={claimed_name_token!r}")
+
+                    if claimed_name and claimed_name.lower() == "unknown":
+                        # User explicitly does NOT want to be identified by voice.
+                        voice_matching_enabled = False
+                        logger.info("Voice matching disabled by user specifying name 'Unknown'.")
+                        if args.verbose:
+                            print("[DEBUG] Voice matching disabled at user's request ('Unknown').")
+                        resolved_name = None
+                        is_new = False
+                    elif claimed_name:
                         try:
                             # Use name clip embedding if available, else fall back to original.
-                            resolved_name, _ = identity.resolve_voice(
+                            resolved_name, is_new2 = identity.resolve_voice(
                                 embedding=name_embedding or embedding,
                                 voice_id=None,
                                 claimed_name=claimed_name,
                             )
+                            is_new = is_new or is_new2
                         except Exception as exc:
                             logger.error("Failed to register new voice profile: %s", exc)
                             resolved_name = claimed_name
 
                 if resolved_name:
                     current_speaker_name = resolved_name
-                    logger.info("[VOICE_IDENTITY] resolved speaker=%s", resolved_name)
+                    logger.info("[VOICE_IDENTITY] resolved speaker=%s is_new=%s", resolved_name, is_new)
+                    if args.verbose:
+                        print(f"[DEBUG] speaker_match name={resolved_name!r} is_new={is_new}")
+
+            if args.verbose:
+                print(f"[DEBUG] voice_matching_enabled={voice_matching_enabled}")
+                print(f"[DEBUG] current_speaker_name={current_speaker_name!r}, "
+                      f"last_ack_speaker_name={last_ack_speaker_name!r}")
 
             # Set up one-time greeting when the active speaker changes.
             if current_speaker_name and current_speaker_name != last_ack_speaker_name:
@@ -473,6 +548,14 @@ def audio_loop(args: argparse.Namespace) -> None:
                 voice_id=in_dev,
                 embedding=embedding,
             )
+
+            if args.verbose:
+                print("[DEBUG] broker_response:")
+                try:
+                    print(json.dumps(resp, indent=2, sort_keys=True))
+                except TypeError:
+                    print(resp)
+
             full_reply = resp.get("reply_text") or ""
             speech_text, debug_text = split_speech_and_debug(full_reply)
 
@@ -495,7 +578,7 @@ def audio_loop(args: argparse.Namespace) -> None:
             else:
                 print(f"[AGENT] {speech_text}")
 
-            play_sec = synthesize_and_play(
+            play_sec, last_agent_voice_embedding = synthesize_and_play(
                 text=speech_text,
                 voice_id=voice_id,
                 output_device=out_dev,
@@ -537,9 +620,15 @@ def text_loop(args: argparse.Namespace) -> None:
         logger.info("[AGENT_TEXT] %s", speech_text)
 
         print(speech_text)
-        if args.verbose and debug_text:
-            print("[DEBUG]")
-            print(debug_text)
+        if args.verbose:
+            print("[DEBUG] broker_response:")
+            try:
+                print(json.dumps(resp, indent=2, sort_keys=True))
+            except TypeError:
+                print(resp)
+            if debug_text:
+                print("[DEBUG]")
+                print(debug_text)
 
 
 # ---------------------------------------------------------------------------
