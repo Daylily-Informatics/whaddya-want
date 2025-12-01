@@ -1,3 +1,5 @@
+# source me with PROFILE and RGN args
+
 PROFILE=${$1:-default}
 RGN=${$2:-us-west-2}
 
