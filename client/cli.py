@@ -274,8 +274,42 @@ def call_broker(
         with urllib.request.urlopen(req, timeout=60) as resp:
             raw = resp.read().decode("utf-8")
             return json.loads(raw)
+    except urllib.error.HTTPError as exc:
+        body_bytes = exc.read() if hasattr(exc, "read") else b""
+        body_text = body_bytes.decode("utf-8", errors="ignore") if body_bytes else ""
+
+        detail = None
+        if body_text:
+            try:
+                parsed = json.loads(body_text)
+                if isinstance(parsed, dict):
+                    detail = parsed.get("message") or parsed.get("error") or parsed.get("detail")
+            except json.JSONDecodeError:
+                detail = body_text.strip()
+
+        logger.error(
+            "Broker responded with HTTP %s (%s). Body=%r",
+            exc.code,
+            exc.reason,
+            body_text,
+        )
+
+        reason = f"HTTP {exc.code}" + (f" {exc.reason}" if exc.reason else "")
+        if detail:
+            reason = f"{reason}: {detail}"
+
+        return {
+            "reply_text": f"I had trouble reaching the conversation broker ({reason}). Please try again in a moment.",
+            "actions": [],
+        }
+    except urllib.error.URLError as exc:
+        logger.error("Network error calling broker at %s: %s", broker_url, exc)
+        return {
+            "reply_text": "I could not reach the conversation broker due to a network issue. Please check your connection and try again.",
+            "actions": [],
+        }
     except Exception as exc:
-        logger.error("Error calling broker at %s: %s", broker_url, exc)
+        logger.error("Unexpected error calling broker at %s: %s", broker_url, exc, exc_info=True)
         return {"reply_text": "I had trouble reaching the conversation broker.", "actions": []}
 
 
