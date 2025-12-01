@@ -1,7 +1,7 @@
 # source me with PROFILE and RGN args
 
-PROFILE=${$1:-default}
-RGN=${$2:-us-west-2}
+PROFILE=$1
+RGN=$2
 
 export AWS_PROFILE=$PROFILE
 export AWS_REGION=$RGN
