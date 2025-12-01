@@ -6,3 +6,5 @@ RGN=$2
 export AWS_PROFILE=$PROFILE
 export AWS_REGION=$RGN
 export AWS_DEFAULT_REGION=$RGN
+
+source .venv/bin/activate
