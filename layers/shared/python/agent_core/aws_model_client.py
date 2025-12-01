@@ -10,34 +10,10 @@ This client is responsible for:
     - agent_core.planner.handle_llm_result
 
 It also:
-- Answers a few simple questions directly from long-term memory
-  ("what is my name", "how old am I", "do I have dogs") to avoid
-  wasting LLM calls.
-- Supports *real* Bedrock tool-calling: when `tools` are provided we
-  send a `toolConfig` to Bedrock and translate any returned toolCalls
-  into the generic `tool_calls` structure that the planner expects.
+- Answers a few simple questions directly from long-term memory.
+- Supports *real* Bedrock tool-calling via toolConfig/toolCalls.
 - Optionally synthesizes a `store_memory` tool call when the model
-  did not request one, so that basic long-term memory continues to
-  function even if the model under-uses tools.
-
-Returned response shape:
-
-    {
-        "messages": [
-            ... original messages ...,
-            {
-                "role": "assistant",
-                "content": reply_text,
-                "tool_calls": [
-                    {"name": "store_memory", "arguments": "{...}"},
-                    ...
-                ]
-            }
-        ]
-    }
-
-This is intentionally generic: it does *not* execute tools itself; it
-just returns tool calls for the planner and action dispatcher.
+  did not request one, so basic long-term memory keeps working.
 """
 
 import json
@@ -56,7 +32,6 @@ logger = logging.getLogger(__name__)
 
 class AwsModelClient:
     def __init__(self, model_id: str | None = None, region_name: str | None = None) -> None:
-        # Prefer explicit args, then env. We do *not* silently default to Titan.
         self._model: str = (model_id or os.getenv("MODEL_ID") or "").strip()
         if not self._model:
             raise RuntimeError(
@@ -67,14 +42,11 @@ class AwsModelClient:
         self._bedrock = boto3.client("bedrock-runtime", region_name=self._region)
         logger.info("Initialized AwsModelClient model=%s region=%s", self._model, self._region)
 
-    # ------------------------------------------------------------------
-    # Internal helpers for Bedrock invocation
-    # ------------------------------------------------------------------
+    # ---- Bedrock invocation helpers -----------------------------------------
 
     def _split_system_and_messages(
         self, messages: List[Dict[str, Any]]
     ) -> Tuple[str, List[Dict[str, str]]]:
-        """Split a mixed message list into (system_prompt, non_system_messages)."""
         system_parts: List[str] = []
         non_system: List[Dict[str, str]] = []
         for m in messages:
@@ -88,7 +60,6 @@ class AwsModelClient:
         return system_text, non_system
 
     def _build_bedrock_messages(self, convo: List[Dict[str, str]]) -> List[Dict[str, Any]]:
-        """Convert generic messages into Bedrock `converse` message format."""
         messages: List[Dict[str, Any]] = []
         for msg in convo:
             role = msg["role"]
@@ -102,7 +73,6 @@ class AwsModelClient:
         return messages
 
     def _convert_tools_to_bedrock(self, tools: Optional[List[Dict[str, Any]]]) -> Optional[Dict[str, Any]]:
-        """Translate generic tool specs into Bedrock toolConfig structure."""
         if not tools:
             return None
 
@@ -137,7 +107,6 @@ class AwsModelClient:
         convo: List[Dict[str, str]],
         tools: Optional[List[Dict[str, Any]]],
     ) -> Dict[str, Any]:
-        """Low-level wrapper around Bedrock `converse` that returns the raw output."""
         messages = self._build_bedrock_messages(convo)
         kwargs: Dict[str, Any] = {
             "modelId": self._model,
@@ -165,11 +134,9 @@ class AwsModelClient:
             )
             out = self._bedrock.converse(**kwargs)
             return out
-        except Exception as e:  # pragma: no cover - defensive fallback
+        except Exception as e:  # pragma: no cover - defensive
             msg = str(e)
             logger.warning("Bedrock converse error: %s", msg)
-
-            # Explicitly surface "no system support" instead of silently stripping system.
             if "doesn't support system messages" in msg.lower():
                 return {
                     "output": {
@@ -189,8 +156,6 @@ class AwsModelClient:
                         "toolCalls": [],
                     }
                 }
-
-            # Last resort: surface a generic failure message.
             return {
                 "output": {
                     "message": {
@@ -208,7 +173,6 @@ class AwsModelClient:
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]],
     ) -> Tuple[str, List[Dict[str, Any]]]:
-        """Call Bedrock and return (reply_text, tool_calls)."""
         system, convo = self._split_system_and_messages(messages)
         if not self._model:
             raise RuntimeError("MODEL_ID must be set for Bedrock provider.")
@@ -219,7 +183,6 @@ class AwsModelClient:
         )
         raw = self._invoke_converse(system, convo, tools)
 
-        # Extract text
         reply_text = ""
         try:
             out_msg = raw["output"]["message"]
@@ -228,10 +191,9 @@ class AwsModelClient:
                 if isinstance(part, dict) and "text" in part:
                     reply_text = str(part["text"])
                     break
-        except Exception:  # pragma: no cover - defensive
+        except Exception:  # pragma: no cover
             reply_text = "I couldn't generate a response."
 
-        # Extract tool calls, if any
         tool_calls: List[Dict[str, Any]] = []
         try:
             raw_tool_calls = raw.get("output", {}).get("toolCalls", []) or []
@@ -239,25 +201,20 @@ class AwsModelClient:
                 name = tc.get("name")
                 if not name:
                     continue
-                # Bedrock uses `input` for tool arguments
                 args = tc.get("input") or {}
                 tool_calls.append({"name": name, "arguments": json.dumps(args)})
-        except Exception as exc:  # pragma: no cover - defensive
+        except Exception as exc:  # pragma: no cover
             logger.warning("Failed to parse Bedrock toolCalls: %s", exc)
 
         return reply_text, tool_calls
 
-    # ------------------------------------------------------------------
-    # Helpers for memory semantics
-    # ------------------------------------------------------------------
+    # ---- memory helpers ------------------------------------------------------
 
     def _get_agent_id(self) -> str:
-        """Best-effort agent id; used as the partition key for memories."""
         return os.getenv("AGENT_ID") or "marvin"
 
     @staticmethod
     def _extract_text_fields(item: Dict[str, Any]) -> Iterable[str]:
-        """Yield all relevant text fields from a memory item dict."""
         if not isinstance(item, dict):
             return []
         texts: List[str] = []
@@ -272,17 +229,14 @@ class AwsModelClient:
         return texts
 
     def _answer_from_memory(self, user_text: str) -> Optional[str]:
-        """Try to answer simple questions directly from MEMORY rows."""
         if not user_text:
             return None
 
         lower = user_text.strip().lower()
         agent_id = self._get_agent_id()
-
-        # Normalize whitespace
         lower = re.sub(r"\s+", " ", lower)
 
-        # --- Name questions ---
+        # Name
         if "what is my name" in lower or "what's my name" in lower or "who am i" in lower:
             candidates: List[str] = []
             mem_items = memory_store.recent_memories(agent_id=agent_id, limit=100)
@@ -304,7 +258,7 @@ class AwsModelClient:
                 if name:
                     return f"Based on what you've told me before, your name is {name}."
 
-        # --- Age questions ---
+        # Age
         if (
             "how old am i" in lower
             or "what is my age" in lower
@@ -330,7 +284,7 @@ class AwsModelClient:
                 age = ages[0]
                 return f"From my memory, you told me you are {age} years old."
 
-        # --- Dog questions ---
+        # Dogs
         if "do i have dogs" in lower or "do i have a dog" in lower or "do i have any dogs" in lower:
             mem_items = memory_store.recent_memories(agent_id=agent_id, limit=200)
             dog_sentences: List[str] = []
@@ -340,50 +294,41 @@ class AwsModelClient:
                     tl = txt.lower()
                     if "dog" in tl:
                         dog_sentences.append(txt)
-                        # Try to pull out names after "named"
                         for m in re.finditer(
                             r"named\s+([A-Za-z][A-Za-z0-9_-]*)", txt, re.IGNORECASE
                         ):
                             dog_names.append(m.group(1))
             if dog_sentences:
                 if dog_names:
-                    unique_names: List[str] = []
+                    unique = []
                     for n in dog_names:
-                        if n not in unique_names:
-                            unique_names.append(n)
-                    if len(unique_names) == 1:
-                        return f"Yes. You've told me you have a dog named {unique_names[0]}."
+                        if n not in unique:
+                            unique.append(n)
+                    if len(unique) == 1:
+                        return f"Yes. You've told me you have a dog named {unique[0]}."
                     else:
-                        joined = ", ".join(unique_names)
+                        joined = ", ".join(unique)
                         return f"Yes. You've told me you have dogs, including {joined}."
                 return "Yes, I remember you telling me you have dogs."
 
         return None
 
-    # ------------------------------------------------------------------
-    # Public API expected by agent_core.llm_client
-    # ------------------------------------------------------------------
+    # ---- public API ----------------------------------------------------------
 
     def chat(
         self,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
-        """Return an LLM response shaped for agent_core.planner.handle_llm_result."""
         logger.debug("Chat called with %s messages; generating reply", len(messages))
 
-        # Find the most recent user message; this is what we'll persist and may answer from.
         last_user_text: Optional[str] = None
         for msg in reversed(messages):
             if (msg.get("role") or "").lower() == "user":
                 content = msg.get("content", "")
-                if isinstance(content, str):
-                    last_user_text = content
-                else:
-                    last_user_text = str(content)
+                last_user_text = str(content)
                 break
 
-        # First, see if we can answer directly from memory.
         reply_text: Optional[str] = None
         tool_calls: List[Dict[str, Any]] = []
 
@@ -391,20 +336,18 @@ class AwsModelClient:
             mem_answer = self._answer_from_memory(last_user_text)
             if mem_answer:
                 logger.debug(
-                    "Answering from memory for user text preview='%s'", last_user_text[:60]
+                    "Answering from memory for user text preview='%s'",
+                    last_user_text[:60],
                 )
                 reply_text = mem_answer
 
-        # If we couldn't answer from memory, fall back to the LLM + tools.
         if reply_text is None:
             reply_text, tool_calls = self._chat_bedrock(messages, tools)
 
-        # Helper: decide whether a user utterance is worth persisting.
         def _should_store(text: str) -> bool:
             stripped = (text or "").strip()
             if not stripped:
                 return False
-
             lower = stripped.lower()
             tokens = lower.split()
 
@@ -452,7 +395,6 @@ class AwsModelClient:
 
             return True
 
-        # Helper: classify the memory kind based on simple patterns.
         def _classify_memory_kind(text: str) -> str:
             lower = (text or "").lower()
 
@@ -503,7 +445,6 @@ class AwsModelClient:
 
             return "FACT"
 
-        # Synthesize a store_memory call if appropriate and not already present.
         if last_user_text and _should_store(last_user_text):
             has_store = any((tc.get("name") == "store_memory") for tc in tool_calls)
             if not has_store:
@@ -542,5 +483,4 @@ class AwsModelClient:
 
     @classmethod
     def from_env(cls) -> "AwsModelClient":
-        """Factory using MODEL_ID / AWS_REGION from the Lambda/CLI environment."""
         return cls(model_id=os.getenv("MODEL_ID"), region_name=os.getenv("AWS_REGION"))

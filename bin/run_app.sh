@@ -126,6 +126,6 @@ PYTHONPATH="$PWD:$PWD/layers/shared/python" python -m client.cli --session "$SES
   --voice Matthew \
   --voice-mode generative \
   --verbose -vv \
-  --self-voice-name Matthew
+  --self-voice-name Matthew 
 
 # --enroll-ai-voice

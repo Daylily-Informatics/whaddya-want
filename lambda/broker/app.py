@@ -120,6 +120,11 @@ def handler(event, context):
     else:
         source = body.get("source") or ("unknown_voice" if voice_id else "user")
 
+    # Build a "raw" copy of the body that is Dynamo-safe:
+    # explicitly strip out any float-heavy fields like voice_embedding.
+    raw_body: Dict[str, Any] = dict(body)
+    raw_body.pop("voice_embedding", None)
+
     # Persist the incoming event
     agent_event = Event(
         agent_id=AGENT_ID,
@@ -131,13 +136,15 @@ def handler(event, context):
             "transcript": transcript,
             "voice_id": voice_id,
             "speaker_name": speaker_name,
-            "voice_embedding": embedding,
-            "raw": body,
+            # just a flag; no floats:
+            "had_voice_embedding": bool(embedding),
+            "raw": raw_body,
         },
     )
     memory_store.put_event(agent_event)
     logger.debug("Stored incoming event payload: %s", agent_event.payload)
 
+    # Retrieve recent memories for context
     memories = memory_store.recent_memories(agent_id=AGENT_ID, limit=40)
     logger.debug("Loaded %s recent memories", len(memories))
 

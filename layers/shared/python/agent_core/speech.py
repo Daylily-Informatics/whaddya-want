@@ -56,7 +56,6 @@ class SpeechSynthesizer:
     @staticmethod
     def _to_ssml(text: str) -> str:
         """Convert plain text into a minimal SSML document."""
-        # Escape special XML characters and replace hard newlines with breaks.
         escaped = escape(text)
         escaped = escaped.replace("\n\n", "<break time='800ms'/>").replace(
             "\n", "<break time='400ms'/>"
@@ -97,7 +96,6 @@ class SpeechSynthesizer:
         }
 
         if self._bucket and self._s3 is not None:
-            # Generate a reasonably unique key.
             ts = datetime.now(timezone.utc).isoformat()
             safe_ts = ts.replace(":", "-")
             prefix = (key_prefix or "agent").strip("/")

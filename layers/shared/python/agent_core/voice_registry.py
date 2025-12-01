@@ -45,10 +45,7 @@ class VoiceProfile:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_item(self) -> Dict[str, Any]:
-        """Convert this profile to a DynamoDB-friendly item.
-
-        In particular, we must ensure numeric embeddings are stored as Decimal.
-        """
+        """Convert this profile to a DynamoDB-friendly item."""
         meta = encode_metadata_for_dynamo(self.metadata)
         return {
             "pk": f"AGENT#{self.agent_id}",
@@ -63,7 +60,6 @@ class VoiceProfile:
 
     @classmethod
     def from_item(cls, item: Dict[str, Any]) -> "VoiceProfile":
-        """Reconstruct a VoiceProfile from a DynamoDB item."""
         agent_tag = item.get("pk", "")
         if agent_tag.startswith("AGENT#"):
             agent_id = agent_tag.split("#", 1)[1]
@@ -95,16 +91,10 @@ class VoiceProfile:
         )
 
 
-# ---------------------------------------------------------------------------
-# Metadata (embedding) encoding helpers
-# ---------------------------------------------------------------------------
+# ---- metadata encoding helpers ------------------------------------------------
 
 def encode_metadata_for_dynamo(meta: Dict[str, Any]) -> Dict[str, Any]:
-    """Return a copy of metadata where embeddings are Decimal-encoded.
-
-    We expect embeddings to live under meta["embeddings"] as a list of lists
-    of floats. DynamoDB requires Decimal for numeric values.
-    """
+    """Return a copy of metadata where embeddings are Decimal-encoded."""
     if not isinstance(meta, dict):
         return {}
 
@@ -114,7 +104,6 @@ def encode_metadata_for_dynamo(meta: Dict[str, Any]) -> Dict[str, Any]:
         return out
 
     if not isinstance(embs, list):
-        # If it's garbage, drop it rather than exploding the write.
         logger.warning("Unexpected embeddings type in metadata: %r", type(embs))
         out["embeddings"] = []
         return out
@@ -128,7 +117,6 @@ def encode_metadata_for_dynamo(meta: Dict[str, Any]) -> Dict[str, Any]:
             try:
                 vec.append(Decimal(str(float(v))))
             except Exception:
-                # Skip non-numeric junk.
                 continue
         if vec:
             encoded.append(vec)
@@ -138,11 +126,7 @@ def encode_metadata_for_dynamo(meta: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def decode_metadata_from_dynamo(meta: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert metadata read from Dynamo into a float-friendly structure.
-
-    - Numbers inside embeddings (Decimal) are converted back to float.
-    - Other fields are left as-is.
-    """
+    """Convert metadata read from Dynamo into a float-friendly structure."""
     if not isinstance(meta, dict):
         return {}
 
@@ -177,11 +161,7 @@ def decode_metadata_from_dynamo(meta: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _append_embedding(meta: Dict[str, Any], embedding: List[float]) -> Dict[str, Any]:
-    """Append an embedding (List[float]) to metadata["embeddings"] in float space.
-
-    We keep embeddings as floats in memory; to_item() will convert them to Decimal
-    for Dynamo.
-    """
+    """Append an embedding (List[float]) to metadata["embeddings"] in float space."""
     meta = dict(meta) if meta is not None else {}
     embs = meta.get("embeddings") or []
     if not isinstance(embs, list):
@@ -192,12 +172,9 @@ def _append_embedding(meta: Dict[str, Any], embedding: List[float]) -> Dict[str,
     return meta
 
 
-# ---------------------------------------------------------------------------
-# Core operations
-# ---------------------------------------------------------------------------
+# ---- core operations ----------------------------------------------------------
 
 def get_by_voice_id(agent_id: str, voice_id: str) -> Optional[VoiceProfile]:
-    """Return the VoiceProfile for (agent_id, voice_id) if it exists."""
     pk = f"AGENT#{agent_id}"
     sk = f"VOICE#{voice_id}"
     resp = _table.get_item(Key={"pk": pk, "sk": sk})
@@ -215,7 +192,6 @@ def upsert_voice_profile(
     name: str,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> VoiceProfile:
-    """Create or update a voice profile for the given voice_id."""
     existing = get_by_voice_id(agent_id, voice_id)
     now = datetime.now(timezone.utc)
 
@@ -231,8 +207,6 @@ def upsert_voice_profile(
         existing.last_seen_at = now
         if metadata:
             merged = dict(existing.metadata)
-            # Don't blindly overwrite embeddings; if caller provided embeddings,
-            # append the last one.
             if "embeddings" in metadata:
                 emb_list = metadata.get("embeddings")
                 if isinstance(emb_list, list) and emb_list:
@@ -269,7 +243,6 @@ def upsert_voice_profile(
 
 
 def touch_voice_profile(agent_id: str, voice_id: str) -> None:
-    """Update last_seen_at for a profile if it exists; do nothing otherwise."""
     profile = get_by_voice_id(agent_id, voice_id)
     if not profile:
         return
@@ -278,7 +251,6 @@ def touch_voice_profile(agent_id: str, voice_id: str) -> None:
 
 
 def list_voice_profiles(agent_id: str) -> List[VoiceProfile]:
-    """List all voice profiles for a given agent."""
     pk = f"AGENT#{agent_id}"
     items: List[Dict[str, Any]] = []
     start_key: Optional[Dict[str, Any]] = None
@@ -306,14 +278,12 @@ def list_voice_profiles(agent_id: str) -> List[VoiceProfile]:
 
 
 def list_voice_names(agent_id: str) -> List[str]:
-    """Return a sorted list of unique voice profile names for the agent."""
     profiles = list_voice_profiles(agent_id)
     names = sorted({p.name for p in profiles})
     return names
 
 
 def delete_voice_profile(agent_id: str, name: str) -> bool:
-    """Delete all voice profiles for this agent that match the given name."""
     name_norm = name.strip()
     if not name_norm:
         raise ValueError("Voice profile name must not be empty")
@@ -333,9 +303,7 @@ def delete_voice_profile(agent_id: str, name: str) -> bool:
     return deleted_any
 
 
-# ---------------------------------------------------------------------------
-# Embedding-based nearest neighbor
-# ---------------------------------------------------------------------------
+# ---- embedding-based nearest neighbor ----------------------------------------
 
 def _cosine_similarity(a: List[float], b: List[float]) -> float:
     if not a or not b:
@@ -354,7 +322,6 @@ def find_best_match_by_embedding(
     embedding: List[float],
     min_similarity: float = 0.8,
 ) -> Optional[VoiceProfile]:
-    """Return the best matching VoiceProfile for the given embedding, or None."""
     profiles = list_voice_profiles(agent_id)
     best: Optional[VoiceProfile] = None
     best_sim = min_similarity
@@ -373,9 +340,7 @@ def find_best_match_by_embedding(
     return best
 
 
-# ---------------------------------------------------------------------------
-# High-level API
-# ---------------------------------------------------------------------------
+# ---- high-level API ----------------------------------------------------------
 
 def resolve_voice(
     agent_id: str,
@@ -387,14 +352,11 @@ def resolve_voice(
     """Resolve a voice to a name, using voice_id and/or embedding.
 
     Returns (name, is_new):
-
     - If voice_id is known: returns stored name, is_new=False.
-    - Else if embedding matches an existing profile: returns that name, is_new=False,
-      and creates/updates a mapping for this voice_id if provided.
+    - Else if embedding matches an existing profile: returns that name, is_new=False.
     - Else if claimed_name is provided: creates a new profile and returns (claimed_name, True).
     - Else: (None, True) signalling that the caller should ask for the speaker's name.
     """
-    # 1. If we know the voice_id directly, that's the strongest signal.
     if voice_id:
         existing = get_by_voice_id(agent_id, voice_id)
         if existing:
@@ -406,7 +368,6 @@ def resolve_voice(
                 touch_voice_profile(agent_id, voice_id)
             return existing.name, False
 
-    # 2. Try nearest-neighbor on embedding.
     match: Optional[VoiceProfile] = None
     if embedding:
         match = find_best_match_by_embedding(agent_id, embedding, min_similarity=similarity_threshold)
@@ -423,7 +384,6 @@ def resolve_voice(
         upsert_voice_profile(agent_id, vid, match.name, meta)
         return match.name, False
 
-    # 3. No match; register a new profile if we have a claimed name.
     if claimed_name:
         vid = voice_id or f"voice-{int(datetime.now(timezone.utc).timestamp())}"
         meta: Dict[str, Any] = {}
@@ -438,7 +398,6 @@ def resolve_voice(
         )
         return profile.name, True
 
-    # 4. Unknown voice; caller should ask for the speaker's name.
     logger.debug("Unknown voice (no match, no claimed name).")
     return None, True
 
