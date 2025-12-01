@@ -120,8 +120,7 @@ def handler(event, context):
     else:
         source = body.get("source") or ("unknown_voice" if voice_id else "user")
 
-    # Build a "raw" copy of the body that is Dynamo-safe:
-    # explicitly strip out any float-heavy fields like voice_embedding.
+    # Build a "raw" copy of the body that is Dynamo-safe: strip float-heavy fields like voice_embedding.
     raw_body: Dict[str, Any] = dict(body)
     raw_body.pop("voice_embedding", None)
 
@@ -136,7 +135,6 @@ def handler(event, context):
             "transcript": transcript,
             "voice_id": voice_id,
             "speaker_name": speaker_name,
-            # just a flag; no floats:
             "had_voice_embedding": bool(embedding),
             "raw": raw_body,
         },
@@ -148,10 +146,9 @@ def handler(event, context):
     memories = memory_store.recent_memories(agent_id=AGENT_ID, limit=40)
     logger.debug("Loaded %s recent memories", len(memories))
 
-    personality_prompt = body.get("personality_prompt") or (
-        "You are Marvin, a slightly paranoid but helpful home/office AI."
-    )
-    system_prompt = llm_client.build_system_prompt(personality_prompt)
+    # Use prompts.yaml for the base persona; allow optional per-request extra text.
+    extra_personality = body.get("personality_prompt")
+    system_prompt = llm_client.build_system_prompt(extra_personality=extra_personality)
 
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
@@ -191,6 +188,7 @@ def handler(event, context):
             }
         )
 
+    # Memory dump for retrieval-augmented answers
     messages.append(
         {
             "role": "system",
@@ -198,6 +196,7 @@ def handler(event, context):
         }
     )
 
+    # User message last
     messages.append(
         {
             "role": "user",

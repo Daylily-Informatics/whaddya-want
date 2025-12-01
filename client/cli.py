@@ -208,30 +208,30 @@ def synthesize_and_play(
     output_device: int,
     region_name: Optional[str] = None,
     sample_rate: int = RATE,
-    voice_mode: Optional[str] = None,
-) -> None:
-    """Use Polly to synthesize `text` and play it via sounddevice (non-blocking)."""
+) -> float:
+    """Use Polly to synthesize `text` and play it via sounddevice (non-blocking).
+
+    Returns an approximate playback duration in seconds.
+    """
     if not text:
-        return
+        return 0.0
 
     region = region_name or os.getenv("AWS_REGION") or os.getenv("REGION") or "us-west-2"
     polly = boto3.client("polly", region_name=region)
-    synthesize_kwargs: Dict[str, Any] = {
-        "Text": text,
-        "VoiceId": voice_id,
-        "OutputFormat": "pcm",
-        "SampleRate": str(sample_rate),
-    }
-    if voice_mode:
-        synthesize_kwargs["Engine"] = voice_mode
-
-    resp = polly.synthesize_speech(**synthesize_kwargs)
+    resp = polly.synthesize_speech(
+        Text=text,
+        VoiceId=voice_id,
+        OutputFormat="pcm",
+        SampleRate=str(sample_rate),
+    )
     audio_bytes = resp["AudioStream"].read()
     data = np.frombuffer(audio_bytes, dtype=np.int16)
 
+    logger.info("[AGENT_VOICE_PLAY] %s", text)
     logger.debug("Playing %d samples at %d Hz on device %s", len(data), sample_rate, output_device)
     sd.play(data, samplerate=sample_rate, device=output_device)
-    # No sd.wait(): playback is non-blocking; we manage echo by text filtering.
+    play_sec = len(data) / float(sample_rate)
+    return play_sec
 
 
 # ---------------------------------------------------------------------------
@@ -320,13 +320,12 @@ def split_speech_and_debug(text: str) -> Tuple[str, str]:
 # Echo suppression
 # ---------------------------------------------------------------------------
 
-def is_echo(utter: str, last_agent: str, threshold: float = 0.7) -> bool:
+def is_echo(utter: str, last_agent: str) -> bool:
     """Return True if `utter` looks like an echo of `last_agent`.
 
-    We do a cheap similarity check:
-    - Normalize both to lowercase.
-    - If one is mostly contained in the other (shorter / longer >= threshold),
-      treat it as echo.
+    More aggressive than before:
+    - If utter == last_agent -> echo.
+    - If utter is a non-trivial substring (>=10 chars) of last_agent -> echo.
     """
     if not utter or not last_agent:
         return False
@@ -336,14 +335,14 @@ def is_echo(utter: str, last_agent: str, threshold: float = 0.7) -> bool:
     if not u or not a:
         return False
 
-    # Exact or near-substring
-    if u in a or a in u:
-        shorter = min(len(u), len(a))
-        longer = max(len(u), len(a))
-        if longer == 0:
-            return False
-        ratio = shorter / longer
-        return ratio >= threshold
+    if u == a:
+        return True
+
+    # Non-trivial substring (catch tails like "I'll store this as a fact memory.")
+    if len(u) >= 10 and u in a:
+        return True
+    if len(a) >= 10 and a in u:
+        return True
 
     return False
 
@@ -365,33 +364,53 @@ def audio_loop(args: argparse.Namespace) -> None:
     print()
 
     voice_id = args.voice or os.getenv("AGENT_VOICE_ID") or "Matthew"
-    voice_mode = args.voice_mode or os.getenv("AGENT_VOICE_MODE")
     last_agent_speech: str = ""
+    agent_playing_until: float = 0.0
 
     while True:
         try:
             print("Speak now...")
             utter, embedding = transcribe_once(duration_s=args.utterance_seconds, device_index=in_dev)
+
+            now = time.time()
+
             if not utter:
                 print("(No speech detected)")
                 continue
 
+            logger.info("[MIC] %s", utter)
             if args.verbose:
                 print(f"[YOU] {utter}")
 
             lower = utter.lower()
-            # Voice-stop command
-            if "marvin stop" in lower or "marvin, stop" in lower:
+
+            # Stop command: interrupt agent speech and resume listening.
+            if (
+                "marvin stop" in lower
+                or "marvin, stop" in lower
+                or "marvin please stop" in lower
+                or "marvin, please stop" in lower
+            ):
                 sd.stop()
+                agent_playing_until = 0.0
                 print("[system] Stopped agent speech.")
                 continue
 
-            # Echo suppression: ignore content that looks like the last agent reply.
-            if last_agent_speech and is_echo(utter, last_agent_speech):
+            # If we're still in the playback window, almost certainly echo.
+            if now < agent_playing_until:
+                logger.info("[DURING_PLAYBACK_IGNORED] %s", utter)
                 if args.verbose:
-                    print("[system] Ignoring echo of agent speech.")
+                    print("[system] Ignoring utterance during agent playback window.")
                 continue
 
+            # If utter looks like the last agent speech, treat as echo even if playback ended.
+            if last_agent_speech and is_echo(utter, last_agent_speech):
+                logger.info("[ECHO_IGNORED] %s", utter)
+                if args.verbose:
+                    print("[system] Ignoring echo of agent speech (similar text).")
+                continue
+
+            # Normal path: send to broker
             resp = call_broker(
                 broker_url=args.broker_url,
                 session_id=args.session,
@@ -408,25 +427,30 @@ def audio_loop(args: argparse.Namespace) -> None:
 
             last_agent_speech = speech_text or ""
 
-            print(f"[AGENT] {speech_text}")
-            if args.verbose and debug_text:
-                print("[DEBUG]")
-                print(debug_text)
+            logger.info("[AGENT] %s", speech_text)
+            if args.verbose:
+                print(f"[AGENT] {speech_text}")
+                if debug_text:
+                    print("[DEBUG]")
+                    print(debug_text)
+            else:
+                print(f"[AGENT] {speech_text}")
 
-            synthesize_and_play(
+            play_sec = synthesize_and_play(
                 text=speech_text,
                 voice_id=voice_id,
                 output_device=out_dev,
                 region_name=os.getenv("AWS_REGION") or os.getenv("REGION"),
-                voice_mode=voice_mode,
             )
+            agent_playing_until = time.time() + play_sec
+
         except KeyboardInterrupt:
             print("\nExiting audio loop.")
             break
 
 
 def text_loop(args: argparse.Namespace) -> None:
-    """Simple text-only REPL that talks to the broker."""
+    """Simple text-only REPL that talks to the broker, with debug filtering."""
     print("Text-only mode. Ctrl+D or Ctrl+C to exit.")
     while True:
         try:
@@ -437,6 +461,8 @@ def text_loop(args: argparse.Namespace) -> None:
         if not line:
             continue
 
+        logger.info("[MIC_TEXT] %s", line)
+
         resp = call_broker(
             broker_url=args.broker_url,
             session_id=args.session,
@@ -444,7 +470,17 @@ def text_loop(args: argparse.Namespace) -> None:
             channel="cli",
         )
         reply_text = resp.get("reply_text") or ""
-        print(reply_text)
+        speech_text, debug_text = split_speech_and_debug(reply_text)
+
+        if not speech_text and reply_text:
+            speech_text = reply_text
+
+        logger.info("[AGENT_TEXT] %s", speech_text)
+
+        print(speech_text)
+        if args.verbose and debug_text:
+            print("[DEBUG]")
+            print(debug_text)
 
 
 # ---------------------------------------------------------------------------

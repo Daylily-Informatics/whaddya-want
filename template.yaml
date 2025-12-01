@@ -46,6 +46,14 @@ Resources:
       CompatibleRuntimes:
         - python3.11
       RetentionPolicy: Delete
+    Metadata:
+      BuildMethod: python3.11
+      BuildProperties:
+        # This tells SAM exactly how to build the layer:
+        # - Install Python deps from requirements.txt into /asset-output/python
+        # - Copy your existing python/ tree under layers/shared into the same directory.
+        Commands:
+          - pip install -r requirements.txt -t /asset-output/python
 
   BrokerFunction:
     Type: AWS::Serverless::Function
