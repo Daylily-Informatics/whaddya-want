@@ -13,9 +13,13 @@ import sounddevice as sd
 from amazon_transcribe.client import TranscribeStreamingClient
 
 from agent_core.logging_utils import configure_logging
+from agent_core import voice_registry
 
 
 logger = logging.getLogger(__name__)
+
+AGENT_ID = os.getenv("AGENT_ID", "marvin")
+VOICEPRINT_CAPTURE_SECONDS = 4.0
 
 # ---------------------------------------------------------------------------
 # Device selection and persistence
@@ -199,6 +203,85 @@ def transcribe_once(duration_s: float, device_index: int) -> Tuple[str, Optional
 
 
 # ---------------------------------------------------------------------------
+# Voice identification helpers
+# ---------------------------------------------------------------------------
+
+
+def _resolve_speaker(embedding: Optional[List[float]]) -> Tuple[Optional[str], bool]:
+    """Resolve a speaker name from an embedding via the voice registry.
+
+    Returns (name, is_new_or_unknown). If the name is None and the second value
+    is True, the caller should prompt for enrollment.
+    """
+
+    if embedding is None:
+        return None, True
+
+    try:
+        name, is_new = voice_registry.resolve_voice(
+            agent_id=AGENT_ID,
+            voice_id=None,
+            claimed_name=None,
+            embedding=embedding,
+        )
+        return name, is_new
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Voice resolution failed: %s", exc)
+        return None, True
+
+
+def _enroll_new_speaker(
+    *,
+    initial_embedding: Optional[List[float]],
+    input_device: int,
+    output_device: int,
+    voice_id: str,
+) -> Optional[str]:
+    """Prompt for a speaker name and enroll a new voice profile."""
+
+    print("I don't recognize your voice. What should I call you?")
+    name = input("Enter your name: ").strip()
+    if not name:
+        print("No name provided; skipping enrollment.")
+        return None
+
+    print("Thanks! Please say a short phrase so I can capture your voiceprint...")
+    synthesize_and_play(
+        text="Please say a short phrase so I can capture your voiceprint.",
+        voice_id=voice_id,
+        output_device=output_device,
+    )
+    _ = sd.wait()
+    _transcript, extra_embedding = transcribe_once(
+        duration_s=VOICEPRINT_CAPTURE_SECONDS, device_index=input_device
+    )
+
+    embeddings: List[List[float]] = []
+    if initial_embedding:
+        embeddings.append(list(initial_embedding))
+    if extra_embedding:
+        embeddings.append(list(extra_embedding))
+
+    metadata: Dict[str, Any] = {}
+    if embeddings:
+        metadata["embeddings"] = embeddings
+
+    try:
+        voice_registry.upsert_voice_profile(
+            agent_id=AGENT_ID,
+            voice_id=f"voice-{int(time.time())}",
+            name=name,
+            metadata=metadata or None,
+        )
+        logger.info("Enrolled new voice profile for %s", name)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Failed to enroll voice profile: %s", exc)
+        return None
+
+    return name
+
+
+# ---------------------------------------------------------------------------
 # TTS via Polly + sounddevice
 # ---------------------------------------------------------------------------
 
@@ -366,6 +449,7 @@ def audio_loop(args: argparse.Namespace) -> None:
     voice_id = args.voice or os.getenv("AGENT_VOICE_ID") or "Matthew"
     last_agent_speech: str = ""
     agent_playing_until: float = 0.0
+    last_acknowledged_speaker: Optional[str] = None
 
     while True:
         try:
@@ -410,6 +494,25 @@ def audio_loop(args: argparse.Namespace) -> None:
                     print("[system] Ignoring echo of agent speech (similar text).")
                 continue
 
+            speaker_name: Optional[str] = None
+            try:
+                speaker_name, is_unknown = _resolve_speaker(embedding)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Speaker resolution failed: %s", exc)
+                is_unknown = True
+
+            if is_unknown:
+                enrolled = _enroll_new_speaker(
+                    initial_embedding=embedding,
+                    input_device=in_dev,
+                    output_device=out_dev,
+                    voice_id=voice_id,
+                )
+                if enrolled:
+                    speaker_name = enrolled
+                else:
+                    speaker_name = None
+
             # Normal path: send to broker
             resp = call_broker(
                 broker_url=args.broker_url,
@@ -426,6 +529,10 @@ def audio_loop(args: argparse.Namespace) -> None:
                 speech_text = full_reply
 
             last_agent_speech = speech_text or ""
+
+            if speaker_name and speaker_name != last_acknowledged_speaker:
+                speech_text = f"Hi {speaker_name}. {speech_text}" if speech_text else f"Hi {speaker_name}."
+                last_acknowledged_speaker = speaker_name
 
             logger.info("[AGENT] %s", speech_text)
             if args.verbose:
