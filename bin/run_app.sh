@@ -87,7 +87,7 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --voice-mode)
-      VOICE_MODE="${2:-}"
+      VOICE_MODE="${2:-standard}"
       shift 2
       ;;
     --extra-cli-args)
