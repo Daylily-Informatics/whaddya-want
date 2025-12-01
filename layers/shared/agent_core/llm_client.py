@@ -53,21 +53,24 @@ def load_prompts() -> Dict[str, Any]:
 
     path = _prompts_path()
     if not path.exists():
-        logger.warning("prompts.yaml not found at %s; using empty prompts.", path)
-        _PROMPTS_CACHE = {}
-        return _PROMPTS_CACHE
+        msg = f"prompts.yaml not found at {path}"
+        logger.error(msg)
+        raise FileNotFoundError(msg)
 
     try:
         with path.open("r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
-        if not isinstance(data, dict):
-            logger.warning("prompts.yaml did not parse as a mapping; got %r", type(data))
-            data = {}
-        _PROMPTS_CACHE = data
-        logger.debug("Loaded prompts.yaml from %s", path)
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.warning("Failed to load prompts.yaml from %s: %s", path, exc)
-        _PROMPTS_CACHE = {}
+    except Exception:  # pragma: no cover - defensive
+        logger.exception("Failed to load prompts.yaml from %s", path)
+        raise
+
+    if not isinstance(data, dict):
+        msg = f"prompts.yaml did not parse as a mapping; got {type(data)}"
+        logger.error(msg)
+        raise ValueError(msg)
+
+    _PROMPTS_CACHE = data
+    logger.debug("Loaded prompts.yaml from %s", path)
 
     return _PROMPTS_CACHE
 
