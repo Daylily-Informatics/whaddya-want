@@ -91,7 +91,6 @@ def select_devices(setup_devices: bool) -> Tuple[int, int]:
         )
         return cached_in, cached_out
 
-    # Prompt the user.
     in_dev = _pick_device("input", input_candidates)
     out_dev = _pick_device("output", output_candidates)
 
@@ -138,12 +137,7 @@ def _compute_embedding_from_samples(samples: np.ndarray, num_bins: int = 32) -> 
 
 
 async def _transcribe_once(duration_s: float, device_index: int) -> Tuple[str, Optional[List[float]]]:
-    """Capture microphone audio for `duration_s` and return (transcript, embedding).
-
-    This is the simpler, known-stable version: we just record for up to
-    duration_s, send all audio to Transcribe, then compute an embedding
-    from the captured samples.
-    """
+    """Capture microphone audio for `duration_s` and return (transcript, embedding)."""
     region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "us-west-2"
     client = TranscribeStreamingClient(region=region)
     stream = await client.start_stream_transcription(
@@ -215,10 +209,7 @@ def synthesize_and_play(
     region_name: Optional[str] = None,
     sample_rate: int = RATE,
 ) -> None:
-    """Use Polly to synthesize `text` and play it via sounddevice.
-
-    Playback is non-blocking; use sd.stop() to interrupt.
-    """
+    """Use Polly to synthesize `text` and play it via sounddevice (non-blocking)."""
     if not text:
         return
 
@@ -235,7 +226,7 @@ def synthesize_and_play(
 
     logger.debug("Playing %d samples at %d Hz on device %s", len(data), sample_rate, output_device)
     sd.play(data, samplerate=sample_rate, device=output_device)
-    # no sd.wait(): non-blocking playback
+    # No sd.wait(): playback is non-blocking; we manage echo by text filtering.
 
 
 # ---------------------------------------------------------------------------
@@ -274,42 +265,8 @@ def call_broker(
         with urllib.request.urlopen(req, timeout=60) as resp:
             raw = resp.read().decode("utf-8")
             return json.loads(raw)
-    except urllib.error.HTTPError as exc:
-        body_bytes = exc.read() if hasattr(exc, "read") else b""
-        body_text = body_bytes.decode("utf-8", errors="ignore") if body_bytes else ""
-
-        detail = None
-        if body_text:
-            try:
-                parsed = json.loads(body_text)
-                if isinstance(parsed, dict):
-                    detail = parsed.get("message") or parsed.get("error") or parsed.get("detail")
-            except json.JSONDecodeError:
-                detail = body_text.strip()
-
-        logger.error(
-            "Broker responded with HTTP %s (%s). Body=%r",
-            exc.code,
-            exc.reason,
-            body_text,
-        )
-
-        reason = f"HTTP {exc.code}" + (f" {exc.reason}" if exc.reason else "")
-        if detail:
-            reason = f"{reason}: {detail}"
-
-        return {
-            "reply_text": f"I had trouble reaching the conversation broker ({reason}). Please try again in a moment.",
-            "actions": [],
-        }
-    except urllib.error.URLError as exc:
-        logger.error("Network error calling broker at %s: %s", broker_url, exc)
-        return {
-            "reply_text": "I could not reach the conversation broker due to a network issue. Please check your connection and try again.",
-            "actions": [],
-        }
     except Exception as exc:
-        logger.error("Unexpected error calling broker at %s: %s", broker_url, exc, exc_info=True)
+        logger.error("Error calling broker at %s: %s", broker_url, exc)
         return {"reply_text": "I had trouble reaching the conversation broker.", "actions": []}
 
 
@@ -355,6 +312,38 @@ def split_speech_and_debug(text: str) -> Tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Echo suppression
+# ---------------------------------------------------------------------------
+
+def is_echo(utter: str, last_agent: str, threshold: float = 0.7) -> bool:
+    """Return True if `utter` looks like an echo of `last_agent`.
+
+    We do a cheap similarity check:
+    - Normalize both to lowercase.
+    - If one is mostly contained in the other (shorter / longer >= threshold),
+      treat it as echo.
+    """
+    if not utter or not last_agent:
+        return False
+
+    u = utter.lower().strip()
+    a = last_agent.lower().strip()
+    if not u or not a:
+        return False
+
+    # Exact or near-substring
+    if u in a or a in u:
+        shorter = min(len(u), len(a))
+        longer = max(len(u), len(a))
+        if longer == 0:
+            return False
+        ratio = shorter / longer
+        return ratio >= threshold
+
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Main loops
 # ---------------------------------------------------------------------------
 
@@ -371,6 +360,7 @@ def audio_loop(args: argparse.Namespace) -> None:
     print()
 
     voice_id = args.voice or os.getenv("AGENT_VOICE_ID") or "Matthew"
+    last_agent_speech: str = ""
 
     while True:
         try:
@@ -384,9 +374,16 @@ def audio_loop(args: argparse.Namespace) -> None:
                 print(f"[YOU] {utter}")
 
             lower = utter.lower()
+            # Voice-stop command
             if "marvin stop" in lower or "marvin, stop" in lower:
                 sd.stop()
                 print("[system] Stopped agent speech.")
+                continue
+
+            # Echo suppression: ignore content that looks like the last agent reply.
+            if last_agent_speech and is_echo(utter, last_agent_speech):
+                if args.verbose:
+                    print("[system] Ignoring echo of agent speech.")
                 continue
 
             resp = call_broker(
@@ -402,6 +399,8 @@ def audio_loop(args: argparse.Namespace) -> None:
 
             if not speech_text and full_reply:
                 speech_text = full_reply
+
+            last_agent_speech = speech_text or ""
 
             print(f"[AGENT] {speech_text}")
             if args.verbose and debug_text:

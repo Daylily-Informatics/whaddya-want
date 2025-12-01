@@ -1,30 +1,166 @@
 #!/usr/bin/env bash
 
-# Usage:
-#   source bin/run_app.sh STACK SESSION [MODEL_ID]
+# Launcher for the local CLI talking to a deployed whaddya-want stack.
 #
-# STACK    = CloudFormation stack name (e.g., marpro9)
-# SESSION  = Arbitrary session id (used by the broker to group events)
-# MODEL_ID = (optional) Bedrock model id; if omitted, this script will try to
-#            read MODEL_ID from the BrokerFunction's Lambda configuration.
+# Usage examples:
 #
-# The broker URL is derived from the CloudFormation stack outputs:
-#   - First tries the BrokerEndpoint output.
-#   - If missing, falls back to RestApiId and constructs the URL.
+#   # Basic: derive session name automatically (requires AWS_PROFILE and --region or AWS_REGION)
+#   source bin/run_app.sh --stack-name marpro18 --region us-west-2
+#
+#   # Explicit session name
+#   source bin/run_app.sh --stack-name marpro18 --region us-west-2 --session-name jem18
+#
+#   # Override voice + add extra CLI flags
+#   source bin/run_app.sh \
+#     --stack-name marpro18 \
+#     --region us-west-2 \
+#     --session-name jem18 \
+#     --voice Joanna \
+#     --voice-mode generative \
+#     --extra-cli-args "--verbose --vv"
+#
+#   # Just list valid Polly voices and supported voice-modes in this region
+#   source bin/run_app.sh --query-voices --region us-west-2
+#
+# Flags:
+#   --stack-name     (required unless --query-voices) CloudFormation stack name.
+#   --session-name   (optional) CLI session id. Defaults to "<stack>-<YYYYmmdd-HHMMSS>".
+#   --region         (required unless AWS_REGION is already set) AWS region for all AWS calls.
+#   --voice          (optional) Polly VoiceId. Default: Matthew.
+#   --voice-mode     (optional) Arbitrary mode string passed to client.cli. Default: generative.
+#   --extra-cli-args (optional) Single string of extra flags for client.cli.
+#   --query-voices   (optional) Print Polly voices + supported voice-modes and exit.
+#
+# Requirements:
+#   - AWS_PROFILE must be set in the environment before sourcing this script.
+#
 
-if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
-  echo "Usage: $0 STACK SESSION [MODEL_ID]" >&2
+set -euo pipefail
+
+usage() {
+  cat >&2 <<EOF
+Usage:
+  source bin/run_app.sh --stack-name STACK --region REGION [--session-name SESSION] \\
+                        [--voice VOICE] [--voice-mode MODE] [--extra-cli-args "FLAGS"] [--query-voices]
+
+Examples:
+  source bin/run_app.sh --stack-name marpro18 --region us-west-2
+  source bin/run_app.sh --stack-name marpro18 --region us-west-2 --session-name jem18
+  source bin/run_app.sh --stack-name marpro18 --region us-west-2 --extra-cli-args "--verbose --vv"
+  source bin/run_app.sh --query-voices --region us-west-2
+EOF
+}
+
+# Enforce AWS_PROFILE
+if [[ -z "${AWS_PROFILE:-}" ]]; then
+  echo "ERROR: AWS_PROFILE is not set. Please export AWS_PROFILE before running this script." >&2
+  usage
   return 1 2>/dev/null || exit 1
 fi
 
-export STACK="$1"
-export SESSION="$2"
-MODEL_ID_OVERRIDE="${3:-}"
+# Defaults
+STACK=""
+SESSION=""
+VOICE="Matthew"
+VOICE_MODE="generative"
+EXTRA_CLI_ARGS=""
+QUERY_VOICES=0
+REGION_FLAG=""
+
+# Parse flags
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --stack-name)
+      STACK="${2:-}"
+      shift 2
+      ;;
+    --session-name)
+      SESSION="${2:-}"
+      shift 2
+      ;;
+    --region)
+      REGION_FLAG="${2:-}"
+      shift 2
+      ;;
+    --voice)
+      VOICE="${2:-}"
+      shift 2
+      ;;
+    --voice-mode)
+      VOICE_MODE="${2:-}"
+      shift 2
+      ;;
+    --extra-cli-args)
+      EXTRA_CLI_ARGS="${2:-}"
+      shift 2
+      ;;
+    --query-voices)
+      QUERY_VOICES=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      return 0 2>/dev/null || exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage
+      return 1 2>/dev/null || exit 1
+      ;;
+  esac
+done
+
+# Region/env plumbing:
+# - Prefer explicit --region flag.
+# - Else use existing AWS_REGION.
+# - Else error.
+if [[ -n "$REGION_FLAG" ]]; then
+  REGION="$REGION_FLAG"
+elif [[ -n "${AWS_REGION:-}" ]]; then
+  REGION="$AWS_REGION"
+else
+  echo "ERROR: Region is not set. Please pass --region REGION or export AWS_REGION." >&2
+  usage
+  return 1 2>/dev/null || exit 1
+fi
 
 export AGENT_ID=marvin
-export REGION="${AWS_REGION:-us-west-2}"
+export REGION
 export AWS_REGION="$REGION"
 export AWS_DEFAULT_REGION="$REGION"
+
+# If we're only querying voices, we don't need a stack at all.
+if [[ "$QUERY_VOICES" -eq 1 ]]; then
+  echo "AWS_PROFILE       : $AWS_PROFILE"
+  echo "Region            : $AWS_REGION"
+  echo
+  echo "Available Polly voices in this region:"
+  aws polly describe-voices \
+    --region "$AWS_REGION" \
+    --query 'Voices[].{Id:Id,LanguageCode:LanguageCode,Name:Name,Engines:SupportedEngines}' \
+    --output table
+
+  echo
+  echo "Supported voice modes (client-side concept, not Polly-specific):"
+  echo "  generative   - LLM-driven conversational agent with TTS output"
+  echo "  tts-only     - (if you implement it) pure TTS playback without LLM"
+  return 0 2>/dev/null || exit 0
+fi
+
+# From here on, we need a stack.
+if [[ -z "$STACK" ]]; then
+  echo "ERROR: --stack-name is required (unless using --query-voices)." >&2
+  usage
+  return 1 2>/dev/null || exit 1
+fi
+
+# Default session if not provided: STACK-YYYYmmdd-HHMMSS
+if [[ -z "$SESSION" ]]; then
+  SESSION="${STACK}-$(date +%Y%m%d-%H%M%S)"
+fi
+
+export STACK
+export SESSION
 
 # Resolve AgentStateTable physical name
 export AGENT_STATE_TABLE="$(
@@ -45,11 +181,11 @@ BROKER_FROM_OUTPUT="$(
     --output text 2>/dev/null || echo ""
 )"
 
-if [ "$BROKER_FROM_OUTPUT" = "None" ]; then
+if [[ "$BROKER_FROM_OUTPUT" = "None" ]]; then
   BROKER_FROM_OUTPUT=""
 fi
 
-if [ -n "$BROKER_FROM_OUTPUT" ]; then
+if [[ -n "$BROKER_FROM_OUTPUT" ]]; then
   export BROKER="$BROKER_FROM_OUTPUT"
 else
   # Fallback: derive from RestApiId if BrokerEndpoint output is missing
@@ -60,20 +196,15 @@ else
       --query "Stacks[0].Outputs[?OutputKey=='RestApiId'].OutputValue" \
       --output text 2>/dev/null || echo ""
   )"
-  if [ "$REST_API_ID" = "None" ] || [ -z "$REST_API_ID" ]; then
+  if [[ "$REST_API_ID" = "None" || -z "$REST_API_ID" ]]; then
     echo "ERROR: Could not derive BrokerEndpoint or RestApiId from stack '$STACK'." >&2
     return 1 2>/dev/null || exit 1
   fi
   export BROKER="https://${REST_API_ID}.execute-api.${REGION}.amazonaws.com/Prod/agent"
 fi
 
-# Resolve MODEL_ID:
-#  - if a 3rd arg was provided, use that
-#  - otherwise, ask Lambda for BrokerFunction's environment MODEL_ID
-if [ -n "$MODEL_ID_OVERRIDE" ]; then
-  export MODEL_ID="$MODEL_ID_OVERRIDE"
-else
-  # Get the physical Lambda name for the BrokerFunction
+# Resolve MODEL_ID from BrokerFunction's Lambda env var (unless pre-set)
+if [[ -z "${MODEL_ID:-}" ]]; then
   BROKER_FN_PHYS="$(
     aws cloudformation describe-stack-resources \
       --stack-name "$STACK" \
@@ -83,7 +214,6 @@ else
       --output text
   )"
 
-  # Ask Lambda for its MODEL_ID env var
   MODEL_ID_LOOKUP="$(
     aws lambda get-function-configuration \
       --function-name "$BROKER_FN_PHYS" \
@@ -92,15 +222,13 @@ else
       --output text 2>/dev/null || echo ""
   )"
 
-  # Some AWS CLI versions return "None" if unset; normalize that away
-  if [ "$MODEL_ID_LOOKUP" = "None" ]; then
+  if [[ "$MODEL_ID_LOOKUP" = "None" ]]; then
     MODEL_ID_LOOKUP=""
   fi
 
-  if [ -n "$MODEL_ID_LOOKUP" ]; then
+  if [[ -n "$MODEL_ID_LOOKUP" ]]; then
     export MODEL_ID="$MODEL_ID_LOOKUP"
   else
-    # Last-resort default if the stack doesn't have MODEL_ID set for some reason.
     export MODEL_ID="meta.llama3-1-8b-instruct-v1:0"
     echo "WARNING: Could not determine MODEL_ID from stack '$STACK'. Falling back to $MODEL_ID" >&2
   fi
@@ -111,21 +239,26 @@ ENABLE_OUTBOUND_EMAIL=1        # to actually send email
 ENABLE_SYSTEM_COMMANDS=1       # to allow run_command
 ACTION_EMAIL_FROM=john@dyly.bio  # verified in SES
 
-echo "BROKER         : $BROKER"
-echo "STACK          : $STACK"
-echo "SESSION        : $SESSION"
+echo "AWS_PROFILE       : $AWS_PROFILE"
+echo "BROKER            : $BROKER"
+echo "STACK             : $STACK"
+echo "SESSION           : $SESSION"
 echo "AGENT_STATE_TABLE : $AGENT_STATE_TABLE"
-echo "MODEL_ID       : $MODEL_ID"
-echo "REGION         : $REGION"
-echo "AWS_REGION     : $AWS_REGION"
-echo "AWS_DEFAULT_REGION : $AWS_DEFAULT_REGION"
+echo "MODEL_ID          : $MODEL_ID"
+echo "REGION            : $REGION"
+echo "AWS_REGION        : $AWS_REGION"
+echo "AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION"
+echo "VOICE             : $VOICE"
+echo "VOICE_MODE        : $VOICE_MODE"
+echo "EXTRA_CLI_ARGS    : $EXTRA_CLI_ARGS"
+echo
 
-PYTHONPATH="$PWD:$PWD/layers/shared/python" python -m client.cli --session "$SESSION" \
+# Build the python command; let the shell split EXTRA_CLI_ARGS into flags.
+PYTHONPATH="$PWD:$PWD/layers/shared/python" python -m client.cli \
+  --session "$SESSION" \
   --broker-url "$BROKER" \
   --setup-devices \
-  --voice Matthew \
-  --voice-mode generative \
-  --verbose -vv \
-  --self-voice-name Matthew 
-
-# --enroll-ai-voice
+  --voice "$VOICE" \
+  --voice-mode "$VOICE_MODE" \
+  --self-voice-name "$VOICE" \
+  ${EXTRA_CLI_ARGS}
