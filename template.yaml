@@ -55,6 +55,16 @@ Resources:
         Commands:
           - pip install -r requirements.txt -t /asset-output/python
 
+  AgentConfigLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: whaddya-want-config
+      Description: Agent configuration (prompts, etc.)
+      ContentUri: layers/config
+      CompatibleRuntimes:
+        - python3.11
+      RetentionPolicy: Delete
+
   BrokerFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -104,6 +114,7 @@ Resources:
             Method: POST
       Layers:
         - !Ref SharedDependenciesLayer
+        - !Ref AgentConfigLayer
 
   AgentHeartbeatFunction:
     Type: AWS::Serverless::Function
@@ -130,6 +141,7 @@ Resources:
               Resource: '*'
       Layers:
         - !Ref SharedDependenciesLayer
+        - !Ref AgentConfigLayer
 
   AgentHeartbeatRule:
     Type: AWS::Events::Rule

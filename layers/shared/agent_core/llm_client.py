@@ -5,7 +5,7 @@ LLM client helpers for the Rank-4 agent.
 
 Responsibilities:
 
-- Load prompt templates from layers/shared/config/prompts.yaml
+- Load prompt templates from layers/config/agent_core/config/prompts.yaml
 - Build the system prompt used for the model, based on that config
 - Provide a simple chat_with_tools(model_client, messages, tools) wrapper
   that delegates to the model client (AwsModelClient or similar).
@@ -30,19 +30,29 @@ _PROMPTS_CACHE: Optional[Dict[str, Any]] = None
 
 def _prompts_path() -> Path:
     """
-    Return the absolute path to layers/shared/config/prompts.yaml.
+    Return the absolute path to layers/config/agent_core/config/prompts.yaml.
 
     This file (llm_client.py) lives under:
         layers/shared/python/agent_core/llm_client.py
 
     The prompts.yaml file lives under:
-        layers/shared/config/prompts.yaml
+        layers/config/agent_core/config/prompts.yaml
 
-    So we go up two levels to "shared" and then into config/.
+    In the source tree, that lives under layers/config/agent_core/config/.
+    When deployed as a Lambda layer, layers/ is mounted at /opt, so we
+    look for the same relative structure there (/opt/config/agent_core/config/).
+    For compatibility, we also fall back to /opt/agent_core/config/ to match
+    how the config layer may be packaged.
     """
     here = Path(__file__).resolve()
-    shared_dir = here.parents[2]  # .../layers/shared
-    return shared_dir / "config" / "prompts.yaml"
+    layers_dir = here.parents[2]  # .../layers
+    source_tree_path = layers_dir / "config" / "agent_core" / "config" / "prompts.yaml"
+    deployed_layer_path = layers_dir / "agent_core" / "config" / "prompts.yaml"
+
+    if source_tree_path.exists():
+        return source_tree_path
+
+    return deployed_layer_path
 
 
 def load_prompts() -> Dict[str, Any]:
