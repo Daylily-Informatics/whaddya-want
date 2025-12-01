@@ -1,0 +1,6 @@
+PROFILE=${$1:-default}
+RGN=${$2:-us-west-2}
+
+export AWS_PROFILE=$PROFILE
+export AWS_REGION=$RGN
+export AWS_DEFAULT_REGION=$RGN
