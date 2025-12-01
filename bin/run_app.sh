@@ -100,7 +100,11 @@ EOF
 }
 
 parse_region_and_remainder "$@"
-set -- "${COMMON_REMAINING_ARGS[@]}"
+if [[ ${#COMMON_REMAINING_ARGS[@]:-0} -gt 0 ]]; then
+  set -- "${COMMON_REMAINING_ARGS[@]}"
+else
+  set --
+fi
 require_aws_profile
 apply_region "$COMMON_REGION_ARG"
 REGION="$AWS_REGION"
