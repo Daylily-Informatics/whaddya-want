@@ -112,15 +112,10 @@ LANGUAGE_CODE = "en-US"
 
 
 def _compute_embedding_from_samples(samples: np.ndarray, num_bins: int = 32) -> Optional[List[float]]:
-    """Compute a simple, fixed-size embedding from a 1D float32 sample array.
-
-    We split the utterance into `num_bins` segments and take the mean absolute
-    amplitude for each, then L2-normalize the resulting vector.
-    """
+    """Compute a simple, fixed-size embedding from a 1D float32 sample array."""
     if samples.size == 0:
         return None
 
-    # Ensure 1D
     if samples.ndim > 1:
         samples = samples.reshape(-1)
 
@@ -143,12 +138,13 @@ def _compute_embedding_from_samples(samples: np.ndarray, num_bins: int = 32) -> 
 
 
 async def _transcribe_once(duration_s: float, device_index: int) -> Tuple[str, Optional[List[float]]]:
-    """Capture microphone audio for up to `duration_s` and return (transcript, embedding).
+    """Capture microphone audio for `duration_s` and return (transcript, embedding).
 
-    We stop early if we detect a period of silence after some speech.
-    The embedding is computed from the entire utterance audio.
+    This is the simpler, known-stable version: we just record for up to
+    duration_s, send all audio to Transcribe, then compute an embedding
+    from the captured samples.
     """
-    region = os.getenv("AWS_REGION") or "us-west-2"
+    region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "us-west-2"
     client = TranscribeStreamingClient(region=region)
     stream = await client.start_stream_transcription(
         language_code=LANGUAGE_CODE,
@@ -163,39 +159,17 @@ async def _transcribe_once(duration_s: float, device_index: int) -> Tuple[str, O
         nonlocal stream, all_frames
         frames_per_chunk = int(RATE * 0.2)  # 0.2s chunks
         start = time.time()
-        silence_chunks = 0
-        saw_speech = False
-        silence_threshold = 300.0  # RMS threshold for "silence" on int16
-        max_silence_chunks = int(1.2 / 0.2)  # ~1.2s of silence
-        min_speech_time = 0.6  # don't cut off immediately
-
         with sd.InputStream(
             samplerate=RATE,
             channels=CHANNELS,
             dtype="int16",
             device=device_index,
         ) as s:
-            while True:
-                now = time.time()
-                if now - start > duration_s:
-                    break
+            while time.time() - start < duration_s:
                 frames, _overflowed = s.read(frames_per_chunk)
                 all_frames.append(frames.copy())
                 audio_bytes = frames.tobytes()
                 await stream.input_stream.send_audio_event(audio_chunk=audio_bytes)
-
-                # Simple silence detection
-                samples = frames.astype(np.float32)
-                rms = float(np.sqrt(np.mean(samples * samples))) if samples.size else 0.0
-                if rms > silence_threshold:
-                    saw_speech = True
-                    silence_chunks = 0
-                else:
-                    if saw_speech and (now - start) > min_speech_time:
-                        silence_chunks += 1
-                        if silence_chunks >= max_silence_chunks:
-                            break
-
         await stream.input_stream.end_stream()
 
     async def listener() -> None:
@@ -261,7 +235,7 @@ def synthesize_and_play(
 
     logger.debug("Playing %d samples at %d Hz on device %s", len(data), sample_rate, output_device)
     sd.play(data, samplerate=sample_rate, device=output_device)
-    # NOTE: no sd.wait() here; playback is non-blocking.
+    # no sd.wait(): non-blocking playback
 
 
 # ---------------------------------------------------------------------------
@@ -273,7 +247,7 @@ def call_broker(
     session_id: str,
     transcript: str,
     channel: str = "audio",
-    voice_id: Optional[str] = None,
+    voice_id: Optional[int] = None,
     embedding: Optional[List[float]] = None,
 ) -> Dict[str, Any]:
     """Send a transcript + optional embedding to the broker and return the JSON response."""

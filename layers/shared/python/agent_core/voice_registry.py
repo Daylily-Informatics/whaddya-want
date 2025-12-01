@@ -7,12 +7,16 @@ Supports:
 - Storing one or more speaker embeddings per voice profile
 - Nearest-neighbor lookup by embedding to fuzzily match new voices to
   existing profiles.
+
+NOTE: DynamoDB does not support native Python float; we must store numeric
+embeddings as Decimal and convert back to float on read.
 """
 
 import logging
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
 import boto3
@@ -41,6 +45,11 @@ class VoiceProfile:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_item(self) -> Dict[str, Any]:
+        """Convert this profile to a DynamoDB-friendly item.
+
+        In particular, we must ensure numeric embeddings are stored as Decimal.
+        """
+        meta = encode_metadata_for_dynamo(self.metadata)
         return {
             "pk": f"AGENT#{self.agent_id}",
             "sk": f"VOICE#{self.voice_id}",
@@ -49,11 +58,12 @@ class VoiceProfile:
             "voice_id": self.voice_id,
             "created_at": self.created_at.isoformat(),
             "last_seen_at": self.last_seen_at.isoformat(),
-            "metadata": self.metadata,
+            "metadata": meta,
         }
 
     @classmethod
     def from_item(cls, item: Dict[str, Any]) -> "VoiceProfile":
+        """Reconstruct a VoiceProfile from a DynamoDB item."""
         agent_tag = item.get("pk", "")
         if agent_tag.startswith("AGENT#"):
             agent_id = agent_tag.split("#", 1)[1]
@@ -72,20 +82,119 @@ class VoiceProfile:
         created_at = datetime.fromisoformat(created_raw)
         last_seen_at = datetime.fromisoformat(last_raw)
 
+        meta = item.get("metadata") or {}
+        meta = decode_metadata_from_dynamo(meta)
+
         return cls(
             agent_id=agent_id,
             voice_id=voice_id,
             name=item.get("name", "Unknown"),
             created_at=created_at,
             last_seen_at=last_seen_at,
-            metadata=item.get("metadata") or {},
+            metadata=meta,
         )
+
+
+# ---------------------------------------------------------------------------
+# Metadata (embedding) encoding helpers
+# ---------------------------------------------------------------------------
+
+def encode_metadata_for_dynamo(meta: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy of metadata where embeddings are Decimal-encoded.
+
+    We expect embeddings to live under meta["embeddings"] as a list of lists
+    of floats. DynamoDB requires Decimal for numeric values.
+    """
+    if not isinstance(meta, dict):
+        return {}
+
+    out: Dict[str, Any] = dict(meta)
+    embs = out.get("embeddings")
+    if embs is None:
+        return out
+
+    if not isinstance(embs, list):
+        # If it's garbage, drop it rather than exploding the write.
+        logger.warning("Unexpected embeddings type in metadata: %r", type(embs))
+        out["embeddings"] = []
+        return out
+
+    encoded: List[List[Decimal]] = []
+    for e in embs:
+        if not isinstance(e, list):
+            continue
+        vec: List[Decimal] = []
+        for v in e:
+            try:
+                vec.append(Decimal(str(float(v))))
+            except Exception:
+                # Skip non-numeric junk.
+                continue
+        if vec:
+            encoded.append(vec)
+
+    out["embeddings"] = encoded
+    return out
+
+
+def decode_metadata_from_dynamo(meta: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert metadata read from Dynamo into a float-friendly structure.
+
+    - Numbers inside embeddings (Decimal) are converted back to float.
+    - Other fields are left as-is.
+    """
+    if not isinstance(meta, dict):
+        return {}
+
+    out: Dict[str, Any] = dict(meta)
+    embs = out.get("embeddings")
+    if embs is None:
+        return out
+
+    if not isinstance(embs, list):
+        logger.warning("Unexpected embeddings type in stored metadata: %r", type(embs))
+        out["embeddings"] = []
+        return out
+
+    decoded: List[List[float]] = []
+    for e in embs:
+        if not isinstance(e, list):
+            continue
+        vec: List[float] = []
+        for v in e:
+            try:
+                if isinstance(v, Decimal):
+                    vec.append(float(v))
+                else:
+                    vec.append(float(v))
+            except Exception:
+                continue
+        if vec:
+            decoded.append(vec)
+
+    out["embeddings"] = decoded
+    return out
+
+
+def _append_embedding(meta: Dict[str, Any], embedding: List[float]) -> Dict[str, Any]:
+    """Append an embedding (List[float]) to metadata["embeddings"] in float space.
+
+    We keep embeddings as floats in memory; to_item() will convert them to Decimal
+    for Dynamo.
+    """
+    meta = dict(meta) if meta is not None else {}
+    embs = meta.get("embeddings") or []
+    if not isinstance(embs, list):
+        embs = []
+    embs = list(embs)
+    embs.append(list(embedding))
+    meta["embeddings"] = embs
+    return meta
 
 
 # ---------------------------------------------------------------------------
 # Core operations
 # ---------------------------------------------------------------------------
-
 
 def get_by_voice_id(agent_id: str, voice_id: str) -> Optional[VoiceProfile]:
     """Return the VoiceProfile for (agent_id, voice_id) if it exists."""
@@ -98,17 +207,6 @@ def get_by_voice_id(agent_id: str, voice_id: str) -> Optional[VoiceProfile]:
     if item.get("item_type") != "VOICE_PROFILE":
         return None
     return VoiceProfile.from_item(item)
-
-
-def _append_embedding(meta: Dict[str, Any], embedding: List[float]) -> Dict[str, Any]:
-    meta = dict(meta) if meta is not None else {}
-    embs = meta.get("embeddings") or []
-    if not isinstance(embs, list):
-        embs = []
-    embs = list(embs)
-    embs.append(embedding)
-    meta["embeddings"] = embs
-    return meta
 
 
 def upsert_voice_profile(
@@ -132,12 +230,19 @@ def upsert_voice_profile(
         existing.name = name
         existing.last_seen_at = now
         if metadata:
-            # Merge metadata shallowly; embeddings are handled by caller.
             merged = dict(existing.metadata)
-            merged.update({k: v for k, v in metadata.items() if k != "embeddings"})
-            # If caller provided embeddings explicitly, append them
+            # Don't blindly overwrite embeddings; if caller provided embeddings,
+            # append the last one.
             if "embeddings" in metadata:
-                merged = _append_embedding(merged, metadata["embeddings"][-1])
+                emb_list = metadata.get("embeddings")
+                if isinstance(emb_list, list) and emb_list:
+                    last_emb = emb_list[-1]
+                    if isinstance(last_emb, list):
+                        merged = _append_embedding(merged, [float(x) for x in last_emb])
+            for k, v in metadata.items():
+                if k == "embeddings":
+                    continue
+                merged[k] = v
             existing.metadata = merged
         profile = existing
     else:
@@ -147,13 +252,16 @@ def upsert_voice_profile(
             voice_id,
             name,
         )
+        clean_meta: Dict[str, Any] = {}
+        if metadata:
+            clean_meta.update(metadata)
         profile = VoiceProfile(
             agent_id=agent_id,
             voice_id=voice_id,
             name=name,
             created_at=now,
             last_seen_at=now,
-            metadata=metadata or {},
+            metadata=clean_meta,
         )
 
     _table.put_item(Item=profile.to_item())
@@ -257,7 +365,8 @@ def find_best_match_by_embedding(
         for e in embs:
             if not isinstance(e, list):
                 continue
-            sim = _cosine_similarity(e, embedding)
+            vec = [float(x) for x in e]
+            sim = _cosine_similarity(vec, embedding)
             if sim > best_sim:
                 best_sim = sim
                 best = p
@@ -290,7 +399,6 @@ def resolve_voice(
         existing = get_by_voice_id(agent_id, voice_id)
         if existing:
             logger.debug("Resolved voice_id=%s to existing profile name=%s", voice_id, existing.name)
-            # Optionally attach the new embedding if provided.
             if embedding:
                 existing.metadata = _append_embedding(existing.metadata, embedding)
                 _table.put_item(Item=existing.to_item())
@@ -310,7 +418,6 @@ def resolve_voice(
             match.voice_id,
             match.name,
         )
-        # Optionally bind this new voice_id to the same person.
         vid = voice_id or f"embed-{int(datetime.now(timezone.utc).timestamp())}"
         meta = _append_embedding(match.metadata, embedding)
         upsert_voice_profile(agent_id, vid, match.name, meta)
