@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Print all face profile names from the identity registry."""
+"""Print all face profile names from the identity registry / Rekognition."""
 
 from __future__ import annotations
 
@@ -14,13 +14,8 @@ from client import identity
 
 
 def _collect_face_names() -> List[str]:
-    entries = identity.list_entries()
-    names = {
-        (entry.get("name") or "").strip()
-        for entry in entries
-        if entry.get("type") == "person" and entry.get("face")
-    }
-    return sorted(n for n in names if n)
+    """Return a sorted list of face profile names via the identity helper."""
+    return identity.list_face_names()
 
 
 def _as_json(names: Iterable[str]) -> str:

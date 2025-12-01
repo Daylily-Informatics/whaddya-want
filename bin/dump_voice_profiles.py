@@ -14,13 +14,8 @@ from client import identity
 
 
 def _collect_voice_names() -> List[str]:
-    entries = identity.list_entries()
-    names = {
-        (entry.get("name") or "").strip()
-        for entry in entries
-        if entry.get("type") == "person" and entry.get("voice")
-    }
-    return sorted(n for n in names if n)
+    """Return a sorted list of voice profile names via the identity helper."""
+    return identity.list_voice_names()
 
 
 def _as_json(names: Iterable[str]) -> str:

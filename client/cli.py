@@ -509,16 +509,25 @@ def audio_loop(args: argparse.Namespace) -> None:
                     # Unknown speaker: prompt for a name and enroll.
                     prompt_text = "I don't recognize your voice yet. What should I call you?"
                     logger.info("[VOICE_ENROLL_PROMPT]")
-                    synthesize_and_play(
+
+                    # 1. Speak the prompt
+                    play_sec = synthesize_and_play(
                         text=prompt_text,
                         voice_id=voice_id,
                         output_device=out_dev,
                         region_name=os.getenv("AWS_REGION") or os.getenv("REGION"),
                     )
+
+                    # 2. Wait for playback to finish before listening for the name
+                    #    Add a small margin to be safe against timing drift.
+                    time.sleep(play_sec + 0.1)
+
+                    # 3. Now capture the user's spoken name
                     name_utter, name_embedding = transcribe_once(
                         duration_s=3.0,
                         device_index=in_dev,
                     )
+
 
                     # Name enrollment state: run heuristic + optional LLM to extract a self-name.
                     heuristic_name = extract_name_heuristic(name_utter or "")
