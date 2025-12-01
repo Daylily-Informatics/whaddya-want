@@ -15,6 +15,7 @@ Options:
   --conda-env <name>    Conda env name (default: aai).
   --force               Recreate the requested environment from scratch.
   --skip-system-check   Skip verification of system dependencies.
+  --region <name>       AWS region (required unless AWS_REGION is already set).
   -h, --help            Show this help and exit.
 
 Notes:
@@ -26,6 +27,53 @@ USAGE
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[WARN]\033[0m %s\n' "$*"; }
 err()  { printf '\033[1;31m[ERR ]\033[0m %s\n' "$*" >&2; exit 1; }
+
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  echo "This script must be executed directly, not sourced." >&2
+  return 1
+fi
+
+require_aws_profile() {
+  if [[ -z "${AWS_PROFILE:-}" ]]; then
+    err "AWS_PROFILE is not set."
+  fi
+}
+
+COMMON_REGION_ARG=""
+COMMON_REMAINING_ARGS=()
+parse_region_and_remainder() {
+  COMMON_REGION_ARG=""
+  COMMON_REMAINING_ARGS=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --region)
+        COMMON_REGION_ARG="${2:-}"
+        shift 2
+        ;;
+      --region=*)
+        COMMON_REGION_ARG="${1#*=}"
+        shift
+        ;;
+      *)
+        COMMON_REMAINING_ARGS+=("$1")
+        shift
+        ;;
+    esac
+  done
+}
+
+apply_region() {
+  local provided="$1"
+  if [[ -n "$provided" ]]; then
+    export AWS_REGION="$provided"
+  elif [[ -n "${AWS_REGION:-}" ]]; then
+    export AWS_REGION
+  else
+    err "you must set --region or AWS_REGION."
+  fi
+  export DEFAULT_AWS_REGION="$AWS_REGION"
+  export AWS_DEFAULT_REGION="$AWS_REGION"
+}
 
 lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 
@@ -89,6 +137,11 @@ VENV_PATH="${REPO_ROOT}/.venv"
 CONDA_ENV_NAME="aai"
 FORCE=0
 SKIP_SYSTEM_CHECK=0
+
+parse_region_and_remainder "$@"
+set -- "${COMMON_REMAINING_ARGS[@]}"
+require_aws_profile
+apply_region "$COMMON_REGION_ARG"
 
 # --- args ---
 while [[ $# -gt 0 ]]; do
