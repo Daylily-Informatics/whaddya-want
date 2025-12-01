@@ -208,6 +208,7 @@ def synthesize_and_play(
     output_device: int,
     region_name: Optional[str] = None,
     sample_rate: int = RATE,
+    voice_mode: Optional[str] = None,
 ) -> None:
     """Use Polly to synthesize `text` and play it via sounddevice (non-blocking)."""
     if not text:
@@ -215,12 +216,16 @@ def synthesize_and_play(
 
     region = region_name or os.getenv("AWS_REGION") or os.getenv("REGION") or "us-west-2"
     polly = boto3.client("polly", region_name=region)
-    resp = polly.synthesize_speech(
-        Text=text,
-        VoiceId=voice_id,
-        OutputFormat="pcm",
-        SampleRate=str(sample_rate),
-    )
+    synthesize_kwargs: Dict[str, Any] = {
+        "Text": text,
+        "VoiceId": voice_id,
+        "OutputFormat": "pcm",
+        "SampleRate": str(sample_rate),
+    }
+    if voice_mode:
+        synthesize_kwargs["Engine"] = voice_mode
+
+    resp = polly.synthesize_speech(**synthesize_kwargs)
     audio_bytes = resp["AudioStream"].read()
     data = np.frombuffer(audio_bytes, dtype=np.int16)
 
@@ -360,6 +365,7 @@ def audio_loop(args: argparse.Namespace) -> None:
     print()
 
     voice_id = args.voice or os.getenv("AGENT_VOICE_ID") or "Matthew"
+    voice_mode = args.voice_mode or os.getenv("AGENT_VOICE_MODE")
     last_agent_speech: str = ""
 
     while True:
@@ -412,6 +418,7 @@ def audio_loop(args: argparse.Namespace) -> None:
                 voice_id=voice_id,
                 output_device=out_dev,
                 region_name=os.getenv("AWS_REGION") or os.getenv("REGION"),
+                voice_mode=voice_mode,
             )
         except KeyboardInterrupt:
             print("\nExiting audio loop.")
