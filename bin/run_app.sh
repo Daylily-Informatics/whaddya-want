@@ -1,27 +1,30 @@
 #!/usr/bin/env bash
 
 # Usage:
-#   source bin/run_app.sh BROKER STACK SESSION [MODEL_ID]
+#   source bin/run_app.sh STACK SESSION [MODEL_ID]
 #
-# BROKER   = API Gateway URL for /agent (e.g., https://xxx.execute-api.us-west-2.amazonaws.com/Prod/agent)
 # STACK    = CloudFormation stack name (e.g., marpro9)
 # SESSION  = Arbitrary session id (used by the broker to group events)
 # MODEL_ID = (optional) Bedrock model id; if omitted, this script will try to
 #            read MODEL_ID from the BrokerFunction's Lambda configuration.
+#
+# The broker URL is derived from the CloudFormation stack outputs:
+#   - First tries the BrokerEndpoint output.
+#   - If missing, falls back to RestApiId and constructs the URL.
 
-if [ "$#" -lt 3 ] || [ "$#" -gt 4 ]; then
-  echo "Usage: $0 BROKER STACK SESSION [MODEL_ID]" >&2
+if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
+  echo "Usage: $0 STACK SESSION [MODEL_ID]" >&2
   return 1 2>/dev/null || exit 1
 fi
 
-export BROKER="$1"
-export STACK="$2"
-export SESSION="$3"
-MODEL_ID_OVERRIDE="${4:-}"
+export STACK="$1"
+export SESSION="$2"
+MODEL_ID_OVERRIDE="${3:-}"
 
 export AGENT_ID=marvin
-export REGION=us-west-2
+export REGION="${AWS_REGION:-us-west-2}"
 export AWS_REGION="$REGION"
+export AWS_DEFAULT_REGION="$REGION"
 
 # Resolve AgentStateTable physical name
 export AGENT_STATE_TABLE="$(
@@ -33,8 +36,39 @@ export AGENT_STATE_TABLE="$(
     --output text
 )"
 
+# Resolve BrokerEndpoint from stack outputs
+BROKER_FROM_OUTPUT="$(
+  aws cloudformation describe-stacks \
+    --stack-name "$STACK" \
+    --region "$REGION" \
+    --query "Stacks[0].Outputs[?OutputKey=='BrokerEndpoint'].OutputValue" \
+    --output text 2>/dev/null || echo ""
+)"
+
+if [ "$BROKER_FROM_OUTPUT" = "None" ]; then
+  BROKER_FROM_OUTPUT=""
+fi
+
+if [ -n "$BROKER_FROM_OUTPUT" ]; then
+  export BROKER="$BROKER_FROM_OUTPUT"
+else
+  # Fallback: derive from RestApiId if BrokerEndpoint output is missing
+  REST_API_ID="$(
+    aws cloudformation describe-stacks \
+      --stack-name "$STACK" \
+      --region "$REGION" \
+      --query "Stacks[0].Outputs[?OutputKey=='RestApiId'].OutputValue" \
+      --output text 2>/dev/null || echo ""
+  )"
+  if [ "$REST_API_ID" = "None" ] || [ -z "$REST_API_ID" ]; then
+    echo "ERROR: Could not derive BrokerEndpoint or RestApiId from stack '$STACK'." >&2
+    return 1 2>/dev/null || exit 1
+  fi
+  export BROKER="https://${REST_API_ID}.execute-api.${REGION}.amazonaws.com/Prod/agent"
+fi
+
 # Resolve MODEL_ID:
-#  - if a 4th arg was provided, use that
+#  - if a 3rd arg was provided, use that
 #  - otherwise, ask Lambda for BrokerFunction's environment MODEL_ID
 if [ -n "$MODEL_ID_OVERRIDE" ]; then
   export MODEL_ID="$MODEL_ID_OVERRIDE"
@@ -82,7 +116,9 @@ echo "STACK          : $STACK"
 echo "SESSION        : $SESSION"
 echo "AGENT_STATE_TABLE : $AGENT_STATE_TABLE"
 echo "MODEL_ID       : $MODEL_ID"
-echo
+echo "REGION         : $REGION"
+echo "AWS_REGION     : $AWS_REGION"
+echo "AWS_DEFAULT_REGION : $AWS_DEFAULT_REGION"
 
 PYTHONPATH="$PWD:$PWD/layers/shared/python" python -m client.cli --session "$SESSION" \
   --broker-url "$BROKER" \

@@ -5,7 +5,6 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import boto3
@@ -17,7 +16,6 @@ from agent_core.logging_utils import configure_logging
 
 
 logger = logging.getLogger(__name__)
-
 
 # ---------------------------------------------------------------------------
 # Device selection and persistence
@@ -105,7 +103,7 @@ def select_devices(setup_devices: bool) -> Tuple[int, int]:
 
 
 # ---------------------------------------------------------------------------
-# STT via Amazon Transcribe Streaming
+# STT via Amazon Transcribe Streaming + naive speaker embedding
 # ---------------------------------------------------------------------------
 
 RATE = 16000
@@ -113,30 +111,91 @@ CHANNELS = 1
 LANGUAGE_CODE = "en-US"
 
 
-async def _transcribe_once(duration_s: float, device_index: int) -> str:
-    """Capture microphone audio for `duration_s` and return a transcript string."""
-    client = TranscribeStreamingClient(region=os.getenv("AWS_REGION") or "us-west-2"
-                                       )
+def _compute_embedding_from_samples(samples: np.ndarray, num_bins: int = 32) -> Optional[List[float]]:
+    """Compute a simple, fixed-size embedding from a 1D float32 sample array.
+
+    We split the utterance into `num_bins` segments and take the mean absolute
+    amplitude for each, then L2-normalize the resulting vector.
+    """
+    if samples.size == 0:
+        return None
+
+    # Ensure 1D
+    if samples.ndim > 1:
+        samples = samples.reshape(-1)
+
+    length = samples.shape[0]
+    bin_size = max(1, length // num_bins)
+    emb: List[float] = []
+    for i in range(num_bins):
+        start_i = i * bin_size
+        end_i = (i + 1) * bin_size if i < num_bins - 1 else length
+        if start_i >= length:
+            emb.append(0.0)
+            continue
+        segment = samples[start_i:end_i]
+        emb.append(float(np.mean(np.abs(segment))))
+
+    norm = float(np.linalg.norm(emb))
+    if norm > 1e-6:
+        emb = [v / norm for v in emb]
+    return emb
+
+
+async def _transcribe_once(duration_s: float, device_index: int) -> Tuple[str, Optional[List[float]]]:
+    """Capture microphone audio for up to `duration_s` and return (transcript, embedding).
+
+    We stop early if we detect a period of silence after some speech.
+    The embedding is computed from the entire utterance audio.
+    """
+    region = os.getenv("AWS_REGION") or "us-west-2"
+    client = TranscribeStreamingClient(region=region)
     stream = await client.start_stream_transcription(
         language_code=LANGUAGE_CODE,
         media_sample_rate_hz=RATE,
-        media_encoding="pcm"    )
+        media_encoding="pcm",
+    )
 
     final_text: str = ""
+    all_frames: List[np.ndarray] = []
 
     async def mic() -> None:
-        nonlocal stream
+        nonlocal stream, all_frames
         frames_per_chunk = int(RATE * 0.2)  # 0.2s chunks
         start = time.time()
+        silence_chunks = 0
+        saw_speech = False
+        silence_threshold = 300.0  # RMS threshold for "silence" on int16
+        max_silence_chunks = int(1.2 / 0.2)  # ~1.2s of silence
+        min_speech_time = 0.6  # don't cut off immediately
+
         with sd.InputStream(
             samplerate=RATE,
             channels=CHANNELS,
             dtype="int16",
             device=device_index,
         ) as s:
-            while time.time() - start < duration_s:
-                audio = s.read(frames_per_chunk)[0].tobytes()
-                await stream.input_stream.send_audio_event(audio_chunk=audio)
+            while True:
+                now = time.time()
+                if now - start > duration_s:
+                    break
+                frames, _overflowed = s.read(frames_per_chunk)
+                all_frames.append(frames.copy())
+                audio_bytes = frames.tobytes()
+                await stream.input_stream.send_audio_event(audio_chunk=audio_bytes)
+
+                # Simple silence detection
+                samples = frames.astype(np.float32)
+                rms = float(np.sqrt(np.mean(samples * samples))) if samples.size else 0.0
+                if rms > silence_threshold:
+                    saw_speech = True
+                    silence_chunks = 0
+                else:
+                    if saw_speech and (now - start) > min_speech_time:
+                        silence_chunks += 1
+                        if silence_chunks >= max_silence_chunks:
+                            break
+
         await stream.input_stream.end_stream()
 
     async def listener() -> None:
@@ -147,14 +206,20 @@ async def _transcribe_once(duration_s: float, device_index: int) -> str:
             for result in event.transcript.results:
                 if result.is_partial:
                     continue
-                # Take the most recent non-partial result as the utterance.
                 final_text = "".join(a.transcript for a in result.alternatives)
 
     await asyncio.gather(mic(), listener())
-    return final_text.strip()
+
+    transcript = final_text.strip()
+    embedding: Optional[List[float]] = None
+    if all_frames:
+        concat = np.concatenate(all_frames, axis=0).astype(np.float32)
+        embedding = _compute_embedding_from_samples(concat)
+
+    return transcript, embedding
 
 
-def transcribe_once(duration_s: float, device_index: int) -> str:
+def transcribe_once(duration_s: float, device_index: int) -> Tuple[str, Optional[List[float]]]:
     """Synchronous wrapper around _transcribe_once."""
     try:
         return asyncio.run(_transcribe_once(duration_s, device_index))
@@ -162,7 +227,7 @@ def transcribe_once(duration_s: float, device_index: int) -> str:
         raise
     except Exception as exc:
         logger.warning("Transcribe failed: %s", exc)
-        return ""
+        return "", None
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +241,10 @@ def synthesize_and_play(
     region_name: Optional[str] = None,
     sample_rate: int = RATE,
 ) -> None:
-    """Use Polly to synthesize `text` and play it via sounddevice."""
+    """Use Polly to synthesize `text` and play it via sounddevice.
+
+    Playback is non-blocking; use sd.stop() to interrupt.
+    """
     if not text:
         return
 
@@ -193,7 +261,7 @@ def synthesize_and_play(
 
     logger.debug("Playing %d samples at %d Hz on device %s", len(data), sample_rate, output_device)
     sd.play(data, samplerate=sample_rate, device=output_device)
-    sd.wait()
+    # NOTE: no sd.wait() here; playback is non-blocking.
 
 
 # ---------------------------------------------------------------------------
@@ -206,17 +274,20 @@ def call_broker(
     transcript: str,
     channel: str = "audio",
     voice_id: Optional[str] = None,
+    embedding: Optional[List[float]] = None,
 ) -> Dict[str, Any]:
-    """Send a transcript to the broker HTTP endpoint and return the JSON response."""
+    """Send a transcript + optional embedding to the broker and return the JSON response."""
     import urllib.request
     import urllib.error
 
-    payload = {
+    payload: Dict[str, Any] = {
         "transcript": transcript,
         "channel": channel,
     }
     if voice_id is not None:
         payload["voice_id"] = str(voice_id)
+    if embedding is not None:
+        payload["voice_embedding"] = embedding
 
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
@@ -232,6 +303,47 @@ def call_broker(
     except Exception as exc:
         logger.error("Error calling broker at %s: %s", broker_url, exc)
         return {"reply_text": "I had trouble reaching the conversation broker.", "actions": []}
+
+
+# ---------------------------------------------------------------------------
+# Reply filtering: separate spoken content from debug/info
+# ---------------------------------------------------------------------------
+
+def split_speech_and_debug(text: str) -> Tuple[str, str]:
+    """Split agent reply into (spoken_text, debug_text)."""
+    if not text:
+        return "", ""
+
+    lines = text.splitlines()
+    speech_lines: List[str] = []
+    debug_lines: List[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        lower = stripped.lower()
+
+        is_debug = False
+
+        if lower.startswith("stored memory:"):
+            is_debug = True
+        if lower.startswith("i now have the following memories"):
+            is_debug = True
+        if stripped.startswith("{") and stripped.endswith("}"):
+            is_debug = True
+        if "\"item_type\": \"MEMORY\"" in stripped or "'item_type': 'MEMORY'" in stripped:
+            is_debug = True
+
+        if debug_lines and stripped.startswith(("* ", "- ")):
+            is_debug = True
+
+        if is_debug:
+            debug_lines.append(line)
+        else:
+            speech_lines.append(line)
+
+    speech_text = "\n".join(speech_lines).strip()
+    debug_text = "\n".join(debug_lines).strip()
+    return speech_text, debug_text
 
 
 # ---------------------------------------------------------------------------
@@ -255,7 +367,7 @@ def audio_loop(args: argparse.Namespace) -> None:
     while True:
         try:
             print("Speak now...")
-            utter = transcribe_once(duration_s=args.utterance_seconds, device_index=in_dev)
+            utter, embedding = transcribe_once(duration_s=args.utterance_seconds, device_index=in_dev)
             if not utter:
                 print("(No speech detected)")
                 continue
@@ -263,17 +375,33 @@ def audio_loop(args: argparse.Namespace) -> None:
             if args.verbose:
                 print(f"[YOU] {utter}")
 
+            lower = utter.lower()
+            if "marvin stop" in lower or "marvin, stop" in lower:
+                sd.stop()
+                print("[system] Stopped agent speech.")
+                continue
+
             resp = call_broker(
                 broker_url=args.broker_url,
                 session_id=args.session,
                 transcript=utter,
                 channel="audio",
                 voice_id=in_dev,
+                embedding=embedding,
             )
-            reply_text = resp.get("reply_text") or ""
-            print(f"[AGENT] {reply_text}")
+            full_reply = resp.get("reply_text") or ""
+            speech_text, debug_text = split_speech_and_debug(full_reply)
+
+            if not speech_text and full_reply:
+                speech_text = full_reply
+
+            print(f"[AGENT] {speech_text}")
+            if args.verbose and debug_text:
+                print("[DEBUG]")
+                print(debug_text)
+
             synthesize_and_play(
-                text=reply_text,
+                text=speech_text,
                 voice_id=voice_id,
                 output_device=out_dev,
                 region_name=os.getenv("AWS_REGION") or os.getenv("REGION"),
@@ -339,8 +467,8 @@ def main() -> None:
     parser.add_argument(
         "--utterance-seconds",
         type=float,
-        default=8.0,
-        help="Maximum length of each recorded utterance in seconds.",
+        default=6.0,
+        help="Maximum length of each recorded utterance in seconds (upper bound).",
     )
     parser.add_argument(
         "-v",
@@ -349,7 +477,6 @@ def main() -> None:
         default=0,
         help="Increase verbosity; can be specified multiple times.",
     )
-
     # Backwards-compat arguments (ignored but accepted)
     parser.add_argument(
         "--voice-mode",
@@ -363,8 +490,6 @@ def main() -> None:
     )
 
     args = parser.parse_args()
-
-    # Configure logging based on -v level.
     configure_logging(args.verbose)
 
     if args.text_only:

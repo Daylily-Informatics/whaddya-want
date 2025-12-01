@@ -2,37 +2,11 @@ from __future__ import annotations
 
 """Voice identity registry backed by the AgentStateTable DynamoDB table.
 
-This module provides a small API for registering and looking up voice profiles
-for an agent. A *voice profile* links a stable voice identifier (for example,
-a speaker embedding ID or device-level voice fingerprint) to a human-readable
-name such as "Major" or "John".
-
-Data is stored in the same DynamoDB table as events and memories
-(AGENT_STATE_TABLE) using items with:
-
-    pk  = f"AGENT#{agent_id}"
-    sk  = f"VOICE#{voice_id}"
-    item_type = "VOICE_PROFILE"
-
-The minimal schema for a voice profile item is:
-
-    {
-        "pk": "AGENT#marvin",
-        "sk": "VOICE#abc123",
-        "item_type": "VOICE_PROFILE",
-        "name": "Major",
-        "voice_id": "abc123",
-        "created_at": "2025-11-29T19:00:00+00:00",
-        "last_seen_at": "2025-11-29T19:05:00+00:00",
-        "metadata": {...}
-    }
-
-You can use this from Lambda (broker) and from local tools (via client.identity)
-to keep a consistent mapping from voice_id -> name.
-
-This module does *not* perform any acoustic analysis. It assumes that upstream
-code (STT pipeline, audio front-end, etc.) can provide a stable voice_id for
-each distinct speaker.
+Supports:
+- Mapping (agent_id, voice_id) -> VoiceProfile
+- Storing one or more speaker embeddings per voice profile
+- Nearest-neighbor lookup by embedding to fuzzily match new voices to
+  existing profiles.
 """
 
 import logging
@@ -126,17 +100,24 @@ def get_by_voice_id(agent_id: str, voice_id: str) -> Optional[VoiceProfile]:
     return VoiceProfile.from_item(item)
 
 
+def _append_embedding(meta: Dict[str, Any], embedding: List[float]) -> Dict[str, Any]:
+    meta = dict(meta) if meta is not None else {}
+    embs = meta.get("embeddings") or []
+    if not isinstance(embs, list):
+        embs = []
+    embs = list(embs)
+    embs.append(embedding)
+    meta["embeddings"] = embs
+    return meta
+
+
 def upsert_voice_profile(
     agent_id: str,
     voice_id: str,
     name: str,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> VoiceProfile:
-    """Create or update a voice profile for the given voice_id.
-
-    If a profile already exists, its name and metadata are updated and
-    last_seen_at is refreshed. Otherwise a new profile is created.
-    """
+    """Create or update a voice profile for the given voice_id."""
     existing = get_by_voice_id(agent_id, voice_id)
     now = datetime.now(timezone.utc)
 
@@ -151,7 +132,13 @@ def upsert_voice_profile(
         existing.name = name
         existing.last_seen_at = now
         if metadata:
-            existing.metadata.update(metadata)
+            # Merge metadata shallowly; embeddings are handled by caller.
+            merged = dict(existing.metadata)
+            merged.update({k: v for k, v in metadata.items() if k != "embeddings"})
+            # If caller provided embeddings explicitly, append them
+            if "embeddings" in metadata:
+                merged = _append_embedding(merged, metadata["embeddings"][-1])
+            existing.metadata = merged
         profile = existing
     else:
         logger.debug(
@@ -218,10 +205,7 @@ def list_voice_names(agent_id: str) -> List[str]:
 
 
 def delete_voice_profile(agent_id: str, name: str) -> bool:
-    """Delete all voice profiles for this agent that match the given name.
-
-    Returns True if at least one profile was deleted, False otherwise.
-    """
+    """Delete all voice profiles for this agent that match the given name."""
     name_norm = name.strip()
     if not name_norm:
         raise ValueError("Voice profile name must not be empty")
@@ -241,37 +225,114 @@ def delete_voice_profile(agent_id: str, name: str) -> bool:
     return deleted_any
 
 
+# ---------------------------------------------------------------------------
+# Embedding-based nearest neighbor
+# ---------------------------------------------------------------------------
+
+def _cosine_similarity(a: List[float], b: List[float]) -> float:
+    if not a or not b:
+        return 0.0
+    n = min(len(a), len(b))
+    dot = sum(a[i] * b[i] for i in range(n))
+    norm_a = sum(a[i] * a[i] for i in range(n)) ** 0.5
+    norm_b = sum(b[i] * b[i] for i in range(n)) ** 0.5
+    if norm_a <= 1e-8 or norm_b <= 1e-8:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def find_best_match_by_embedding(
+    agent_id: str,
+    embedding: List[float],
+    min_similarity: float = 0.8,
+) -> Optional[VoiceProfile]:
+    """Return the best matching VoiceProfile for the given embedding, or None."""
+    profiles = list_voice_profiles(agent_id)
+    best: Optional[VoiceProfile] = None
+    best_sim = min_similarity
+    for p in profiles:
+        embs = p.metadata.get("embeddings") or []
+        if not isinstance(embs, list):
+            continue
+        for e in embs:
+            if not isinstance(e, list):
+                continue
+            sim = _cosine_similarity(e, embedding)
+            if sim > best_sim:
+                best_sim = sim
+                best = p
+    return best
+
+
+# ---------------------------------------------------------------------------
+# High-level API
+# ---------------------------------------------------------------------------
+
 def resolve_voice(
     agent_id: str,
     voice_id: Optional[str],
     claimed_name: Optional[str] = None,
+    embedding: Optional[List[float]] = None,
+    similarity_threshold: float = 0.8,
 ) -> Tuple[Optional[str], bool]:
-    """Resolve a voice_id to a name, optionally registering a new profile.
+    """Resolve a voice to a name, using voice_id and/or embedding.
 
     Returns (name, is_new):
 
-    - If voice_id is None, returns (claimed_name, False) and does not
-      touch the registry.
-    - If voice_id is known, returns (stored_name, False).
-    - If voice_id is unknown and claimed_name is provided, registers a
-      new profile and returns (claimed_name, True).
-    - If voice_id is unknown and claimed_name is None, returns (None, True)
-      to signal that the caller should ask the speaker for their name.
+    - If voice_id is known: returns stored name, is_new=False.
+    - Else if embedding matches an existing profile: returns that name, is_new=False,
+      and creates/updates a mapping for this voice_id if provided.
+    - Else if claimed_name is provided: creates a new profile and returns (claimed_name, True).
+    - Else: (None, True) signalling that the caller should ask for the speaker's name.
     """
-    if not voice_id:
-        # Nothing to resolve; rely on the claimed_name if provided.
-        return claimed_name, False
+    # 1. If we know the voice_id directly, that's the strongest signal.
+    if voice_id:
+        existing = get_by_voice_id(agent_id, voice_id)
+        if existing:
+            logger.debug("Resolved voice_id=%s to existing profile name=%s", voice_id, existing.name)
+            # Optionally attach the new embedding if provided.
+            if embedding:
+                existing.metadata = _append_embedding(existing.metadata, embedding)
+                _table.put_item(Item=existing.to_item())
+            else:
+                touch_voice_profile(agent_id, voice_id)
+            return existing.name, False
 
-    existing = get_by_voice_id(agent_id, voice_id)
-    if existing:
-        touch_voice_profile(agent_id, voice_id)
-        return existing.name, False
+    # 2. Try nearest-neighbor on embedding.
+    match: Optional[VoiceProfile] = None
+    if embedding:
+        match = find_best_match_by_embedding(agent_id, embedding, min_similarity=similarity_threshold)
 
+    if match:
+        logger.debug(
+            "Embedding matched existing voice profile agent=%s voice_id=%s name=%s",
+            agent_id,
+            match.voice_id,
+            match.name,
+        )
+        # Optionally bind this new voice_id to the same person.
+        vid = voice_id or f"embed-{int(datetime.now(timezone.utc).timestamp())}"
+        meta = _append_embedding(match.metadata, embedding)
+        upsert_voice_profile(agent_id, vid, match.name, meta)
+        return match.name, False
+
+    # 3. No match; register a new profile if we have a claimed name.
     if claimed_name:
-        profile = upsert_voice_profile(agent_id, voice_id, claimed_name)
+        vid = voice_id or f"voice-{int(datetime.now(timezone.utc).timestamp())}"
+        meta: Dict[str, Any] = {}
+        if embedding:
+            meta = _append_embedding(meta, embedding)
+        profile = upsert_voice_profile(agent_id, vid, claimed_name, meta)
+        logger.debug(
+            "Registered new voice profile agent=%s voice_id=%s name=%s",
+            agent_id,
+            vid,
+            profile.name,
+        )
         return profile.name, True
 
-    # Unknown voice, no name yet – caller should ask.
+    # 4. Unknown voice; caller should ask for the speaker's name.
+    logger.debug("Unknown voice (no match, no claimed name).")
     return None, True
 
 
@@ -283,5 +344,6 @@ __all__ = [
     "list_voice_profiles",
     "list_voice_names",
     "delete_voice_profile",
+    "find_best_match_by_embedding",
     "resolve_voice",
 ]

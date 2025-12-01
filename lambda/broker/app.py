@@ -2,7 +2,7 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from agent_core.schema import Event
 from agent_core import memory_store, tools as agent_tools
@@ -22,7 +22,7 @@ AGENT_ID = os.environ.get("AGENT_ID", "marvin")
 
 _model_client = AwsModelClient.from_env()
 
-# Initialize Polly-based speech synthesizer (optional S3 backing).
+# Polly-based speech synthesizer (optional S3 backing).
 try:
     _speech = SpeechSynthesizer(
         bucket=os.getenv("AUDIO_BUCKET"),
@@ -44,7 +44,6 @@ def _derive_session_id(event: Dict[str, Any]) -> str:
     src = headers.get("X-Session-Id") or headers.get("x-session-id")
     if src:
         return str(src)
-    # Fallback: derive from requestContext if available.
     rc = event.get("requestContext") or {}
     req_id = rc.get("requestId") or rc.get("requestID") or "unknown"
     return f"lambda-{req_id}"
@@ -62,7 +61,7 @@ def _payload_from_event(event: Dict[str, Any]) -> Dict[str, Any]:
     return body
 
 
-def _extract_claimed_name_from_text(text: str) -> str | None:
+def _extract_claimed_name_from_text(text: str) -> Optional[str]:
     """Heuristic to extract a name from utterances like 'my name is John'."""
     if not text:
         return None
@@ -71,7 +70,6 @@ def _extract_claimed_name_from_text(text: str) -> str | None:
     if idx == -1:
         return None
     after = text[idx + len("my name is") :].strip()
-    # Stop at first punctuation.
     for stop in (".", "!", "?", ","):
         s = after.find(stop)
         if s != -1:
@@ -79,7 +77,6 @@ def _extract_claimed_name_from_text(text: str) -> str | None:
     name = after.strip(" '\"")
     if not name:
         return None
-    # Very basic guard to avoid obviously bad captures.
     if len(name.split()) > 5:
         return None
     return name
@@ -93,24 +90,26 @@ def handler(event, context):
     transcript: str = body.get("transcript") or body.get("text") or ""
     channel: str = body.get("channel", "audio")
 
-    # Voice identity resolution
+    # Voice identity: raw ID + optional embedding + claimed name.
     voice_id = body.get("voice_id") or body.get("speaker_id")
-    # Try to infer a claimed name from the transcript if there is one.
     claimed_name = body.get("speaker_name") or body.get("user_name")
+    embedding = body.get("voice_embedding")
+
     if voice_id and not claimed_name and transcript:
         inferred = _extract_claimed_name_from_text(transcript)
         if inferred:
             claimed_name = inferred
 
-    speaker_name: str | None = None
+    speaker_name: Optional[str] = None
     is_new_voice = False
 
-    if voice_id or claimed_name:
+    if voice_id or claimed_name or embedding:
         try:
             speaker_name, is_new_voice = voice_registry.resolve_voice(
                 agent_id=AGENT_ID,
-                voice_id=voice_id,
+                voice_id=str(voice_id) if voice_id is not None else None,
                 claimed_name=claimed_name,
+                embedding=embedding,
             )
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("Error resolving voice profile: %s", exc)
@@ -132,17 +131,16 @@ def handler(event, context):
             "transcript": transcript,
             "voice_id": voice_id,
             "speaker_name": speaker_name,
+            "voice_embedding": embedding,
             "raw": body,
         },
     )
     memory_store.put_event(agent_event)
     logger.debug("Stored incoming event payload: %s", agent_event.payload)
 
-    # Retrieve recent memories for context
     memories = memory_store.recent_memories(agent_id=AGENT_ID, limit=40)
     logger.debug("Loaded %s recent memories", len(memories))
 
-    # Build messages for the model
     personality_prompt = body.get("personality_prompt") or (
         "You are Marvin, a slightly paranoid but helpful home/office AI."
     )
@@ -152,14 +150,25 @@ def handler(event, context):
         {"role": "system", "content": system_prompt},
     ]
 
-    # Give the model explicit context about the current speaker.
-    if speaker_name:
+    # Speaker context to the model.
+    if speaker_name and not is_new_voice:
         messages.append(
             {
                 "role": "system",
                 "content": (
-                    f"The current speaker is named '{speaker_name}'. When you store memories "
-                    f"about this conversation, treat them as information about '{speaker_name}'."
+                    f"The current speaker's voice has been recognized as '{speaker_name}'. "
+                    f"When you store memories about this conversation, treat them as "
+                    f"information about '{speaker_name}'."
+                ),
+            }
+        )
+    elif speaker_name and is_new_voice:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    f"You have just learned that the current speaker's name is '{speaker_name}'. "
+                    f"Use this name when referring to them in conversation and memory."
                 ),
             }
         )
@@ -175,7 +184,6 @@ def handler(event, context):
             }
         )
 
-    # Memory context as JSON
     messages.append(
         {
             "role": "system",
@@ -183,7 +191,6 @@ def handler(event, context):
         }
     )
 
-    # User message last
     messages.append(
         {
             "role": "user",
@@ -208,7 +215,7 @@ def handler(event, context):
     dispatch_background_actions(actions)
     logger.info("Broker produced %s actions", len(actions))
 
-    audio_info: Dict[str, Any] | None = None
+    audio_info: Optional[Dict[str, Any]] = None
     if _speech is not None and reply_text:
         try:
             audio_info = _speech.synthesize(
