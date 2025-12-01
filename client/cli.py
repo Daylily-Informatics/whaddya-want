@@ -13,6 +13,7 @@ import sounddevice as sd
 from amazon_transcribe.client import TranscribeStreamingClient
 
 from agent_core.logging_utils import configure_logging
+from . import identity  # NEW: voice identity helpers
 
 
 logger = logging.getLogger(__name__)
@@ -364,6 +365,11 @@ def audio_loop(args: argparse.Namespace) -> None:
     print()
 
     voice_id = args.voice or os.getenv("AGENT_VOICE_ID") or "Matthew"
+
+    # Track which speaker we think is active, based on voice embeddings.
+    current_speaker_name: Optional[str] = None
+    last_ack_speaker_name: Optional[str] = None
+
     last_agent_speech: str = ""
     agent_playing_until: float = 0.0
 
@@ -410,6 +416,54 @@ def audio_loop(args: argparse.Namespace) -> None:
                     print("[system] Ignoring echo of agent speech (similar text).")
                 continue
 
+            # Try to resolve the speaker identity from the voice embedding.
+            pending_greet_name: Optional[str] = None
+            if embedding is not None:
+                try:
+                    resolved_name, is_new = identity.resolve_voice(
+                        embedding=embedding,
+                        voice_id=None,
+                        claimed_name=None,
+                    )
+                except Exception as exc:
+                    logger.error("Voice resolution failed: %s", exc)
+                    resolved_name, is_new = None, False
+
+                if resolved_name is None and is_new:
+                    # Unknown speaker: prompt for a name and enroll.
+                    prompt_text = "I don't recognize your voice yet. What should I call you?"
+                    logger.info("[VOICE_ENROLL_PROMPT]")
+                    synthesize_and_play(
+                        text=prompt_text,
+                        voice_id=voice_id,
+                        output_device=out_dev,
+                        region_name=os.getenv("AWS_REGION") or os.getenv("REGION"),
+                    )
+                    name_utter, name_embedding = transcribe_once(
+                        duration_s=3.0,
+                        device_index=in_dev,
+                    )
+                    claimed_name = (name_utter or "").strip().split()[0] or None
+                    if claimed_name:
+                        try:
+                            # Use name clip embedding if available, else fall back to original.
+                            resolved_name, _ = identity.resolve_voice(
+                                embedding=name_embedding or embedding,
+                                voice_id=None,
+                                claimed_name=claimed_name,
+                            )
+                        except Exception as exc:
+                            logger.error("Failed to register new voice profile: %s", exc)
+                            resolved_name = claimed_name
+
+                if resolved_name:
+                    current_speaker_name = resolved_name
+                    logger.info("[VOICE_IDENTITY] resolved speaker=%s", resolved_name)
+
+            # Set up one-time greeting when the active speaker changes.
+            if current_speaker_name and current_speaker_name != last_ack_speaker_name:
+                pending_greet_name = current_speaker_name
+
             # Normal path: send to broker
             resp = call_broker(
                 broker_url=args.broker_url,
@@ -424,6 +478,11 @@ def audio_loop(args: argparse.Namespace) -> None:
 
             if not speech_text and full_reply:
                 speech_text = full_reply
+
+            # Prepend greeting once per new speaker.
+            if pending_greet_name and speech_text:
+                speech_text = f"{pending_greet_name}, {speech_text}"
+                last_ack_speaker_name = pending_greet_name
 
             last_agent_speech = speech_text or ""
 

@@ -14,7 +14,7 @@ to Rekognition or another store later.
 """
 
 import os
-from typing import List
+from typing import List, Optional, Tuple
 
 from agent_core import voice_registry
 
@@ -43,6 +43,32 @@ def delete_voice(name: str) -> bool:
     Returns True if at least one profile was removed, False otherwise.
     """
     return voice_registry.delete_voice_profile(_agent_id(), name)
+
+
+def resolve_voice(
+    embedding: Optional[List[float]],
+    voice_id: Optional[str] = None,
+    claimed_name: Optional[str] = None,
+    similarity_threshold: float = 0.8,
+) -> Tuple[Optional[str], bool]:
+    """Resolve a speaker's voice to a stored name via the shared registry.
+
+    Thin wrapper over `voice_registry.resolve_voice` that automatically scopes
+    lookups to the current AGENT_ID.
+
+    Returns (name, is_new) where:
+
+      - name is the resolved or newly-registered name, or None if still unknown
+      - is_new is True if the voice was not previously known to the registry
+        (i.e., caller may wish to ask the user for their name when name is None).
+    """
+    return voice_registry.resolve_voice(
+        _agent_id(),
+        voice_id=voice_id,
+        claimed_name=claimed_name,
+        embedding=embedding,
+        similarity_threshold=similarity_threshold,
+    )
 
 
 # ---------------------------------------------------------------------------
