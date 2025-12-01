@@ -282,7 +282,7 @@ echo "EXTRA_CLI_ARGS    : $EXTRA_CLI_ARGS"
 echo
 
 # Build the python command; let the shell split EXTRA_CLI_ARGS into flags.
-PYTHONPATH="$PWD:$PWD/layers/shared/python" python -m client.cli \
+PYTHONPATH="$PWD:$PWD/layers/shared/" python -m client.cli \
   --session "$SESSION" \
   --broker-url "$BROKER" \
   --setup-devices \
