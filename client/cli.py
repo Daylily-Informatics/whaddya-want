@@ -13,7 +13,9 @@ import sounddevice as sd
 from amazon_transcribe.client import TranscribeStreamingClient
 
 from agent_core.logging_utils import configure_logging
-from . import identity  # NEW: voice identity helpers
+from . import identity  # voice identity helpers
+
+logger = logging.getLogger(__name__)
 
 NAME_STOPWORDS = {"it's", "its", "what", "you", "i", "call", "should", "name"}
 
@@ -81,18 +83,11 @@ def extract_name_heuristic(utterance: str) -> Optional[str]:
 
 def llm_extract_name(utterance: str) -> Optional[str]:
     """
-    Optional LLM-based name extractor.
-
-    Expects the model to return either:
-      - a single name token, e.g.  Major
-      - or the literal token  NONE
-
-    If the OpenAI client is not available or the call fails, returns None.
+    LLM-based name extraction is disabled for this build.
+    We rely purely on local heuristics; Bedrock is only used via the broker.
     """
     return None
 
-
-logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Device selection and persistence
@@ -449,6 +444,9 @@ def audio_loop(args: argparse.Namespace) -> None:
     last_agent_speech: str = ""
     agent_playing_until: float = 0.0
 
+    # Have we successfully enrolled ANY voice this session?
+    has_enrolled_voice: bool = False
+
     while True:
         try:
             print("Speak now...")
@@ -494,6 +492,9 @@ def audio_loop(args: argparse.Namespace) -> None:
 
             # Try to resolve the speaker identity from the voice embedding.
             pending_greet_name: Optional[str] = None
+            resolved_name: Optional[str] = None
+            is_new: bool = False
+
             if embedding is not None:
                 try:
                     resolved_name, is_new = identity.resolve_voice(
@@ -505,8 +506,8 @@ def audio_loop(args: argparse.Namespace) -> None:
                     logger.error("Voice resolution failed: %s", exc)
                     resolved_name, is_new = None, False
 
-                if resolved_name is None and is_new:
-                    # Unknown speaker: prompt for a name and enroll.
+                if (not has_enrolled_voice) and resolved_name is None and is_new:
+                    # Unknown speaker and no enrolled voice yet: prompt for a name and enroll.
                     prompt_text = "I don't recognize your voice yet. What should I call you?"
                     logger.info("[VOICE_ENROLL_PROMPT]")
 
@@ -519,7 +520,6 @@ def audio_loop(args: argparse.Namespace) -> None:
                     )
 
                     # 2. Wait for playback to finish before listening for the name
-                    #    Add a small margin to be safe against timing drift.
                     time.sleep(play_sec + 0.1)
 
                     # 3. Now capture the user's spoken name
@@ -528,8 +528,7 @@ def audio_loop(args: argparse.Namespace) -> None:
                         device_index=in_dev,
                     )
 
-
-                    # Name enrollment state: run heuristic + optional LLM to extract a self-name.
+                    # Name enrollment state: run heuristic + (disabled) LLM
                     heuristic_name = extract_name_heuristic(name_utter or "")
                     llm_name = llm_extract_name(name_utter or "")
                     final_name = heuristic_name or llm_name
@@ -550,7 +549,6 @@ def audio_loop(args: argparse.Namespace) -> None:
                     if final_name:
                         claimed_name = final_name
                         try:
-                            # Use name clip embedding if available, else fall back to original.
                             resolved_name, _ = identity.resolve_voice(
                                 embedding=name_embedding or embedding,
                                 voice_id=None,
@@ -559,6 +557,7 @@ def audio_loop(args: argparse.Namespace) -> None:
                         except Exception as exc:
                             logger.error("Failed to register new voice profile: %s", exc)
                             resolved_name = claimed_name
+                        has_enrolled_voice = True
                     else:
                         # No usable name; keep resolved_name as None so we'll try again later.
                         resolved_name = None
